@@ -50,6 +50,7 @@
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/db.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/dur_commitjob.h"
 #include "mongo/db/dur_journal.h"
@@ -59,15 +60,17 @@
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/ops/query.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/pagefault.h"
+#include "mongo/db/query/new_find.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/stats/counters.h"
@@ -108,14 +111,6 @@ namespace mongo {
 
     MONGO_FP_DECLARE(rsStopGetMore);
 
-    void BSONElementManipulator::initTimestamp() {
-        massert( 10332 ,  "Expected CurrentTime type", _element.type() == Timestamp );
-        unsigned long long &timestamp = *( reinterpret_cast< unsigned long long* >( value() ) );
-        if ( timestamp == 0 ) {
-            mutex::scoped_lock lk(OpTime::m);
-            timestamp = OpTime::now(lk).asDate();
-        }
-    }
     void BSONElementManipulator::SetNumber(double d) {
         if ( _element.type() == NumberDouble )
             *getDur().writing( reinterpret_cast< double * >( value() )  ) = d;
@@ -130,17 +125,6 @@ namespace mongo {
     void BSONElementManipulator::SetInt(int n) {
         verify( _element.type() == NumberInt );
         getDur().writingInt( *reinterpret_cast< int * >( value() ) ) = n;
-    }
-    /* dur:: version */
-    void BSONElementManipulator::ReplaceTypeAndValue( const BSONElement &e ) {
-        char *d = data();
-        char *v = value();
-        int valsize = e.valuesize();
-        int ofs = (int) (v-d);
-        dassert( ofs > 0 );
-        char *p = (char *) getDur().writingPtr(d, valsize + ofs);
-        *p = e.type();
-        memcpy( p + ofs, e.value(), valsize );
     }
 
     void inProgCmd( Message &m, DbResponse &dbresponse ) {
@@ -278,7 +262,7 @@ namespace mongo {
                 audit::logQueryAuthzCheck(client, ns, q.query, status.code());
                 uassertStatusOK(status);
             }
-            dbresponse.exhaustNS = runQuery(m, q, op, *resp);
+            dbresponse.exhaustNS = newRunQuery(m, q, op, *resp);
             verify( !resp->empty() );
         }
         catch ( SendStaleConfigException& e ){
@@ -548,7 +532,7 @@ namespace mongo {
             verify( n < 30000 );
         }
 
-        int found = ClientCursor::eraseIfAuthorized(n, (long long *) x);
+        int found = CollectionCursorCache::eraseCursorGlobalIfAuthorized(n, (long long *) x);
 
         if ( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || found != n ) {
             LOG( found == n ? 1 : 0 ) << "killcursors: found " << found << " of " << n << endl;
@@ -577,7 +561,6 @@ namespace mongo {
         /* important: kill all open cursors on the database */
         string prefix(db);
         prefix += '.';
-        ClientCursor::invalidate(prefix.c_str());
 
         dbHolderW().erase( db, path );
         ctx->_clear();
@@ -587,6 +570,7 @@ namespace mongo {
     void receivedUpdate(Message& m, CurOp& op) {
         DbMessage d(m);
         NamespaceString ns(d.getns());
+        uassertStatusOK( userAllowedWriteNS( ns ) );
         op.debug().ns = ns.ns();
         int flags = d.pullInt();
         BSONObj query = d.nextJsObj();
@@ -640,47 +624,67 @@ namespace mongo {
             uasserted( 17009, status.reason() );
         }
 
-        PageFaultRetryableSection s;
-        while ( 1 ) {
-            try {
-                Lock::DBWrite lk(ns.ns());
-
-                // void ReplSetImpl::relinquish() uses big write lock so this is thus
-                // synchronized given our lock above.
-                uassert( 17010 ,  "not master", isMasterNs( ns.ns().c_str() ) );
-
-                // if this ever moves to outside of lock, need to adjust check
-                // Client::Context::_finishInit
-                if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
-                    return;
-
-                Client::Context ctx( ns );
-
-                const NamespaceString requestNs(ns);
-                UpdateRequest request(requestNs);
-
-                request.setUpsert(upsert);
-                request.setMulti(multi);
-                request.setQuery(query);
-                request.setUpdates(toupdate);
-                request.setUpdateOpLog(); // TODO: This is wasteful if repl is not active.
-                UpdateLifecycleImpl updateLifecycle(broadcast, requestNs);
-                request.setLifecycle(&updateLifecycle);
-                UpdateResult res = update(request, &op.debug(), &driver);
-
-                // for getlasterror
-                lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
-                break;
+        const NamespaceString requestNs(ns);
+        const bool isSimpleIdQuery = CanonicalQuery::isSimpleIdQuery(query);
+        CanonicalQuery* cqRaw;
+        if (isSimpleIdQuery) {
+            cqRaw = NULL;
+        }
+        else {
+            status = CanonicalQuery::canonicalize(requestNs, query, &cqRaw);
+            if (status == ErrorCodes::NoClientContext) {
+                cqRaw = NULL;
             }
-            catch ( PageFaultException& e ) {
-                e.touch();
+            else if (!status.isOK()) {
+                uasserted(17349,
+                          "could not canonicalize query " + query.toString() + "; " +
+                          causedBy(status));
             }
         }
+        std::auto_ptr<CanonicalQuery> cq(cqRaw);
+
+        Lock::DBWrite lk(ns.ns());
+
+        // void ReplSetImpl::relinquish() uses big write lock so this is thus
+        // synchronized given our lock above.
+        uassert( 17010 ,  "not master", isMasterNs( ns.ns().c_str() ) );
+
+        // if this ever moves to outside of lock, need to adjust check
+        // Client::Context::_finishInit
+        if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
+            return;
+
+        Client::Context ctx( ns );
+
+        if (!isSimpleIdQuery && !cq.get()) {
+            status = CanonicalQuery::canonicalize(requestNs, query, &cqRaw);
+            if (!status.isOK()) {
+                uasserted(17350,
+                          "could not canonicalize query " + query.toString() + "; " +
+                          causedBy(status));
+            }
+            cq.reset(cqRaw);
+        }
+
+        UpdateRequest request(requestNs);
+
+        request.setUpsert(upsert);
+        request.setMulti(multi);
+        request.setQuery(query);
+        request.setUpdates(toupdate);
+        request.setUpdateOpLog(); // TODO: This is wasteful if repl is not active.
+        UpdateLifecycleImpl updateLifecycle(broadcast, requestNs);
+        request.setLifecycle(&updateLifecycle);
+        UpdateResult res = update(request, &op.debug(), &driver, cq.release());
+
+        // for getlasterror
+        lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
     }
 
     void receivedDelete(Message& m, CurOp& op) {
         DbMessage d(m);
         NamespaceString ns(d.getns());
+        uassertStatusOK( userAllowedWriteNS( ns ) );
 
         op.debug().ns = ns.ns();
         int flags = d.pullInt();
@@ -724,6 +728,14 @@ namespace mongo {
 
     QueryResult* emptyMoreResult(long long);
 
+    #define CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION \
+        if( waitNotification != 0) {\
+            if ( collection != 0 ) {\
+                collection->unsubcribeToChange( waitNotification );\
+            }\
+            delete waitNotification;\
+        }
+
     bool receivedGetMore(DbResponse& dbresponse, Message& m, CurOp& curop ) {
         bool ok = true;
 
@@ -743,84 +755,112 @@ namespace mongo {
         bool exhaust = false;
         QueryResult* msgdata = 0;
         OpTime last;
-        while( 1 ) {
-            bool isCursorAuthorized = false;
-            try {
-                const NamespaceString nsString( ns );
-                uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
+        NotifyAll* waitNotification = 0;        
+        Collection* collection = 0;
+        try{
+            while( 1 ) {
+                bool isCursorAuthorized = false;
+                NotifyAll::When lastWaitTime;
+                try {
+                    const NamespaceString nsString( ns );
+                    uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
-                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(
-                        nsString, cursorid);
-                audit::logGetMoreAuthzCheck(&cc(), nsString, cursorid, status.code());
-                uassertStatusOK(status);
+                    Status status = cc().getAuthorizationSession()->checkAuthForGetMore(
+                            nsString, cursorid);
+                    audit::logGetMoreAuthzCheck(&cc(), nsString, cursorid, status.code());
+                    uassertStatusOK(status);
 
-                if (str::startsWith(ns, "local.oplog.")){
-                    while (MONGO_FAIL_POINT(rsStopGetMore)) {
-                        sleepmillis(0);
+                    if (str::startsWith(ns, "local.oplog.")){
+                        while (MONGO_FAIL_POINT(rsStopGetMore)) {
+                            sleepmillis(0);
+                        }
+
+                        if (pass == 0) {
+                            mutex::scoped_lock lk(OpTime::m);
+                            last = OpTime::getLast(lk);
+                        }
+                        else {
+                            last.waitForDifferent(1000/*ms*/);
+                        }
                     }
 
-                    if (pass == 0) {
-                        mutex::scoped_lock lk(OpTime::m);
-                        last = OpTime::getLast(lk);
+                    msgdata = newGetMore(ns,
+                                             ntoreturn,
+                                             cursorid,
+                                             curop,
+                                             pass,
+                                             exhaust,
+                                             &isCursorAuthorized);
+                }
+                catch ( AssertionException& e ) {
+                    if ( isCursorAuthorized ) {
+                        // If a cursor with id 'cursorid' was authorized, it may have been advanced
+                        // before an exception terminated processGetMore.  Erase the ClientCursor
+                        // because it may now be out of sync with the client's iteration state.
+                        // SERVER-7952
+                        // TODO Temporary code, see SERVER-4563 for a cleanup overview.
+                        CollectionCursorCache::eraseCursorGlobal( cursorid );
+                    }
+                    ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
+                    ok = false;
+                    break;
+                }
+                
+                if (msgdata == 0) {
+                    // this should only happen with QueryOption_AwaitData
+                    exhaust = false;
+                    massert(13073, "shutting down", !inShutdown() );
+                    if ( ! timer ) {
+                        timer.reset( new Timer() );
                     }
                     else {
-                        last.waitForDifferent(1000/*ms*/);
+                        if ( timer->seconds() >= 4 ) {
+                            // after about 4 seconds, return. pass stops at 1000 normally.
+                            // we want to return occasionally so slave can checkpoint.
+                            pass = 10000;
+                        }
                     }
-                }
+                    pass++;
+                    if (debug)
+                        sleepmillis(20);
+                    else if( waitNotification == 0 ) {
+                        waitNotification = new NotifyAll();
+                        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(ns));
+                        collection = ctx->ctx().db()->getCollection(ns);
+                        // TODO: Add unique assertion number here????
+                        uassert( 17383, "collection dropped between newGetMore calls", collection );
+                        lastWaitTime = waitNotification->now();
+                        collection->subscribeToChange( waitNotification ); 
+                        /* After creating the notification and subscripting we will do one more loop before waiting
+                           because of concurrency, a new item *may* have been inserted in the collection while we were
+                           setting up our notification and subscribing to the event */                   
+                    } else {                    
+                        /* There's cases where an item is inserted *BEFORE* we execute the wait bellow
+                           with current implementation of NotifyAll we won't detect that the event is signaled
+                           therefore control will return with timeout of 2ms. 
+                           
+                           TODO: It will be nice in the future to tune
+                           implementaiton or usage of NotifyAll to detect that case and avoid sacrifice of those 2
+                           precious milliseconds waiting while there was data waiting */
+                        waitNotification->timedWaitFor( lastWaitTime, 2 );
+                        lastWaitTime = waitNotification->now();
+                    }
 
-                msgdata = processGetMore(ns,
-                                         ntoreturn,
-                                         cursorid,
-                                         curop,
-                                         pass,
-                                         exhaust,
-                                         &isCursorAuthorized);
-            }
-            catch ( AssertionException& e ) {
-                if ( isCursorAuthorized ) {
-                    // If a cursor with id 'cursorid' was authorized, it may have been advanced
-                    // before an exception terminated processGetMore.  Erase the ClientCursor
-                    // because it may now be out of sync with the client's iteration state.
-                    // SERVER-7952
-                    // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-                    ClientCursor::erase( cursorid );
-                }
-                ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
-                ok = false;
+                    // note: the 1100 is because of the waitForDifferent above
+                    // should eventually clean this up a bit
+                    curop.setExpectedLatencyMs( 1100 + timer->millis() );
+                    
+                    continue;
+                }                       
                 break;
-            }
-            
-            if (msgdata == 0) {
-                // this should only happen with QueryOption_AwaitData
-                exhaust = false;
-                massert(13073, "shutting down", !inShutdown() );
-                if ( ! timer ) {
-                    timer.reset( new Timer() );
-                }
-                else {
-                    if ( timer->seconds() >= 4 ) {
-                        // after about 4 seconds, return. pass stops at 1000 normally.
-                        // we want to return occasionally so slave can checkpoint.
-                        pass = 10000;
-                    }
-                }
-                pass++;
-                if (debug)
-                    sleepmillis(20);
-                // Let's go really fast the first 400 passes (arbitrary number), yield to thread with no sleeping.
-                // If there was no new data in capped collection, let's slow down on burning the CPU
-                // by doing a sleep(1) for about >~2 second. Finally, let's move to 2ms wait in between
-                // loops after that until we reach the limit of 4 seconds in the code above
-                else sleepmillis( pass < 400 ? 0 : pass < 2000 ? 1 : 2 );                    
-                
-                // note: the 1100 is because of the waitForDifferent above
-                // should eventually clean this up a bit
-                curop.setExpectedLatencyMs( 1100 + timer->millis() );
-                
-                continue;
-            }
-            break;
-        };
+            };
+        } catch(...){
+            /* We don't want to leave a dangling change notification on the collection object. That's why we will catch
+               any exception do cleanup, and re-throw */
+            CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION; 
+            throw;                   
+        }             
+        CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION; 
 
         if (ex) {
             BSONObjBuilder err;
@@ -851,47 +891,55 @@ namespace mongo {
         return ok;
     }
 
-    void checkAndInsert(const char *ns, /*modifies*/BSONObj& js) {
-        uassert( 10059 , "object to insert too large", js.objsize() <= BSONObjMaxUserSize);
-        {
-            BSONObjIterator i( js );
-            while ( i.more() ) {
-                BSONElement e = i.next();
+    void checkAndInsert(Client::Context& ctx, const char *ns, /*modifies*/BSONObj& js) {
+        if ( nsToCollectionSubstring( ns ) == "system.indexes" ) {
+            string targetNS = js["ns"].String();
+            uassertStatusOK( userAllowedWriteNS( targetNS ) );
 
-                // No '$' prefixed field names allowed.
-                // NOTE: We only check top level (scanning deep would be too expensive).
-                uassert( 13511,
-                         str::stream() << "Document can't have $ prefixed field names: "
-                                       << e.fieldName(),
-                         e.fieldName()[0] != '$' );
-
-                // check no regexp for _id (SERVER-9502)
-                // also, disallow undefined and arrays
-                if (str::equals(e.fieldName(), "_id")) {
-                    uassert(16824, "can't use a regex for _id", e.type() != RegEx);
-                    uassert(17150, "can't use undefined for _id", e.type() != Undefined);
-                    uassert(17151, "can't use an array for _id", e.type() != Array);
-                }
+            Collection* collection = ctx.db()->getCollection( targetNS );
+            if ( !collection ) {
+                // implicitly create
+                collection = ctx.db()->createCollection( targetNS );
+                verify( collection );
             }
+
+            // Only permit interrupting an (index build) insert if the
+            // insert comes from a socket client request rather than a
+            // parent operation using the client interface.  The parent
+            // operation might not support interrupts.
+            bool mayInterrupt = cc().curop()->parent() == NULL;
+
+            Status status = collection->getIndexCatalog()->createIndex( js, mayInterrupt );
+
+            if ( status.code() == ErrorCodes::IndexAlreadyExists )
+                return;
+
+            uassertStatusOK( status );
+            logOp( "i", ns, js );
+            return;
         }
 
-        theDataFileMgr.insertWithObjMod(ns,
-                                        // May be modified in the call to add an _id field.
-                                        js,
-                                        // Only permit interrupting an (index build) insert if the
-                                        // insert comes from a socket client request rather than a
-                                        // parent operation using the client interface.  The parent
-                                        // operation might not support interrupts.
-                                        cc().curop()->parent() == NULL,
-                                        false);
+        StatusWith<BSONObj> fixed = fixDocumentForInsert( js );
+        uassertStatusOK( fixed.getStatus() );
+        if ( !fixed.getValue().isEmpty() )
+            js = fixed.getValue();
+
+        Collection* collection = ctx.db()->getCollection( ns );
+        if ( !collection ) {
+            collection = ctx.db()->createCollection( ns );
+            verify( collection );
+        }
+
+        StatusWith<DiskLoc> status = collection->insertDocument( js, true );
+        uassertStatusOK( status.getStatus() );
         logOp("i", ns, js);
     }
 
-    NOINLINE_DECL void insertMulti(bool keepGoing, const char *ns, vector<BSONObj>& objs, CurOp& op) {
+    NOINLINE_DECL void insertMulti(Client::Context& ctx, bool keepGoing, const char *ns, vector<BSONObj>& objs, CurOp& op) {
         size_t i;
         for (i=0; i<objs.size(); i++){
             try {
-                checkAndInsert(ns, objs[i]);
+                checkAndInsert(ctx, ns, objs[i]);
                 getDur().commitIfNeeded();
             } catch (const UserException&) {
                 if (!keepGoing || i == objs.size()-1){
@@ -910,6 +958,8 @@ namespace mongo {
         DbMessage d(m);
         const char *ns = d.getns();
         op.debug().ns = ns;
+
+        uassertStatusOK( userAllowedWriteNS( ns ) );
 
         if( !d.moreJSObjs() ) {
             // strange.  should we complain?
@@ -945,9 +995,9 @@ namespace mongo {
                 
                 if (multi.size() > 1) {
                     const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
-                    insertMulti(keepGoing, ns, multi, op);
+                    insertMulti(ctx, keepGoing, ns, multi, op);
                 } else {
-                    checkAndInsert(ns, multi[0]);
+                    checkAndInsert(ctx, ns, multi[0]);
                     globalOpCounters.incInsertInWriteLock(1);
                     op.debug().ninserted = 1;
                 }
@@ -1051,7 +1101,7 @@ namespace {
     }
 
     void DBDirectClient::killCursor( long long id ) {
-        ClientCursor::erase( id );
+        CollectionCursorCache::eraseCursorGlobal( id );
     }
 
     HostAndPort DBDirectClient::_clientHost = HostAndPort( "0.0.0.0" , 0 );
@@ -1065,7 +1115,7 @@ namespace {
         Lock::DBRead lk( ns );
         string errmsg;
         int errCode;
-        long long res = runCount( ns.c_str() , _countCmd( ns , query , options , limit , skip ) , errmsg, errCode );
+        long long res = runCount( ns, _countCmd( ns , query , options , limit , skip ) , errmsg, errCode );
         if ( res == -1 ) {
             // namespace doesn't exist
             return 0;
@@ -1238,7 +1288,7 @@ namespace {
             return;
         }
 #endif
-        tryToOutputFatal( "dbexit: really exiting now" );
+        tryToOutputFatal( "dbexit: really exiting now\n" );
         if ( c ) c->shutdown();
         ::_exit(rc);
     }
