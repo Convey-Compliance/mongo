@@ -49,6 +49,7 @@ namespace mongo {
     class ExtentManager;
     class NamespaceDetails;
     class IndexCatalog;
+    class MultiIndexBlock;
 
     class CollectionIterator;
     class FlatIterator;
@@ -161,6 +162,8 @@ namespace mongo {
 
         StatusWith<DiskLoc> insertDocument( const DocWriter* doc, bool enforceQuota );
 
+        StatusWith<DiskLoc> insertDocument( const BSONObj& doc, MultiIndexBlock& indexBlock );
+
         /**
          * updates the document @ oldLocation with newDoc
          * if the document fits in the old space, it is put there
@@ -218,10 +221,11 @@ namespace mongo {
          *  - some user error checks
          *  - adjust padding
          */
-        StatusWith<DiskLoc> _insertDocument( const BSONObj& doc, bool enforceQuota );
+        StatusWith<DiskLoc> _insertDocument( const BSONObj& doc,
+                                             bool enforceQuota );
 
         void _compactExtent(const DiskLoc diskloc, int extentNumber,
-                            vector<IndexAccessMethod*>& indexesToInsertTo,
+                            MultiIndexBlock& indexesToInsertTo,
                             const CompactOptions* compactOptions, CompactStats* stats );
 
         // @return 0 for inf., otherwise a number of files
