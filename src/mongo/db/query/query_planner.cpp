@@ -183,6 +183,16 @@ namespace mongo {
                 return Status(ErrorCodes::BadValue, ss);
             }
 
+            // Make sure not to cache solutions which use '2d' indices.
+            // A 2d index that doesn't wrap on one query may wrap on another, so we have to
+            // check that the index is OK with the predicate. The only thing we have to do
+            // this for is 2d.  For now it's easier to move ahead if we don't cache 2d.
+            //
+            // TODO: revisit with a post-cached-index-assignment compatibility check
+            if (is2DIndex(relevantIndices[itag->index].keyPattern)) {
+                return Status(ErrorCodes::BadValue, "can't cache '2d' index");
+            }
+
             IndexEntry* ientry = new IndexEntry(relevantIndices[itag->index]);
             indexTree->entry.reset(ientry);
             indexTree->index_pos = itag->pos;
@@ -576,7 +586,6 @@ namespace mongo {
         QLOG() << query.root()->toString() << endl;
 
         // If there is a GEO_NEAR it must have an index it can use directly.
-        // XXX: move into data access?
         MatchExpression* gnNode = NULL;
         if (QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR, &gnNode)) {
             // No index for GEO_NEAR?  No query.
@@ -648,6 +657,8 @@ namespace mongo {
             tag->first.swap(newFirst);
 
             if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
+                // Don't leave tags on query tree.
+                query.root()->resetTag();
                 return Status::OK();
             }
         }
@@ -659,6 +670,8 @@ namespace mongo {
             // Error if the text node is tagged with zero indices, or if the text node is tagged
             // with greater than one index.
             if (1 != tag->first.size() + tag->notFirst.size()) {
+                // Don't leave tags on query tree.
+                query.root()->resetTag();
                 return Status(ErrorCodes::BadValue, "need exactly one text index for $text query");
             }
         }
@@ -710,6 +723,9 @@ namespace mongo {
                 }
             }
         }
+
+        // Don't leave tags on query tree.
+        query.root()->resetTag();
 
         QLOG() << "Planner: outputted " << out->size() << " indexed solutions.\n";
 

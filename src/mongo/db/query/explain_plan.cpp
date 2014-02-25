@@ -30,6 +30,7 @@
 
 #include <boost/algorithm/string/join.hpp>
 
+#include "mongo/db/exec/2dcommon.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/db/query/type_explain.h"
 #include "mongo/util/mongoutils/str.h"
@@ -212,7 +213,7 @@ namespace mongo {
                     nScannedObjects += childExplain->getNScanned();
                 }
             }
-            // XXX: Pick cursor name for backwards compatibility with 2.4.
+            // We set the cursor name for backwards compatibility with 2.4.
             res->setCursor("QueryOptimizerCursor");
             res->setNScanned(nScanned);
             res->setNScannedObjects(nScannedObjects);
@@ -232,8 +233,19 @@ namespace mongo {
             res->setCursor("GeoBrowse-" + nStats->type);
             res->setNScanned(leaf->common.works);
             res->setNScannedObjects(leaf->common.works);
-            // XXX: adding empty index bounds for backwards compatibility.
-            res->setIndexBounds(BSONObj());
+
+            // Generate index bounds from prefixes.
+            GeoHashConverter converter(nStats->converterParams);
+            BSONObjBuilder bob;
+            BSONArrayBuilder arrayBob(bob.subarrayStart(nStats->field));
+            for (size_t i = 0; i < nStats->expPrefixes.size(); ++i) {
+                const GeoHash& prefix = nStats->expPrefixes[i];
+                Box box = converter.unhashToBox(prefix);
+                arrayBob.append(box.toBSON());
+            }
+            arrayBob.doneFast();
+            res->setIndexBounds(bob.obj());
+
             // TODO: Could be multikey.
             res->setIsMultiKey(false);
             res->setIndexOnly(false);
@@ -244,7 +256,7 @@ namespace mongo {
             // The first work() is an init.  Every subsequent work examines a document.
             res->setNScanned(leaf->common.works);
             res->setNScannedObjects(leaf->common.works);
-            // XXX: adding empty index bounds for backwards compatibility.
+            // TODO: only adding empty index bounds for backwards compatibility.
             res->setIndexBounds(BSONObj());
             // TODO: Could be multikey.
             res->setIsMultiKey(false);
@@ -256,7 +268,7 @@ namespace mongo {
             // The first work() is an init.  Every subsequent work examines a document.
             res->setNScanned(nStats->nscanned);
             res->setNScannedObjects(nStats->objectsLoaded);
-            // XXX: adding empty index bounds for backwards compatibility.
+            // TODO: only adding empty index bounds for backwards compatibility.
             res->setIndexBounds(BSONObj());
             // TODO: Could be multikey.
             res->setIsMultiKey(false);
@@ -458,6 +470,20 @@ namespace mongo {
             bob->appendNumber("forcedFetches", spec->forcedFetches);
             bob->appendNumber("matchTested", spec->matchTested);
         }
+        else if (STAGE_GEO_2D == stats.stageType) {
+            TwoDStats* spec = static_cast<TwoDStats*>(stats.specific.get());
+            bob->append("geometryType", spec->type);
+            bob->append("field", spec->field);
+
+            // Generate verbose index bounds from prefixes
+            GeoHashConverter converter(spec->converterParams);
+            BSONArrayBuilder arrayBob(bob->subarrayStart("boundsVerbose"));
+            for (size_t i = 0; i < spec->expPrefixes.size(); ++i) {
+                const GeoHash& prefix = spec->expPrefixes[i];
+                Box box = converter.unhashToBox(prefix);
+                arrayBob.append(box.toString());
+            }
+        }
         else if (STAGE_GEO_NEAR_2D == stats.stageType) {
             TwoDNearStats* spec = static_cast<TwoDNearStats*>(stats.specific.get());
             bob->appendNumber("objectsLoaded", spec->objectsLoaded);
@@ -465,8 +491,8 @@ namespace mongo {
         }
         else if (STAGE_IXSCAN == stats.stageType) {
             IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
-            // XXX: how much do we really want here?  runtime stats vs. tree structure (soln
-            // tostring).
+            // TODO: how much do we really want here?  we should separate runtime stats vs. tree
+            // structure (soln tostring).
             bob->append("keyPattern", spec->keyPattern.toString());
             bob->append("boundsVerbose", spec->indexBoundsVerbose);
             bob->appendNumber("isMultiKey", spec->isMultiKey);
@@ -514,6 +540,12 @@ namespace mongo {
             statsToBSON(*stats.children[i], &childBob);
         }
         childrenBob.doneFast();
+    }
+
+    BSONObj statsToBSON(const PlanStageStats& stats) {
+        BSONObjBuilder bob;
+        statsToBSON(stats, &bob);
+        return bob.obj();
     }
 
     namespace {

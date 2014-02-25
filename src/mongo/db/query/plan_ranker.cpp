@@ -34,6 +34,7 @@
 
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/query/explain_plan.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/qlog.h"
 
@@ -61,6 +62,12 @@ namespace mongo {
         invariant(!candidates.empty());
         invariant(why);
 
+        // A plan that hits EOF is automatically scored above
+        // its peers. If multiple plans hit EOF during the same
+        // set of round-robin calls to work(), then all such plans
+        // receive the bonus.
+        double eofBonus = 1.0;
+
         // Each plan will have a stat tree.
         vector<PlanStageStats*> statTrees;
 
@@ -78,9 +85,14 @@ namespace mongo {
 
         // Compute score for each tree.  Record the best.
         for (size_t i = 0; i < statTrees.size(); ++i) {
-            QLOG() << "scoring plan " << i << ":\n" << candidates[i].solution->toString();
+            QLOG() << "scoring plan " << i << ":\n"
+                   << statsToBSON(*statTrees[i]).jsonString(Strict, true);
             double score = scoreTree(statTrees[i]);
             QLOG() << "score = " << score << endl;
+            if (statTrees[i]->common.isEOF) {
+                QLOG() << "adding +" << eofBonus << " EOF bonus to score" << endl;
+                score += 1;
+            }
             scoresAndCandidateindices.push_back(std::make_pair(score, i));
         }
 
@@ -96,6 +108,30 @@ namespace mongo {
         for (size_t i = 0; i < scoresAndCandidateindices.size(); ++i) {
             double score = scoresAndCandidateindices[i].first;
             size_t candidateIndex = scoresAndCandidateindices[i].second;
+
+            // We shouldn't cache the scores with the EOF bonus included,
+            // as this is just a tie-breaking measure for plan selection.
+            // Plans not run through the multi plan runner will not receive
+            // the bonus.
+            //
+            // An example of a bad thing that could happen if we stored scores
+            // with the EOF bonus included:
+            //
+            //   Let's say Plan A hits EOF, is the highest ranking plan, and gets
+            //   cached as such. On subsequent runs it will not receive the bonus.
+            //   Eventually the plan cache feedback mechanism will evict the cache
+            //   entry---the scores will appear to have fallen due to the missing
+            //   EOF bonus.
+            //
+            // This begs the question, why don't we include the EOF bonus in
+            // scoring of cached plans as well? The problem here is that the cached
+            // plan runner always runs plans to completion before scoring. Queries
+            // that don't get the bonus in the multi plan runner might get the bonus
+            // after being run from the plan cache.
+            if (statTrees[candidateIndex]->common.isEOF) {
+                score -= eofBonus;
+            }
+
             why->stats.mutableVector().push_back(statTrees[candidateIndex]);
             why->scores.push_back(score);
             why->candidateOrder.push_back(candidateIndex);
@@ -144,34 +180,39 @@ namespace mongo {
         double productivity = static_cast<double>(stats->common.advanced)
                             / static_cast<double>(stats->common.works);
 
-        // double score = baseScore + productivity;
-
-        // Does a plan have a sort?
-        // bool sort = hasSort(stats);
-        // double sortPenalty = sort ? 0.5 : 0;
-        // double score = baseScore + productivity - sortPenalty;
-
-        // How selective do we think an index is?
-        // double selectivity = computeSelectivity(stats);
-        // return baseScore + productivity + selectivity;
-
         // If we have to perform a fetch, that's not great.
         //
         // We only do this when we have a projection stage because we have so many jstests that
         // check bounds even when a collscan plan is just as good as the ixscan'd plan :(
         double noFetchBonus = 1;
+        double epsilon = 0.001;
 
         // We prefer covered projections.
         if (hasStage(STAGE_PROJECTION, stats) && hasStage(STAGE_FETCH, stats)) {
             // Just enough to break a tie.
-            noFetchBonus = 1 - 0.001;
+            noFetchBonus = 1 - epsilon;
         }
 
-        double score = baseScore + productivity + noFetchBonus;
+        // In the case of ties, prefer single index solutions to ixisect. Index
+        // intersection solutions are often slower than single-index solutions
+        // because they require examining a superset of index keys that would be
+        // examined by a single index scan.
+        //
+        // On the other hand, index intersection solutions examine the same
+        // number or fewer of documents. In the case that index intersection
+        // allows us to examine fewer documents, the penalty given to ixisect
+        // can be made up via the no fetch bonus.
+        double noIxisectBonus = epsilon;
+        if (hasStage(STAGE_AND_HASH, stats) || hasStage(STAGE_AND_SORTED, stats)) {
+            noIxisectBonus = 0;
+        }
 
-        QLOG() << "score (" << score << ") = baseScore (" << baseScore << ")"
+        double score = baseScore + productivity + noFetchBonus + noIxisectBonus;
+
+        QLOG() << "score (" << score << ") = baseScore(" << baseScore << ")"
                                      <<  " + productivity(" << productivity << ")"
                                      <<  " + noFetchBonus(" << noFetchBonus << ")"
+                                     <<  " + noIxisectBonus(" << noIxisectBonus << ")"
                                      << endl;
 
         return score;

@@ -29,6 +29,7 @@
 #include "mongo/db/query/canonical_query.h"
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/query_planner_common.h"
 
@@ -117,6 +118,61 @@ namespace {
     }
 
     /**
+     * Encodes GEO match expression.
+     * Encoding includes:
+     * - type of geo query (within/intersect/near)
+     * - geometry type
+     * - CRS (flat or spherical)
+     */
+    void encodeGeoMatchExpression(const GeoMatchExpression* tree, mongoutils::str::stream* os) {
+        const GeoQuery& geoQuery = tree->getGeoQuery();
+
+        // Type of geo query.
+        switch (geoQuery.getPred()) {
+        case GeoQuery::WITHIN: *os << "wi"; break;
+        case GeoQuery::INTERSECT: *os << "in"; break;
+        case GeoQuery::INVALID: *os << "id"; break;
+        }
+
+        // Geometry type.
+        // Only one of the shared_ptrs in GeoContainer may be non-NULL.
+        const GeometryContainer& geoContainer = geoQuery.getGeometry();
+        if (NULL != geoContainer._point) { *os << "pt"; }
+        else if (NULL != geoContainer._line) { *os << "ln"; }
+        else if (NULL != geoContainer._polygon) { *os << "pl"; }
+        else if (NULL != geoContainer._cap ) { *os << "cc"; }
+        else if (NULL != geoContainer._multiPoint) { *os << "mp"; }
+        else if (NULL != geoContainer._multiLine) { *os << "ml"; }
+        else if (NULL != geoContainer._multiPolygon) { *os << "my"; }
+        else if (NULL != geoContainer._geometryCollection) { *os << "gc"; }
+        else { invariant(NULL != geoContainer._box); *os << "bx"; }
+
+        // CRS (flat or spherical)
+        if (geoContainer.hasFlatRegion()) { *os << "fl"; }
+        else { invariant(geoContainer.hasS2Region()); *os << "sp"; }
+    }
+
+    /**
+     * Encodes GEO_NEAR match expression.
+     * Encode:
+     * - isNearSphere
+     * - CRS (flat or spherical)
+     */
+    void encodeGeoNearMatchExpression(const GeoNearMatchExpression* tree,
+                                      mongoutils::str::stream* os) {
+        const NearQuery& nearQuery = tree->getData();
+
+        // isNearSphere
+        *os << (nearQuery.isNearSphere ? "ns" : "nr");
+
+        // CRS (flat or spherical)
+        switch (nearQuery.centroid.crs) {
+        case FLAT: *os << "fl"; break;
+        case SPHERE: *os << "sp"; break;
+        }
+    }
+
+    /**
      * Traverses expression tree pre-order.
      * Appends an encoding of each node's match type and path name
      * to the output stream.
@@ -124,6 +180,15 @@ namespace {
     void encodePlanCacheKeyTree(const MatchExpression* tree, mongoutils::str::stream* os) {
         // Encode match type and path.
         *os << encodeMatchType(tree->matchType()) << tree->path();
+
+        // GEO and GEO_NEAR require additional encoding.
+        if (MatchExpression::GEO == tree->matchType()) {
+            encodeGeoMatchExpression(static_cast<const GeoMatchExpression*>(tree), os);
+        }
+        else if (MatchExpression::GEO_NEAR == tree->matchType()) {
+            encodeGeoNearMatchExpression(static_cast<const GeoNearMatchExpression*>(tree), os);
+        }
+
         // Traverse child nodes.
         for (size_t i = 0; i < tree->numChildren(); ++i) {
             encodePlanCacheKeyTree(tree->getChild(i), os);
@@ -159,6 +224,7 @@ namespace {
      * Encodes parsed projection into cache key.
      * Does a simple toString() on each projected field
      * in the BSON object.
+     * Orders the encoded elements in the projection by field name.
      * This handles all the special projection types ($meta, $elemMatch, etc.)
      */
     void encodePlanCacheKeyProj(const BSONObj& projObj, mongoutils::str::stream* os) {
@@ -168,9 +234,20 @@ namespace {
 
         *os << "p";
 
+        // Sorts the BSON elements by field name using a map.
+        std::map<StringData, BSONElement> elements;
+
         BSONObjIterator it(projObj);
         while (it.more()) {
             BSONElement elt = it.next();
+            StringData fieldName = elt.fieldNameStringData();
+            elements[fieldName] = elt;
+        }
+
+        // Read elements in order of field name
+        for (std::map<StringData, BSONElement>::const_iterator i = elements.begin();
+             i != elements.end(); ++i) {
+            const BSONElement& elt = (*i).second;
             // BSONElement::toString() arguments
             // includeFieldName - skip field name (appending after toString() result). false.
             // full: choose less verbose representation of child/data values. false.

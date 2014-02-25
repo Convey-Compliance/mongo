@@ -544,7 +544,7 @@ namespace mongo {
                        > ( serverGlobalParams.slowMS + currentOp->getExpectedLatencyMs() );
 
         if ( logAll || logSlow ) {
-            MONGO_TLOG(1) << currentOp->debug().report( *currentOp ) << endl;
+            MONGO_TLOG(0) << currentOp->debug().report( *currentOp ) << endl;
         }
 
         if ( currentOp->shouldDBProfile( executionTime ) ) {
@@ -654,7 +654,7 @@ namespace mongo {
                     if ( request.getOrdered() )
                         break;
                 }
-                killCurrentOp.checkForInterrupt(false);
+                killCurrentOp.checkForInterrupt();
             }
         }
         else {
@@ -669,7 +669,7 @@ namespace mongo {
                     if ( request.getOrdered() )
                         break;
                 }
-                killCurrentOp.checkForInterrupt(false);
+                killCurrentOp.checkForInterrupt();
             }
         }
 
