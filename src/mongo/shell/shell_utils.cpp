@@ -144,7 +144,8 @@ namespace mongo {
             BSONObjSet keys;
             getKeysForUpgradeChecking(index, doc, &keys);
             for (BSONObjSet::const_iterator key = keys.begin(); key != keys.end(); ++key) { 
-                if (key->objsize() > 1024) {
+                // recreation of the logic in KeyV1::dataSize() and BtreeBucket<V>::getKeyMax()
+                if (key->objsize() + 1 > 1024) {
                     return BSON("" << true);
                 }
             }                                                                           
@@ -178,6 +179,10 @@ namespace mongo {
             return BSON("" << shellGlobalParams.useWriteCommandsDefault);
         }
 
+        BSONObj writeMode(const BSONObj&, void*) {
+            return BSON("" << shellGlobalParams.writeMode);
+        }
+
         BSONObj interpreterVersion(const BSONObj& a, void* data) {
             uassert( 16453, "interpreterVersion accepts no arguments", a.nFields() == 0 );
             return BSON( "" << globalScriptEngine->getInterpreterVersionString() );
@@ -205,6 +210,7 @@ namespace mongo {
         void initScope( Scope &scope ) {
             // Need to define this method before JSFiles::utils is executed.
             scope.injectNative("_useWriteCommandsDefault", useWriteCommandsDefault);
+            scope.injectNative("_writeMode", writeMode);
             scope.externalSetup();
             mongo::shell_utils::installShellUtils( scope );
             scope.execSetup(JSFiles::servers);

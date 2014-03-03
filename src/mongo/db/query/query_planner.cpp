@@ -764,10 +764,11 @@ namespace mongo {
             && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)) {
 
             // See if we have a sort provided from an index already.
+            // This is implied by the presence of a non-blocking solution.
             bool usingIndexToSort = false;
             for (size_t i = 0; i < out->size(); ++i) {
                 QuerySolution* soln = (*out)[i];
-                if (!soln->hasSortStage) {
+                if (!soln->hasBlockingStage) {
                     usingIndexToSort = true;
                     break;
                 }
@@ -818,13 +819,19 @@ namespace mongo {
             }
         }
 
-        // TODO: Do we always want to offer a collscan solution?
-        // XXX: currently disabling the always-use-a-collscan in order to find more planner bugs.
-        if (    !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)
-             && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)
-             && hintIndex.isEmpty()
-             && ((params.options & QueryPlannerParams::INCLUDE_COLLSCAN) || (0 == out->size() && canTableScan)))
-        {
+        // geoNear and text queries *require* an index.
+        // Also, if a hint is specified it indicates that we MUST use it.
+        bool possibleToCollscan = !QueryPlannerCommon::hasNode(query.root(), MatchExpression::GEO_NEAR)
+                               && !QueryPlannerCommon::hasNode(query.root(), MatchExpression::TEXT)
+                               && hintIndex.isEmpty();
+
+        // The caller can explicitly ask for a collscan.
+        bool collscanRequested = (params.options & QueryPlannerParams::INCLUDE_COLLSCAN);
+
+        // No indexed plans?  We must provide a collscan if possible or else we can't run the query.
+        bool collscanNeeded = (0 == out->size() && canTableScan);
+
+        if (possibleToCollscan && (collscanRequested || collscanNeeded)) {
             QuerySolution* collscan = buildCollscanSoln(query, false, params);
             if (NULL != collscan) {
                 SolutionCacheData* scd = new SolutionCacheData();

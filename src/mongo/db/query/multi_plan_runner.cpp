@@ -219,7 +219,7 @@ namespace mongo {
 
         // If we haven't picked the best plan yet...
         if (NULL == _bestPlan) {
-            if (!pickBestPlan(NULL)) {
+            if (!pickBestPlan(NULL, objOut)) {
                 verify(_failure || _killed);
                 if (_killed) { return Runner::RUNNER_DEAD; }
                 if (_failure) { return Runner::RUNNER_ERROR; }
@@ -311,12 +311,12 @@ namespace mongo {
         return state;
     }
 
-    bool MultiPlanRunner::pickBestPlan(size_t* out) {
+    bool MultiPlanRunner::pickBestPlan(size_t* out, BSONObj* objOut) {
         static const int timesEachPlanIsWorked = 100;
 
         // Run each plan some number of times.
         for (int i = 0; i < timesEachPlanIsWorked; ++i) {
-            bool moreToDo = workAllPlans();
+            bool moreToDo = workAllPlans(objOut);
             if (!moreToDo) { break; }
         }
 
@@ -341,10 +341,10 @@ namespace mongo {
         QLOG() << "Winning solution:\n" << _bestSolution->toString() << endl;
 
         size_t backupChild = bestChild;
-        if (_bestSolution->hasSortStage && (0 == _alreadyProduced.size())) {
-            QLOG() << "Winner has blocked sort, looking for backup plan...\n";
+        if (_bestSolution->hasBlockingStage && (0 == _alreadyProduced.size())) {
+            QLOG() << "Winner has blocking stage, looking for backup plan...\n";
             for (size_t i = 0; i < _candidates.size(); ++i) {
-                if (!_candidates[i].solution->hasSortStage) {
+                if (!_candidates[i].solution->hasBlockingStage) {
                     QLOG() << "Candidate " << i << " is backup child\n";
                     backupChild = i;
                     _backupSolution = _candidates[i].solution;
@@ -430,7 +430,11 @@ namespace mongo {
         return true;
     }
 
-    bool MultiPlanRunner::workAllPlans() {
+    bool MultiPlanRunner::hasBackupPlan() const {
+        return NULL != _backupPlan;
+    }
+
+    bool MultiPlanRunner::workAllPlans(BSONObj* objOut) {
         bool planHitEOF = false;
 
         for (size_t i = 0; i < _candidates.size(); ++i) {
@@ -500,6 +504,11 @@ namespace mongo {
 
                 candidate.failed = true;
                 ++_failureCount;
+
+                // Propage most recent seen failure to parent.
+                if (PlanStage::FAILURE == state) {
+                    WorkingSetCommon::getStatusMemberObject(*candidate.ws, id, objOut);
+                }
 
                 if (_failureCount == _candidates.size()) {
                     _failure = true;

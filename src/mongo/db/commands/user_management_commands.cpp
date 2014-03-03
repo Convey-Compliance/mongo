@@ -266,7 +266,12 @@ namespace mongo {
     }
 
     static Status requireAuthSchemaVersion26Final(AuthorizationManager* authzManager) {
-        const int foundSchemaVersion = authzManager->getAuthorizationVersion();
+        int foundSchemaVersion;
+        Status status = authzManager->getAuthorizationVersion(&foundSchemaVersion);
+        if (!status.isOK()) {
+            return status;
+        }
+
         if (foundSchemaVersion != AuthorizationManager::schemaVersion26Final) {
             return Status(
                     ErrorCodes::AuthSchemaIncompatible,
@@ -278,7 +283,12 @@ namespace mongo {
     }
 
     static Status requireAuthSchemaVersion26UpgradeOrFinal(AuthorizationManager* authzManager) {
-        const int foundSchemaVersion = authzManager->getAuthorizationVersion();
+        int foundSchemaVersion;
+        Status status = authzManager->getAuthorizationVersion(&foundSchemaVersion);
+        if (!status.isOK()) {
+            return status;
+        }
+
         if (foundSchemaVersion != AuthorizationManager::schemaVersion26Final &&
             foundSchemaVersion != AuthorizationManager::schemaVersion26Upgrade) {
             return Status(
@@ -363,6 +373,14 @@ namespace mongo {
                         Status(ErrorCodes::BadValue,
                                "Must provide a 'pwd' field for all user documents, except those"
                                " with '$external' as the user's source db"));
+            }
+
+            if (args.hasHashedPassword && args.userName.getDB() == "$external") {
+                return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::BadValue,
+                               "Cannot set the password for users defined on the '$external' "
+                                       "database"));
             }
 
             if (!args.hasRoles) {
@@ -540,6 +558,14 @@ namespace mongo {
                         result,
                         Status(ErrorCodes::BadValue,
                                "Must specify at least one field to update in updateUser"));
+            }
+
+            if (args.hasHashedPassword && args.userName.getDB() == "$external") {
+                return appendCommandStatus(
+                        result,
+                        Status(ErrorCodes::BadValue,
+                               "Cannot set the password for users defined on the '$external' "
+                                       "database"));
             }
 
             BSONObjBuilder updateSetBuilder;
@@ -1118,7 +1144,11 @@ namespace mongo {
                 }
 
                 AuthorizationManager* authzManager = getGlobalAuthorizationManager();
-                int authzVersion = authzManager->getAuthorizationVersion();
+                int authzVersion;
+                Status status = authzManager->getAuthorizationVersion(&authzVersion);
+                if (!status.isOK()) {
+                    return appendCommandStatus(result, status);
+                }
                 NamespaceString usersNamespace =
                         authzVersion== AuthorizationManager::schemaVersion26Final ?
                                 AuthorizationManager::usersCollectionNamespace :

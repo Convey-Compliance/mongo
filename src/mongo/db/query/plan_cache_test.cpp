@@ -98,7 +98,35 @@ namespace {
                                                      skip, limit,
                                                      hintObj,
                                                      minObj, maxObj,
-                                                     false, &cq);
+                                                     false, // snapshot
+                                                     false, // explain
+                                                     &cq);
+        ASSERT_OK(result);
+        return cq;
+    }
+
+     CanonicalQuery* canonicalize(const char* queryStr, const char* sortStr,
+                                 const char* projStr,
+                                 long long skip, long long limit,
+                                 const char* hintStr,
+                                 const char* minStr, const char* maxStr,
+                                 bool snapshot,
+                                 bool explain) {
+        BSONObj queryObj = fromjson(queryStr);
+        BSONObj sortObj = fromjson(sortStr);
+        BSONObj projObj = fromjson(projStr);
+        BSONObj hintObj = fromjson(hintStr);
+        BSONObj minObj = fromjson(minStr);
+        BSONObj maxObj = fromjson(maxStr);
+        CanonicalQuery* cq;
+        Status result = CanonicalQuery::canonicalize(ns, queryObj, sortObj,
+                                                     projObj,
+                                                     skip, limit,
+                                                     hintObj,
+                                                     minObj, maxObj,
+                                                     snapshot,
+                                                     explain,
+                                                     &cq);
         ASSERT_OK(result);
         return cq;
     }
@@ -307,6 +335,22 @@ namespace {
         assertShouldCacheQuery(*cq);
     }
 
+    /**
+     * Explain queries are not-cacheable because of allPlans cannot
+     * be accurately generated from stale cached stats in the plan cache for
+     * non-winning plans.
+     */
+    TEST(PlanCacheTest, ShouldNotCacheQueryExplain) {
+        auto_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}", 0, 0, "{}",
+                                                 "{}", "{}", // min, max
+                                                 false, // snapshot
+                                                 true // explain
+                                                 ));
+        const LiteParsedQuery& pq = cq->getParsed();
+        ASSERT_TRUE(pq.isExplain());
+        assertShouldNotCacheQuery(*cq);
+    }
+
     // Adding an empty vector of query solutions should fail.
     TEST(PlanCacheTest, AddEmptySolutions) {
         PlanCache planCache;
@@ -487,7 +531,9 @@ namespace {
                           bool snapshot) {
             solns.clear();
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
-                                                    minObj, maxObj, snapshot, &cq);
+                                                    minObj, maxObj, snapshot,
+                                                    false, // explain
+                                                    &cq);
             if (!s.isOK()) { cq = NULL; }
             ASSERT_OK(s);
             s = QueryPlanner::plan(*cq, params, &solns);

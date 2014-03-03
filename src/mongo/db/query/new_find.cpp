@@ -235,12 +235,22 @@ namespace mongo {
             if (Runner::RUNNER_DEAD == state || Runner::RUNNER_ERROR == state) {
                 // Propagate this error to caller.
                 if (Runner::RUNNER_ERROR == state) {
+                    // Stats are helpful when errors occur.
+                    TypeExplain* bareExplain;
+                    Status res = runner->getInfo(&bareExplain, NULL);
+                    if (res.isOK()) {
+                        boost::scoped_ptr<TypeExplain> errorExplain(bareExplain);
+                        error() << "Runner error, stats:\n"
+                                << errorExplain->stats.jsonString(Strict, true);
+                    }
+
                     uasserted(17406, "getMore runner error: " +
                               WorkingSetCommon::toStatusString(obj));
                 }
 
                 // If we're dead there's no way to get more results.
                 saveClientCursor = false;
+
                 // In the old system tailable capped cursors would be killed off at the
                 // cursorid level.  If a tailable capped cursor is nuked the cursorid
                 // would vanish.
@@ -587,6 +597,13 @@ namespace mongo {
 
         // Caller expects exceptions thrown in certain cases.
         if (Runner::RUNNER_ERROR == state) {
+            TypeExplain* bareExplain;
+            Status res = runner->getInfo(&bareExplain, NULL);
+            if (res.isOK()) {
+                boost::scoped_ptr<TypeExplain> errorExplain(bareExplain);
+                error() << "Runner error, stats:\n"
+                        << errorExplain->stats.jsonString(Strict, true);
+            }
             uasserted(17144, "Runner error: " + WorkingSetCommon::toStatusString(obj));
         }
 
@@ -613,10 +630,19 @@ namespace mongo {
                                            shardingState.getVersion(pq.ns()));
         }
 
-        // Get explain information if it is needed by either the profiler
-        // or by an explain() query.
+        // Used to fill in explain and to determine if the query is slow enough to be logged.
+        int elapsedMillis = curop.elapsedMillis();
+
+        // Get explain information if:
+        // 1) it is needed by an explain query;
+        // 2) profiling is enabled; or
+        // 3) profiling is disabled but we still need explain details to log a "slow" query.
+        // Producing explain information is expensive and should be done only if we are certain
+        // the information will be used.
         boost::scoped_ptr<TypeExplain> explain(NULL);
-        if (isExplain || ctx.ctx().db()->getProfilingLevel() > 0) {
+        if (isExplain ||
+            ctx.ctx().db()->getProfilingLevel() > 0 ||
+            elapsedMillis > serverGlobalParams.slowMS) {
             // Ask the runner to produce explain information.
             TypeExplain* bareExplain;
             Status res = runner->getInfo(&bareExplain, NULL);
@@ -648,7 +674,7 @@ namespace mongo {
             explain->setN(numResults);
 
             // Clock the whole operation.
-            explain->setMillis(curop.elapsedMillis());
+            explain->setMillis(elapsedMillis);
 
             BSONObj explainObj = explain->toBSON();
             bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
@@ -723,6 +749,10 @@ namespace mongo {
 
             if (explain->isNScannedSet()) {
                 curop.debug().nscanned = explain->getNScanned();
+            }
+
+            if (explain->isNScannedObjectsSet()) {
+                curop.debug().nscannedObjects = explain->getNScannedObjects();
             }
 
             if (explain->isIDHackSet()) {

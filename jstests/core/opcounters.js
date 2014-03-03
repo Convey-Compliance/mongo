@@ -1,9 +1,10 @@
 // Test that opcounters get incremented properly.
-
 var t = db.opcounters;
 var isMongos = ("isdbgrid" == db.runCommand("ismaster").msg);
 var opCounters;
 var res;
+
+assert(t.getDB().getMongo().useWriteCommands(), "test is not running with write commands")
 
 //
 // Count ops attempted in write commands in mongod and mongos
@@ -24,34 +25,41 @@ t.drop();
 // Single insert, no error.
 opCounters = db.serverStatus().opcounters;
 res = t.insert({_id:0});
-assert(!res.hasWriteErrors());
+assert.writeOK(res);
 assert.eq(opCounters.insert + 1, db.serverStatus().opcounters.insert);
 
 // Bulk insert, no error.
 opCounters = db.serverStatus().opcounters;
 res = t.insert([{_id:1},{_id:2}])
-assert(!res.hasWriteErrors());
+assert.writeOK(res);
 assert.eq(opCounters.insert + 2, db.serverStatus().opcounters.insert);
 
 // Single insert, with error.
 opCounters = db.serverStatus().opcounters;
 res = t.insert({_id:0})
-print(res.getWriteError())
-assert(res.hasWriteErrors());
-assert.eq(opCounters.insert + 1, db.serverStatus().opcounters.insert);
+assert.writeError(res);
+if (t.getMongo().writeMode() == "commands")
+    assert.eq(opCounters.insert + 1, db.serverStatus().opcounters.insert);
+else
+    assert.eq(opCounters.insert, db.serverStatus().opcounters.insert);
 
 // Bulk insert, with error, ordered.
 opCounters = db.serverStatus().opcounters;
 res = t.insert([{_id:3},{_id:3},{_id:4}])
-assert(res.hasWriteErrors());
-assert.eq(opCounters.insert + 2, db.serverStatus().opcounters.insert);
-
+assert.writeError(res);
+if (t.getMongo().writeMode() == "commands")
+    assert.eq(opCounters.insert + 2, db.serverStatus().opcounters.insert);
+else
+    assert.eq(opCounters.insert + 1, db.serverStatus().opcounters.insert);
 // Bulk insert, with error, unordered.
 var continueOnErrorFlag = 1;
 opCounters = db.serverStatus().opcounters;
 res = t.insert([{_id:5},{_id:5},{_id:6}], continueOnErrorFlag)
-assert(res.hasWriteErrors());
-assert.eq(opCounters.insert + 3, db.serverStatus().opcounters.insert);
+assert.writeError(res);
+if (t.getMongo().writeMode() == "commands")
+    assert.eq(opCounters.insert + 3, db.serverStatus().opcounters.insert);
+else
+    assert.eq(opCounters.insert + 2, db.serverStatus().opcounters.insert);
 
 //
 // 2. Update.
@@ -63,13 +71,13 @@ t.insert({_id:0});
 // Update, no error.
 opCounters = db.serverStatus().opcounters;
 res = t.update({_id:0}, {$set:{a:1}});
-assert(!res.hasWriteErrors());
+assert.writeOK(res);
 assert.eq(opCounters.update + 1, db.serverStatus().opcounters.update);
 
 // Update, with error.
 opCounters = db.serverStatus().opcounters;
 res = t.update({_id:0}, {$set:{_id:1}});
-assert(res.hasWriteErrors());
+assert.writeError(res);
 assert.eq(opCounters.update + 1, db.serverStatus().opcounters.update);
 
 //
@@ -82,13 +90,13 @@ t.insert([{_id:0},{_id:1}]);
 // Delete, no error.
 opCounters = db.serverStatus().opcounters;
 res = t.remove({_id:0});
-assert(!res.hasWriteErrors());
+assert.writeOK(res);
 assert.eq(opCounters.delete + 1, db.serverStatus().opcounters.delete);
 
 // Delete, with error.
 opCounters = db.serverStatus().opcounters;
 res = t.remove({_id:{$invalidOp:1}});
-assert(res.hasWriteErrors());
+assert.writeError(res);
 assert.eq(opCounters.delete + 1, db.serverStatus().opcounters.delete);
 
 //

@@ -146,7 +146,9 @@ namespace {
                           bool snapshot) {
             solns.clear();
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
-                                                    minObj, maxObj, snapshot, &cq);
+                                                    minObj, maxObj, snapshot,
+                                                    false, // explain
+                                                    &cq);
             if (!s.isOK()) { cq = NULL; }
             ASSERT_OK(s);
             s = QueryPlanner::plan(*cq, params, &solns);
@@ -196,7 +198,9 @@ namespace {
                                  bool snapshot) {
             solns.clear();
             Status s = CanonicalQuery::canonicalize(ns, query, sort, proj, skip, limit, hint,
-                                                    minObj, maxObj, snapshot, &cq);
+                                                    minObj, maxObj, snapshot,
+                                                    false, // explain
+                                                    &cq);
             if (!s.isOK()) { cq = NULL; }
             ASSERT_OK(s);
             s = QueryPlanner::plan(*cq, params, &solns);
@@ -447,7 +451,7 @@ namespace {
     TEST_F(QueryPlannerTest, ExistsTrue) {
         addIndex(BSON("x" << 1));
 
-        runQuery(fromjson("{x: 1, y: {$exists: true}}"));
+        runQuery(fromjson("{x: {$exists: true}}"));
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
@@ -457,7 +461,7 @@ namespace {
     TEST_F(QueryPlannerTest, ExistsFalse) {
         addIndex(BSON("x" << 1));
 
-        runQuery(fromjson("{x: 1, y: {$exists: false}}"));
+        runQuery(fromjson("{x: {$exists: false}}"));
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
@@ -467,7 +471,7 @@ namespace {
     TEST_F(QueryPlannerTest, ExistsTrueSparseIndex) {
         addIndex(BSON("x" << 1), false, true);
 
-        runQuery(fromjson("{x: 1, y: {$exists: true}}"));
+        runQuery(fromjson("{x: {$exists: true}}"));
 
         assertNumSolutions(2U);
         assertSolutionExists("{cscan: {dir: 1}}");
@@ -475,6 +479,45 @@ namespace {
     }
 
     TEST_F(QueryPlannerTest, ExistsFalseSparseIndex) {
+        addIndex(BSON("x" << 1), false, true);
+
+        runQuery(fromjson("{x: {$exists: false}}"));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+    }
+
+    TEST_F(QueryPlannerTest, ExistsTrueOnUnindexedField) {
+        addIndex(BSON("x" << 1));
+
+        runQuery(fromjson("{x: 1, y: {$exists: true}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {x: 1}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, ExistsFalseOnUnindexedField) {
+        addIndex(BSON("x" << 1));
+
+        runQuery(fromjson("{x: 1, y: {$exists: false}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {x: 1}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, ExistsTrueSparseIndexOnOtherField) {
+        addIndex(BSON("x" << 1), false, true);
+
+        runQuery(fromjson("{x: 1, y: {$exists: true}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {node: {ixscan: {pattern: {x: 1}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, ExistsFalseSparseIndexOnOtherField) {
         addIndex(BSON("x" << 1), false, true);
 
         runQuery(fromjson("{x: 1, y: {$exists: false}}"));
@@ -2806,18 +2849,18 @@ namespace {
     // SERVER-12196
     TEST_F(QueryPlannerTest, IntersectBasicTwoPredCompoundMatchesIdxOrder1) {
         params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
-        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("a" << 1));
         addIndex(BSON("b" << 1));
         runQuery(fromjson("{a:1, b:1}"));
 
         assertNumSolutions(3U);
 
-        assertSolutionExists("{fetch: {filter: null, node: "
-                                 "{ixscan: {filter: null, pattern: {a:1, b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {b:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1}}}}}");
         assertSolutionExists("{fetch: {filter: {a:1}, node: "
                                  "{ixscan: {filter: null, pattern: {b:1}}}}}");
-        assertSolutionExists("{fetch: {filter: null, node: {andHash: {nodes: ["
-                                 "{ixscan: {filter: null, pattern: {a:1, b:1}}},"
+        assertSolutionExists("{fetch: {filter: null, node: {andSorted: {nodes: ["
+                                 "{ixscan: {filter: null, pattern: {a:1}}},"
                                  "{ixscan: {filter: null, pattern: {b:1}}}]}}}}");
     }
 
@@ -2825,29 +2868,40 @@ namespace {
     TEST_F(QueryPlannerTest, IntersectBasicTwoPredCompoundMatchesIdxOrder2) {
         params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
         addIndex(BSON("b" << 1));
-        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("a" << 1));
         runQuery(fromjson("{a:1, b:1}"));
 
         assertNumSolutions(3U);
 
-        assertSolutionExists("{fetch: {filter: null, node: "
-                                 "{ixscan: {filter: null, pattern: {a:1, b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {b:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1}}}}}");
         assertSolutionExists("{fetch: {filter: {a:1}, node: "
                                  "{ixscan: {filter: null, pattern: {b:1}}}}}");
-        assertSolutionExists("{fetch: {filter: null, node: {andHash: {nodes: ["
-                                 "{ixscan: {filter: null, pattern: {a:1, b:1}}},"
+        assertSolutionExists("{fetch: {filter: null, node: {andSorted: {nodes: ["
+                                 "{ixscan: {filter: null, pattern: {a:1}}},"
                                  "{ixscan: {filter: null, pattern: {b:1}}}]}}}}");
     }
 
-    TEST_F(QueryPlannerTest, IntersectBasicMultikey) {
+    TEST_F(QueryPlannerTest, IntersectManySelfIntersections) {
         params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
         // True means multikey.
         addIndex(BSON("a" << 1), true);
-        // We can't combine bounds for the multikey case so we have one scan per pred.
-        runQuery(fromjson("{a:1, a:2}"));
-        assertSolutionExists("{fetch: {filter: null, node: {andSorted: {nodes: ["
-                                    "{ixscan: {filter: null, pattern: {a:1}}},"
-                                    "{ixscan: {filter: null, pattern: {a:1}}}]}}}}");
+
+        // This one goes to 11.
+        runQuery(fromjson("{a:1, a:2, a:3, a:4, a:5, a:6, a:7, a:8, a:9, a:10, a:11}"));
+
+        // But this one only goes to 10.
+        assertSolutionExists("{fetch: {filter: {a:11}, node: {andSorted: {nodes: ["
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 1
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 2
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 3
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 4
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 5
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 6
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 7
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 8
+                                    "{ixscan: {filter: null, pattern: {a:1}}},"   // 9
+                                    "{ixscan: {filter: null, pattern: {a:1}}}]}}}}");   // 10
     }
 
     TEST_F(QueryPlannerTest, IntersectSubtreeNodes) {
@@ -2921,6 +2975,80 @@ namespace {
                                  "{ 'a' : null, 'b' : 16, 'c' : null, 'd' : null }]}"));
 
         ASSERT_LESS_THAN(getNumSolutions(), 10U);
+    }
+
+    //
+    // Index intersection cases for SERVER-12825: make sure that
+    // we don't generate an ixisect plan if a compound index is
+    // available instead.
+    //
+
+    // SERVER-12825
+    TEST_F(QueryPlannerTest, IntersectCompoundInsteadBasic) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+        addIndex(BSON("a" << 1 << "b" << 1));
+        runQuery(fromjson("{a: 1, b: 1}"));
+
+        assertNumSolutions(3U);
+        assertSolutionExists("{fetch: {filter: {b:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,b:1}}}}}");
+    }
+
+    // SERVER-12825
+    TEST_F(QueryPlannerTest, IntersectCompoundInsteadThreeCompoundIndices) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("c" << 1 << "d" << 1));
+        addIndex(BSON("a" << 1 << "c" << -1 << "b" << -1 << "d" << 1));
+        runQuery(fromjson("{a: 1, b: 1, c: 1, d: 1}"));
+
+        assertNumSolutions(3U);
+        assertSolutionExists("{fetch: {filter: {$and: [{c:1},{d:1}]}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {$and:[{a:1},{b:1}]}, node: "
+                                 "{ixscan: {filter: null, pattern: {c:1,d:1}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,c:-1,b:-1,d:1}}}}}");
+    }
+
+    // SERVER-12825
+    TEST_F(QueryPlannerTest, IntersectCompoundInsteadUnusedField) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1));
+        runQuery(fromjson("{a: 1, b: 1}"));
+
+        assertNumSolutions(3U);
+        assertSolutionExists("{fetch: {filter: {b:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,b:1,c:1}}}}}");
+    }
+
+    // SERVER-12825
+    TEST_F(QueryPlannerTest, IntersectCompoundInsteadUnusedField2) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN | QueryPlannerParams::INDEX_INTERSECTION;
+        addIndex(BSON("a" << 1 << "b" << 1));
+        addIndex(BSON("c" << 1 << "d" << 1));
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1));
+        runQuery(fromjson("{a: 1, c: 1}"));
+
+        assertNumSolutions(3U);
+        assertSolutionExists("{fetch: {filter: {c:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,b:1}}}}}");
+        assertSolutionExists("{fetch: {filter: {a:1}, node: "
+                                 "{ixscan: {filter: null, pattern: {c:1,d:1}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: "
+                                 "{ixscan: {filter: null, pattern: {a:1,b:1,c:1}}}}}");
     }
 
     //

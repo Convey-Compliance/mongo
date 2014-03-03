@@ -145,7 +145,7 @@ namespace mongo {
                             bool mayInterrupt,
                             ShutdownBehavior shutdownBehavior = SHUTDOWN_CLEANUP );
 
-        Status okToAddIndex( const BSONObj& spec ) const;
+        StatusWith<BSONObj> prepareSpecForCreate( const BSONObj& original ) const;
 
         Status dropAllIndexes( bool includingIdIndex );
 
@@ -236,9 +236,9 @@ namespace mongo {
             return _getAccessMethodName( keyPattern );
         }
 
-        // public static helpers
+        Status _upgradeDatabaseMinorVersionIfNeeded( const string& newPluginName );
 
-        static BSONObj fixIndexSpec( const BSONObj& spec );
+        // public static helpers
 
         static BSONObj fixIndexKey( const BSONObj& key );
 
@@ -247,8 +247,6 @@ namespace mongo {
         // creates a new thing, no caching
         IndexAccessMethod* _createAccessMethod( const IndexDescriptor* desc,
                                                 IndexCatalogEntry* entry );
-
-        Status _upgradeDatabaseMinorVersionIfNeeded( const string& newPluginName );
 
         int _removeFromSystemIndexes( const StringData& indexName );
 
@@ -287,6 +285,12 @@ namespace mongo {
 
         // descriptor ownership passes to _setupInMemoryStructures
         IndexCatalogEntry* _setupInMemoryStructures( IndexDescriptor* descriptor );
+
+        static BSONObj _fixIndexSpec( const BSONObj& spec );
+
+        Status _isSpecOk( const BSONObj& spec ) const;
+
+        Status _doesSpecConflictWithExisting( const BSONObj& spec ) const;
 
         int _magic;
         Collection* _collection;

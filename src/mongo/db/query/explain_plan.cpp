@@ -204,6 +204,18 @@ namespace mongo {
                 TypeExplain* childExplain = NULL;
                 explainPlan(**it, &childExplain, false /* no full details */);
                 if (childExplain) {
+                    // Override child's indexOnly value if we have a non-covered
+                    // query (implied by a FETCH stage).
+                    //
+                    // As we run explain on each child, explainPlan() sets indexOnly
+                    // based only on the information in each child. This does not
+                    // consider the possibility of a FETCH stage above the OR/MERGE_SORT
+                    // stage, in which case the child's indexOnly may be erroneously set
+                    // to true.
+                    if (!covered && childExplain->isIndexOnlySet()) {
+                        childExplain->setIndexOnly(false);
+                    }
+
                     // 'res' takes ownership of 'childExplain'.
                     res->addToClauses(childExplain);
                     nScanned += childExplain->getNScanned();
@@ -448,6 +460,8 @@ namespace mongo {
             AndHashStats* spec = static_cast<AndHashStats*>(stats.specific.get());
             bob->appendNumber("flaggedButPassed", spec->flaggedButPassed);
             bob->appendNumber("flaggedInProgress", spec->flaggedInProgress);
+            bob->appendNumber("memUsage", spec->memUsage);
+            bob->appendNumber("memLimit", spec->memLimit);
             for (size_t i = 0; i < spec->mapAfterChild.size(); ++i) {
                 bob->appendNumber(string(stream() << "mapAfterChild_" << i), spec->mapAfterChild[i]);
             }
@@ -520,6 +534,8 @@ namespace mongo {
         else if (STAGE_SORT == stats.stageType) {
             SortStats* spec = static_cast<SortStats*>(stats.specific.get());
             bob->appendNumber("forcedFetches", spec->forcedFetches);
+            bob->appendNumber("memUsage", spec->memUsage);
+            bob->appendNumber("memLimit", spec->memLimit);
         }
         else if (STAGE_SORT_MERGE == stats.stageType) {
             MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());

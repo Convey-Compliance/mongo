@@ -8,7 +8,14 @@ documentUpgradeCheck = function(indexes, doc) {
     indexes.forEach(function(idx) {
         if (keyTooLong({index: idx, doc: doc})) {
             print("Document:\n\t" + tojson(doc) + "\n\tcannot be indexed by: " + idx.name);
-            print("Remove this document via the _id field");
+            if (idx.name === "_id_") {
+                print("As a result, this document cannot be removed by its _id index. Instead, " +
+                      "try to remove it by all other fields (omit any fields that have been " +
+                      "identified as unindexable by the upgrade checker).");
+            }
+            else {
+                print("Remove this document via the _id field");
+            }
             goodSoFar = false;
         }
     });
@@ -89,8 +96,47 @@ dbUpgradeCheck = function(dbName) {
     return goodSoFar;
 }
 
-upgradeCheck = function() { 
-    print("\tChecking for 2.6 upgrade compatibility");
+upgradeCheck = function(obj) { 
+    // parse args if there are any
+    if (obj) {
+        // check collection if a collection is passed
+        if (obj["collection"]) {
+            // make sure a string was passed in for the collection
+            if (typeof obj["collection"] !== "string") {
+                print("The collection field must contain a string");
+                return false;
+            }
+        }
+
+        if (obj["db"]) {
+            // make sure a string was passed in for the db
+            if (typeof obj["db"] !== "string") {
+                print("The db field must contain a string");
+                return false;
+            }
+
+            // check only the collection if it was passed it
+            if (obj["collection"]) {
+                print("\tChecking collection '" + obj["db"] + '.' + obj["collection"] +
+                      "' for 2.6 upgrade compatibility");
+                return collUpgradeCheck(obj["db"], obj["collection"]);
+            }
+
+            //otherwise check entire db
+            print("\tChecking database '" + obj["db"] + "' for 2.6 upgrade compatibility");
+            return dbUpgradeCheck(obj["db"]);
+        }
+        if (obj["collection"]) {
+            print("\tChecking collection '" + db.getName() + '.' + obj["collection"] +
+                  "' for 2.6 upgrade compatibility");
+            return collUpgradeCheck(db.getName(), obj["collection"]);
+        }
+        print("When passing an argument to upgradeCheck, it must be of the form {db: " +
+              "<dbNameString>, collection: <collectionNameString>} (either field may be omitted)");
+        return false;
+    }
+
+    print("\tChecking mongod instance for 2.6 upgrade compatibility");
     var dbs = db.getMongo().getDBs();
     var goodSoFar = true;
 

@@ -30,6 +30,7 @@
 
 #include "mongo/db/catalog/index_create.h"
 
+#include "mongo/base/error_codes.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
@@ -128,7 +129,7 @@ namespace mongo {
                 }
             }
             catch( AssertionException& e ) {
-                if( e.interrupted() ) {
+                if (ErrorCodes::isInterruption(DBException::convertExceptionCode(e.getCode()))) {
                     killCurrentOp.checkForInterrupt();
                 }
 
@@ -293,13 +294,32 @@ namespace mongo {
     }
 
     Status MultiIndexBlock::init( std::vector<BSONObj>& indexSpecs ) {
+
         for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
             BSONObj info = indexSpecs[i];
-            info = _collection->getIndexCatalog()->fixIndexSpec( info );
+
+            string pluginName = IndexNames::findPluginName( info["key"].Obj() );
+            if ( pluginName.size() ) {
+                Status s =
+                    _collection->getIndexCatalog()->_upgradeDatabaseMinorVersionIfNeeded(pluginName);
+                if ( !s.isOK() )
+                    return s;
+            }
+
+        }
+
+        for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
+            BSONObj info = indexSpecs[i];
+            StatusWith<BSONObj> statusWithInfo =
+                _collection->getIndexCatalog()->prepareSpecForCreate( info );
+            Status status = statusWithInfo.getStatus();
+            if ( !status.isOK() )
+                return status;
+            info = statusWithInfo.getValue();
 
             IndexState state;
             state.block.reset( new IndexCatalog::IndexBuildBlock( _collection, info ) );
-            Status status = state.block->init();
+            status = state.block->init();
             if ( !status.isOK() )
                 return status;
 

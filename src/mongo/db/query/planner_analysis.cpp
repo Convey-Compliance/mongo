@@ -446,9 +446,16 @@ namespace mongo {
             solnRoot = sfn;
         }
 
-        solnRoot = analyzeSort(query, params, solnRoot, &soln->hasSortStage);
+        bool hasSortStage = false;
+        solnRoot = analyzeSort(query, params, solnRoot, &hasSortStage);
+
         // This can happen if we need to create a blocking sort stage and we're not allowed to.
         if (NULL == solnRoot) { return NULL; }
+
+        // A solution can be blocking if it has a blocking sort stage or
+        // a hashed AND stage.
+        bool hasAndHashStage = hasNode(solnRoot, STAGE_AND_HASH);
+        soln->hasBlockingStage = hasSortStage || hasAndHashStage;
 
         // If we can (and should), add the keep mutations stage.
 
@@ -469,12 +476,12 @@ namespace mongo {
         bool cannotKeepFlagged = hasNode(solnRoot, STAGE_TEXT)
                               || hasNode(solnRoot, STAGE_GEO_NEAR_2D)
                               || hasNode(solnRoot, STAGE_GEO_NEAR_2DSPHERE)
-                              || (!query.getParsed().getSort().isEmpty() && !soln->hasSortStage);
+                              || (!query.getParsed().getSort().isEmpty() && !hasSortStage);
 
         // Only these stages can produce flagged results.  A stage has to hold state past one call
         // to work(...) in order to possibly flag a result.
         bool couldProduceFlagged = hasNode(solnRoot, STAGE_GEO_2D)
-                                || hasNode(solnRoot, STAGE_AND_HASH)
+                                || hasAndHashStage
                                 || hasNode(solnRoot, STAGE_AND_SORTED)
                                 || hasNode(solnRoot, STAGE_FETCH);
 
@@ -561,7 +568,7 @@ namespace mongo {
         // Otherwise, we need to limit the results in the case of a hard limit
         // (ie. limit in raw query is negative)
         if (0 != query.getParsed().getNumToReturn() &&
-            !soln->hasSortStage &&
+            !hasSortStage &&
             !query.getParsed().wantMore()) {
 
             LimitNode* limit = new LimitNode();
