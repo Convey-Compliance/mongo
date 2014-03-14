@@ -74,14 +74,13 @@ var strings = [
 ];
 
 var nItems = 200000;
+var bulk = db.ts1.initializeUnorderedBulkOp();
 for(i = 1; i <= nItems; ++i) {
-    db.ts1.save(
+    bulk.insert(
         {counter: ++count, number: strings[i % 20], random: Math.random(),
          filler: "0123456789012345678901234567890123456789"});
 }
-
-// wait for all writebacks to be applied
-assert.eq(db.getLastError(), null);
+assert.writeOK(bulk.execute());
 
 // Turn on exception tracing in mongod to figure out exactly where the SCEs are coming from
 // TEMPORARY - REMOVE ONCE SERVER-9622 IS RESOLVED
@@ -154,7 +153,7 @@ for(i = 0; i < 6; ++i) {
     c = a4[i].counter;
     printjson({c:c})
     assert((c == 55) || (c == 1111) || (c == 2222) ||
-           (c == 33333) || (c = 99999) || (c == 55555),
+           (c == 33333) || (c == 99999) || (c == 55555),
            'agg sharded test simple match failed');
 }
 

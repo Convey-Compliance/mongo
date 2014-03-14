@@ -31,12 +31,14 @@
 #include <memory>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/ops/delete.h"
+#include "mongo/db/ops/delete_executor.h"
+#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/update_executor.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -152,7 +154,17 @@ namespace mongo {
 
         Status wcStatus = Status::OK();
         if ( wcDoc.isEmpty() ) {
-            wcStatus = writeConcern.parse( _defaultWriteConcern );
+
+            // The default write concern if empty is w : 1
+            // Specifying w : 0 is/was allowed, but is interpreted identically to w : 1
+
+            wcStatus = writeConcern.parse(
+                _defaultWriteConcern.isEmpty() ?
+                    WriteConcernOptions::Acknowledged : _defaultWriteConcern );
+
+            if ( writeConcern.wNumNodes == 0 && writeConcern.wMode.empty() ) {
+                writeConcern.wNumNodes = 1;
+            }
         }
         else {
             wcStatus = writeConcern.parse( wcDoc );
@@ -164,6 +176,15 @@ namespace mongo {
 
         if ( !wcStatus.isOK() ) {
             toBatchError( wcStatus, response );
+            return;
+        }
+
+        // Validate batch size
+        if ( request.sizeWriteOps() > BatchedCommandRequest::kMaxWriteBatchSize ) {
+            toBatchError( Status( ErrorCodes::FailedToParse,
+                                  stream() << "exceeded maximum write batch size of "
+                                           << BatchedCommandRequest::kMaxWriteBatchSize ),
+                          response );
             return;
         }
 
@@ -454,7 +475,8 @@ namespace mongo {
         currentOp->debug().op = currentOp->getOp();
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
-            // No-op for insert, we don't update query or updateobj
+            currentOp->setQuery( currWrite.getDocument() );
+            currentOp->debug().query = currWrite.getDocument();
         }
         else if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Update ) {
             currentOp->setQuery( currWrite.getUpdate()->getQuery() );
@@ -473,7 +495,7 @@ namespace mongo {
     void WriteBatchExecutor::incOpStats( const BatchItemRef& currWrite ) {
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
-            // No-op, for inserts we increment not on the op but once for each write
+            _opCounters->gotInsert();
         }
         else if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Update ) {
             _opCounters->gotUpdate();
@@ -490,8 +512,6 @@ namespace mongo {
                                             CurOp* currentOp ) {
 
         if ( currWrite.getOpType() == BatchedCommandRequest::BatchType_Insert ) {
-            // We increment batch inserts like individual inserts
-            _opCounters->gotInsert();
             _stats->numInserted += stats.n;
             _le->nObjects = stats.n;
             currentOp->debug().ninserted += stats.n;
@@ -632,8 +652,6 @@ namespace mongo {
 
         if ( request.getBatchType() == BatchedCommandRequest::BatchType_Insert ) {
             execInserts( request, errors );
-            // Note: not checking for interrupt in bulk inserts, as we are not yet
-            // handling the curops/profiling properly.
         }
         else if ( request.getBatchType() == BatchedCommandRequest::BatchType_Update ) {
             for ( size_t i = 0; i < request.sizeWriteOps(); i++ ) {
@@ -708,13 +726,6 @@ namespace mongo {
         const NamespaceString nss( request.getTargetingNS() );
         scoped_ptr<BatchItemRef> currInsertItem( new BatchItemRef( &request, 0 ) );
 
-        //
-        // BEGIN CURRENT OP
-        //
-
-        scoped_ptr<CurOp> currentOp( beginCurrentOp( _client, *currInsertItem ) );
-        incOpStats( *currInsertItem );
-
         // Go through our request and do some preprocessing on insert documents outside the lock to
         // validate and put them in a normalized form - i.e. put _id in front and fill in
         // timestamps.  The insert document may also be invalid.
@@ -722,13 +733,17 @@ namespace mongo {
         vector<StatusWith<BSONObj> > normalInserts;
         normalizeInserts( request, &normalInserts );
 
-        WriteErrorDetail* lastOpError = NULL;
-
         while ( currInsertItem->getItemIndex() < static_cast<int>( request.sizeWriteOps() ) ) {
 
             WriteOpResult currResult;
 
-            {
+            // Don't (re-)acquire locks and create database until it's necessary
+            if ( !normalInserts[currInsertItem->getItemIndex()].isOK() ) {
+                currResult.error =
+                    toWriteError( normalInserts[currInsertItem->getItemIndex()].getStatus() );
+            }
+            else {
+
                 PageFaultRetryableSection pFaultSection;
 
                 ////////////////////////////////////
@@ -770,11 +785,11 @@ namespace mongo {
                         }
                     }
                     catch ( const DBException& ex ) {
-                        Status stat(ex.toStatus());
-                        if (ErrorCodes::isInterruption(stat.code())) {
+                        Status status(ex.toStatus());
+                        if (ErrorCodes::isInterruption(status.code())) {
                             throw;
                         }
-                        currResult.error = toWriteError(stat);
+                        currResult.error = toWriteError(status);
                     }
 
                     //
@@ -784,6 +799,13 @@ namespace mongo {
                     while ( collection
                             && currInsertItem->getItemIndex()
                                < static_cast<int>( request.sizeWriteOps() ) ) {
+
+                        //
+                        // BEGIN CURRENT OP
+                        //
+
+                        scoped_ptr<CurOp> currentOp( beginCurrentOp( _client, *currInsertItem ) );
+                        incOpStats( *currInsertItem ); 
 
                         // Get the actual document we want to write, assuming it's valid
                         const StatusWith<BSONObj>& normalInsert = //
@@ -812,6 +834,12 @@ namespace mongo {
                                                &currResult );
                         }
 
+                        //
+                        // END CURRENT OP
+                        //
+
+                        finishCurrentOp( _client, currentOp.get(), currResult.error );
+  
                         // Faults release the write lock
                         if ( currResult.fault )
                             break;
@@ -831,6 +859,16 @@ namespace mongo {
                                                                 currInsertItem->getItemIndex()
                                                                 + 1 ) );
                         currResult.reset();
+
+                        // Destruct curop so that our parent curop is restored, so that we
+                        // record the yield count in the parent.
+                        currentOp.reset(NULL);
+
+                        // yield sometimes
+                        int micros = ClientCursor::suggestYieldMicros();
+                        if (micros > 0) {
+                            ClientCursor::staticYield(micros, "", NULL);
+                        }
                     }
                 }
 
@@ -839,8 +877,6 @@ namespace mongo {
             //
             // Store the current error if it exists
             //
-
-            lastOpError = currResult.error;
 
             if ( currResult.error ) {
 
@@ -857,7 +893,6 @@ namespace mongo {
             //
 
             if ( currResult.fault ) {
-                dassert( !lastOpError );
                 // Check page fault out of lock
                 currResult.fault->touch();
             }
@@ -868,11 +903,6 @@ namespace mongo {
             }
         }
 
-        //
-        // END CURRENT OP
-        //
-
-        finishCurrentOp( _client, currentOp.get(), lastOpError );
     }
 
     void WriteBatchExecutor::execUpdate( const BatchItemRef& updateItem,
@@ -905,9 +935,6 @@ namespace mongo {
 
         // Removes are similar to updates, but page faults are handled externally
 
-        const BatchedCommandRequest& request = *removeItem.getRequest();
-        const NamespaceString nss( removeItem.getRequest()->getNS() );
-
         // BEGIN CURRENT OP
         scoped_ptr<CurOp> currentOp( beginCurrentOp( _client, removeItem ) );
         incOpStats( removeItem );
@@ -915,34 +942,11 @@ namespace mongo {
         WriteOpResult result;
 
         while ( true ) {
+            multiRemove( removeItem, &result );
 
-            {
-                // NOTE: Deletes will not fault outside the lock once any data has been written
-                PageFaultRetryableSection pFaultSection;
-
-                ///////////////////////////////////////////
-                Lock::DBWrite writeLock( nss.ns() );
-                ///////////////////////////////////////////
-
-                // Check version once we're locked
-
-                if ( !checkShardVersion( &shardingState, request, &result.error ) ) {
-                    // Version error
-                    break;
-                }
-
-                // Context once we're locked, to set more details in currentOp()
-                // TODO: better constructor?
-                Client::Context writeContext( nss.ns(),
-                                              storageGlobalParams.dbpath,
-                                              false /* don't check version */);
-
-                multiRemove( removeItem, &result );
-
-                if ( !result.fault ) {
-                    incWriteStats( removeItem, result.stats, result.error, currentOp.get() );
-                    break;
-                }
+            if ( !result.fault ) {
+                incWriteStats( removeItem, result.stats, result.error, currentOp.get() );
+                break;
             }
 
             //
@@ -1001,11 +1005,11 @@ namespace mongo {
             result->fault = new PageFaultException( ex );
         }
         catch ( const DBException& ex ) {
-            Status stat(ex.toStatus());
-            if (ErrorCodes::isInterruption(stat.code())) {
+            Status status(ex.toStatus());
+            if (ErrorCodes::isInterruption(status.code())) {
                 throw;
             }
-            result->error = toWriteError(stat);
+            result->error = toWriteError(status);
         }
 
     }
@@ -1045,18 +1049,18 @@ namespace mongo {
             result->fault = new PageFaultException( ex );
         }
         catch ( const DBException& ex ) {
-            Status stat(ex.toStatus());
-            if (ErrorCodes::isInterruption(stat.code())) {
+            Status status = ex.toStatus();
+            if (ErrorCodes::isInterruption(status.code())) {
                 throw;
             }
-            result->error = toWriteError(stat);
+            result->error = toWriteError(status);
         }
     }
 
     static void multiUpdate( const BatchItemRef& updateItem,
                              WriteOpResult* result ) {
 
-        NamespaceString nsString(updateItem.getRequest()->getNS());
+        const NamespaceString nsString(updateItem.getRequest()->getNS());
         UpdateRequest request(nsString);
         request.setQuery(updateItem.getUpdate()->getQuery());
         request.setUpdates(updateItem.getUpdate()->getUpdateExpr());
@@ -1099,11 +1103,11 @@ namespace mongo {
             result->stats.upsertedID = resUpsertedID;
         }
         catch (const DBException& ex) {
-            Status stat(ex.toStatus());
-            if (ErrorCodes::isInterruption(stat.code())) {
+            status = ex.toStatus();
+            if (ErrorCodes::isInterruption(status.code())) {
                 throw;
             }
-            result->error = toWriteError(stat);
+            result->error = toWriteError(status);
         }
     }
 
@@ -1116,28 +1120,52 @@ namespace mongo {
     static void multiRemove( const BatchItemRef& removeItem,
                              WriteOpResult* result ) {
 
-        Lock::assertWriteLocked( removeItem.getRequest()->getNS() );
+        const NamespaceString nss( removeItem.getRequest()->getNS() );
+        DeleteRequest request( nss );
+        request.setQuery( removeItem.getDelete()->getQuery() );
+        request.setMulti( removeItem.getDelete()->getLimit() != 1 );
+        request.setUpdateOpLog(true);
+        request.setGod( false );
+        DeleteExecutor executor( &request );
+        Status status = executor.prepare();
+        if ( !status.isOK() ) {
+            result->error = toWriteError( status );
+            return;
+        }
+
+        // NOTE: Deletes will not fault outside the lock once any data has been written
+        PageFaultRetryableSection pFaultSection;
+
+        ///////////////////////////////////////////
+        Lock::DBWrite writeLock( nss.ns() );
+        ///////////////////////////////////////////
+
+        // Check version once we're locked
+
+        if ( !checkShardVersion( &shardingState, *removeItem.getRequest(), &result->error ) ) {
+            // Version error
+            return;
+        }
+
+        // Context once we're locked, to set more details in currentOp()
+        // TODO: better constructor?
+        Client::Context writeContext( nss.ns(),
+                                      storageGlobalParams.dbpath,
+                                      false /* don't check version */);
 
         try {
-            long long n = deleteObjects( removeItem.getRequest()->getNS(),
-                                         removeItem.getDelete()->getQuery(),
-                                         removeItem.getDelete()->getLimit() == 1, // justOne
-                                         true, // logOp
-                                         false // god
-                                         );
-
-            result->stats.n = n;
+            result->stats.n = executor.execute();
         }
         catch ( const PageFaultException& ex ) {
             // TODO: An actual data structure that's not an exception for this
             result->fault = new PageFaultException( ex );
         }
         catch ( const DBException& ex ) {
-            Status stat(ex.toStatus());
-            if (ErrorCodes::isInterruption(stat.code())) {
+            status = ex.toStatus();
+            if (ErrorCodes::isInterruption(status.code())) {
                 throw;
             }
-            result->error = toWriteError(stat);
+            result->error = toWriteError(status);
         }
     }
 

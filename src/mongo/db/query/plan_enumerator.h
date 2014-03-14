@@ -35,16 +35,14 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/query_knobs.h"
 
 namespace mongo {
 
     struct PlanEnumeratorParams {
 
-        // How many choices do we want when computing ixisect solutions in an AND?
-        static const size_t kDefaultMaxIntersectPerAnd = 3;
-
         PlanEnumeratorParams() : intersect(false),
-                                 maxIntersectPerAnd(3) { }
+                                 maxIntersectPerAnd(internalQueryEnumerationMaxIntersectPerAnd) { }
 
         // Do we provide solutions that use more indices than the minimum required to provide
         // an indexed solution?
@@ -251,14 +249,18 @@ namespace mongo {
          * information due to flattening.
          *
          * Nodes that cannot be deeply traversed are returned via the output
-         * vector 'subnodesOut'.
+         * vectors 'subnodesOut' and 'mandatorySubnodes'. Subnodes are "mandatory"
+         * if they *must* use an index (TEXT and GEO).
          *
          * Does not take ownership of arguments.
+         *
+         * Returns false if the AND cannot be indexed. Otherwise returns true.
          */
-        void partitionPreds(MatchExpression* node,
+        bool partitionPreds(MatchExpression* node,
                             PrepMemoContext context,
                             vector<MatchExpression*>* indexOut,
-                            vector<MemoID>* subnodesOut);
+                            vector<MemoID>* subnodesOut,
+                            vector<MemoID>* mandatorySubnodes);
 
         /**
          * Finds a set of predicates that can be safely compounded with 'assigned',
@@ -360,7 +362,7 @@ namespace mongo {
                       const IndexEntry& thisIndex,
                       OneIndexAssignment* assign);
 
-        void dumpMemo();
+        std::string dumpMemo();
 
         // Map from expression to its MemoID.
         unordered_map<MatchExpression*, MemoID> _nodeToId;

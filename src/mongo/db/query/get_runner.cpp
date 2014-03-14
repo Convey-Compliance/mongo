@@ -35,6 +35,7 @@
 #include "mongo/db/query/cached_plan_runner.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/eof_runner.h"
+#include "mongo/db/query/explain_plan.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/idhack_runner.h"
 #include "mongo/db/query/index_bounds_builder.h"
@@ -43,6 +44,7 @@
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/single_solution_runner.h"
@@ -53,15 +55,6 @@
 #include "mongo/s/d_logic.h"
 
 namespace mongo {
-
-    MONGO_EXPORT_SERVER_PARAMETER(enableIndexIntersection, bool, true);
-
-    static bool canUseIDHack(const CanonicalQuery& query) {
-        return !query.getParsed().showDiskLoc()
-            && query.getParsed().getHint().isEmpty()
-            && CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter())
-            && !query.getParsed().hasOption(QueryOption_CursorTailable);
-    }
 
     // static
     void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
@@ -113,6 +106,8 @@ namespace mongo {
                      size_t plannerOptions) {
 
         if (!collection) {
+            LOG(2) << "Collection " << ns << " does not exist."
+                   << " Using EOF runner: " << unparsedQuery.toString();
             *outCanonicalQuery = NULL;
             *outRunner = new EOFRunner(NULL, ns);
             return Status::OK();
@@ -128,6 +123,8 @@ namespace mongo {
                 return status;
             return getRunner(collection, *outCanonicalQuery, outRunner, plannerOptions);
         }
+
+        LOG(2) << "Using idhack: " << unparsedQuery.toString();
 
         *outCanonicalQuery = NULL;
         *outRunner = new IDHackRunner(collection, unparsedQuery["_id"].wrap());
@@ -196,7 +193,7 @@ namespace mongo {
             }
         }
 
-        if (enableIndexIntersection) {
+        if (internalQueryPlannerEnableIndexIntersection) {
             plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
         }
 
@@ -218,12 +215,16 @@ namespace mongo {
         // This can happen as we're called by internal clients as well.
         if (NULL == collection) {
             const string& ns = canonicalQuery->ns();
+            LOG(2) << "Collection " << ns << " does not exist."
+                   << " Using EOF runner: " << canonicalQuery->toStringShort();
             *out = new EOFRunner(canonicalQuery.release(), ns);
             return Status::OK();
         }
 
         // If we have an _id index we can use the idhack runner.
-        if (canUseIDHack(*canonicalQuery) && collection->getIndexCatalog()->findIdIndex()) {
+        if (IDHackRunner::supportsQuery(*canonicalQuery) &&
+            collection->getIndexCatalog()->findIdIndex()) {
+            LOG(2) << "Using idhack: " << canonicalQuery->toStringShort();
             *out = new IDHackRunner(collection, canonicalQuery.release());
             return Status::OK();
         }
@@ -290,6 +291,9 @@ namespace mongo {
             if (status.isOK()) {
                 if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
                     if (turnIxscanIntoCount(qs)) {
+                        LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
+                               << ", planSummary: " << getPlanSummary(*qs);
+
                         WorkingSet* ws;
                         PlanStage* root;
                         verify(StageBuilder::build(*qs, &root, &ws));
@@ -301,6 +305,9 @@ namespace mongo {
                         return Status::OK();
                     }
                 }
+
+                LOG(2) << "Using cached query plan: " << canonicalQuery->toStringShort()
+                       << ", planSummary: " << getPlanSummary(*qs);
 
                 WorkingSet* ws;
                 PlanStage* root;
@@ -350,6 +357,9 @@ namespace mongo {
                         }
                     }
 
+                    LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
+                           << ", planSummary: " << getPlanSummary(*solutions[i]);
+
                     // We're not going to cache anything that's fast count.
                     WorkingSet* ws;
                     PlanStage* root;
@@ -365,6 +375,10 @@ namespace mongo {
         }
 
         if (1 == solutions.size()) {
+            LOG(2) << "Only one plan is available; it will be run but will not be cached. "
+                   << canonicalQuery->toStringShort()
+                   << ", planSummary: " << getPlanSummary(*solutions[0]);
+
             // Only one possible plan.  Run it.  Build the stages from the solution.
             WorkingSet* ws;
             PlanStage* root;
@@ -770,6 +784,9 @@ namespace mongo {
             QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(*cq, params, dn);
             verify(soln);
 
+            LOG(2) << "Using fast distinct: " << cq->toStringShort()
+                   << ", planSummary: " << getPlanSummary(*soln);
+
             WorkingSet* ws;
             PlanStage* root;
             verify(StageBuilder::build(*soln, &root, &ws));
@@ -793,6 +810,9 @@ namespace mongo {
                         delete solutions[j];
                     }
                 }
+
+                LOG(2) << "Using fast distinct: " << cq->toStringShort()
+                       << ", planSummary: " << getPlanSummary(*solutions[i]);
 
                 // Build and return the SSR over solutions[i].
                 WorkingSet* ws;

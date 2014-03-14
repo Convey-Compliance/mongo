@@ -46,13 +46,6 @@ var _bulk_api_module = (function() {
     return db.runCommand( cmd );
   };
 
-  var enforceWriteConcern = function(db, options) {
-    // Reset previous errors so we can apply the write concern no matter what
-    // as long as it is valid.
-    db.runCommand({ resetError: 1 });
-    return executeGetLastError(db, options);
-  };
-
   /**
    * Wraps the result for write commands and presents a convenient api for accessing
    * single results & errors (returns the last one if there are multiple).
@@ -111,8 +104,10 @@ var _bulk_api_module = (function() {
       if(singleBatch && singleBatch.batchType == UPDATE) {
         result.nMatched = this.nMatched;
         result.nUpserted = this.nUpserted;
-        result.nModified = this.nModified;
-
+        
+        if(this.nModified != undefined)
+            result.nModified = this.nModified;
+        
         if(Array.isArray(bulkResult.upserted)
             && bulkResult.upserted.length == 1) {
           result._id = bulkResult.upserted[0]._id;
@@ -422,6 +417,18 @@ var _bulk_api_module = (function() {
       return batches;
     }
 
+    var finalizeBatch = function(newDocType) {
+        // Save the batch to the execution stack
+        batches.push(currentBatch);
+
+        // Create a new batch
+        currentBatch = new Batch(newDocType, currentIndex);
+
+        // Reset the current size trackers
+        currentBatchSize = 0;
+        currentBatchSizeBytes = 0;
+    };
+
     // Add to internal list of documents
     var addToOperationsList = function(docType, document) {
       // Get the bsonSize
@@ -433,19 +440,9 @@ var _bulk_api_module = (function() {
       currentBatchSize = currentBatchSize + 1;
       currentBatchSizeBytes = currentBatchSizeBytes + bsonSize;
 
-      // Check if we need to create a new batch
-      if((currentBatchSize >= maxNumberOfDocsInBatch)
-        || (currentBatchSizeBytes >= maxBatchSizeBytes)
-        || (currentBatch.batchType != docType)) {
-        // Save the batch to the execution stack
-        batches.push(currentBatch);
-
-        // Create a new batch
-        currentBatch = new Batch(docType, currentIndex);
-
-        // Reset the current size trackers
-        currentBatchSize = 0;
-        currentBatchSizeBytes = 0;
+      // Finalize and create a new batch if we have a new operation type
+      if (currentBatch.batchType != docType) {
+          finalizeBatch(docType);
       }
 
       // We have an array of documents
@@ -455,6 +452,13 @@ var _bulk_api_module = (function() {
         currentBatch.operations.push(document)
         currentIndex = currentIndex + 1;
       }
+
+      // Check if the batch exceeds one of the size limits
+      if((currentBatchSize >= maxNumberOfDocsInBatch)
+        || (currentBatchSizeBytes >= maxBatchSizeBytes)) {
+          finalizeBatch(docType);
+      }
+
     };
 
     /**
@@ -631,10 +635,13 @@ var _bulk_api_module = (function() {
 
       // If we have an update Batch type
       if(batch.batchType == UPDATE) {
-        var nModified = ('nModified' in result)? result.nModified: 0;
         bulkResult.nUpserted = bulkResult.nUpserted + nUpserted;
         bulkResult.nMatched = bulkResult.nMatched + (result.n - nUpserted);
-        bulkResult.nModified = bulkResult.nModified + nModified;
+        if(result.nModified == undefined) {
+            bulkResult.nModified = undefined;
+        } else if(bulkResult.nModified != undefined) {
+            bulkResult.nModified = bulkResult.nModified + result.nModified;
+        }
       }
 
       if(Array.isArray(result.writeErrors)) {
@@ -823,7 +830,6 @@ var _bulk_api_module = (function() {
 
       var batchResult = {
           n: 0
-        , nModified: 0
         , writeErrors: []
         , upserted: []
       };
@@ -875,12 +881,27 @@ var _bulk_api_module = (function() {
         }
       }
 
-      // The write concern may have not been enforced if we did it earlier and a write
-      // error occurs, so we apply the actual write concern at the end.
-      if (batchResult.writeErrors.length == 0 ||
-              !ordered && (batchResult.writeErrors.length < batch.operations.length)) {
-        result = enforceWriteConcern(collection.getDB(), writeConcern);
-        extractedError = extractGLEErrors(result);
+      var needToEnforceWC = writeConcern != null &&
+            bsonWoCompare(writeConcern, { w: 1 }) != 0 &&
+            bsonWoCompare(writeConcern, { w: 0 }) != 0;
+
+      if (needToEnforceWC &&
+            (batchResult.writeErrors.length == 0 ||
+              (!ordered &&
+               // not all errored.
+               batchResult.writeErrors.length < batch.operations.length))) {
+
+          // if last write errored
+          if( batchResult.writeErrors.length > 0 &&
+              batchResult.writeErrors[batchResult.writeErrors.length - 1].index ==
+              (batch.operations.length - 1)) {
+              // Reset previous errors so we can apply the write concern no matter what
+              // as long as it is valid.
+              collection.getDB().runCommand({ resetError: 1 });
+          }
+
+          result = executeGetLastError(collection.getDB(), writeConcern);
+          extractedError = extractGLEErrors(result);
       }
 
       if (extractedError != null && extractedError.wcError != null) {
@@ -894,7 +915,7 @@ var _bulk_api_module = (function() {
     //
     // Execute the batch
     this.execute = function(_writeConcern) {
-      if(executed) throw Error("operations cannot be re-executed");
+      if(executed) throw Error("A bulk operation cannot be re-executed");
 
       // If writeConcern set, use it, else get from collection (which will inherit from db/mongo)
       writeConcern = _writeConcern ? _writeConcern : coll.getWriteConcern();

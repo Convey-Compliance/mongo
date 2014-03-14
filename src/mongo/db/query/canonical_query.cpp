@@ -39,6 +39,35 @@ namespace {
     using std::string;
     using namespace mongo;
 
+    // Delimiters for cache key encoding.
+    const char kEncodeChildrenBegin = '[';
+    const char kEncodeChildrenEnd = ']';
+    const char kEncodeChildrenSeparator = ',';
+    const char kEncodeSortSection = '~';
+    const char kEncodeProjectionSection = '|';
+
+    /**
+     * Encode user-provided string. Cache key delimiters seen in the
+     * user string are escaped with a backslash.
+     */
+    void encodeUserString(const StringData& s, mongoutils::str::stream* os) {
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            switch (c) {
+            case kEncodeChildrenBegin:
+            case kEncodeChildrenEnd:
+            case kEncodeChildrenSeparator:
+            case kEncodeSortSection:
+            case kEncodeProjectionSection:
+            case '\\':
+                  *os << '\\';
+                // Fall through to default case.
+            default:
+                *os << c;
+            }
+        }
+    }
+
     void encodePlanCacheKeyTree(const MatchExpression* tree, mongoutils::str::stream* os);
 
     /**
@@ -110,11 +139,8 @@ namespace {
         case MatchExpression::ALWAYS_FALSE: return "af"; break;
         case MatchExpression::GEO_NEAR: return "gn"; break;
         case MatchExpression::TEXT: return "te"; break;
+        default: verify(0); return "";
         }
-        // Unreachable code.
-        // All MatchType values have been handled in switch().
-        verify(0);
-        return "";
     }
 
     /**
@@ -179,7 +205,9 @@ namespace {
      */
     void encodePlanCacheKeyTree(const MatchExpression* tree, mongoutils::str::stream* os) {
         // Encode match type and path.
-        *os << encodeMatchType(tree->matchType()) << tree->path();
+        *os << encodeMatchType(tree->matchType());
+
+        encodeUserString(tree->path(), os);
 
         // GEO and GEO_NEAR require additional encoding.
         if (MatchExpression::GEO == tree->matchType()) {
@@ -190,8 +218,19 @@ namespace {
         }
 
         // Traverse child nodes.
+        // Enclose children in [].
+        if (tree->numChildren() > 0) {
+            *os << kEncodeChildrenBegin;
+        }
+        // Use comma to separate children encoding.
         for (size_t i = 0; i < tree->numChildren(); ++i) {
+            if (i > 0) {
+                *os << kEncodeChildrenSeparator;
+            }
             encodePlanCacheKeyTree(tree->getChild(i), os);
+        }
+        if (tree->numChildren() > 0) {
+            *os << kEncodeChildrenEnd;
         }
     }
 
@@ -201,6 +240,12 @@ namespace {
      * LiteParsedQuery.
      */
     void encodePlanCacheKeySort(const BSONObj& sortObj, mongoutils::str::stream* os) {
+        if (sortObj.isEmpty()) {
+            return;
+        }
+
+        *os << kEncodeSortSection;
+
         BSONObjIterator it(sortObj);
         while (it.more()) {
             BSONElement elt = it.next();
@@ -216,7 +261,7 @@ namespace {
             else {
                 *os << "d";
             }
-            *os << elt.fieldName();
+            encodeUserString(elt.fieldName(), os);
         }
     }
 
@@ -232,7 +277,7 @@ namespace {
             return;
         }
 
-        *os << "p";
+        *os << kEncodeProjectionSection;
 
         // Sorts the BSON elements by field name using a map.
         std::map<StringData, BSONElement> elements;
@@ -251,8 +296,8 @@ namespace {
             // BSONElement::toString() arguments
             // includeFieldName - skip field name (appending after toString() result). false.
             // full: choose less verbose representation of child/data values. false.
-            *os << elt.toString(false, false);
-            *os << elt.fieldName();
+            encodeUserString(elt.toString(false, false), os);
+            encodeUserString(elt.fieldName(), os);
         }
     }
 
@@ -347,16 +392,10 @@ namespace mongo {
     bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
         bool hasID = false;
 
-        // Must have _id field, and optionally can have either
-        // $isolated or $atomic.
-        if (query.nFields() > 2) {
-            return false;
-        }
-
         BSONObjIterator it(query);
         while (it.more()) {
             BSONElement elt = it.next();
-            if (mongoutils::str::equals("_id", elt.fieldName())) {
+            if (mongoutils::str::equals("_id", elt.fieldName() ) ) {
                 // Verify that the query on _id is a simple equality.
                 hasID = true;
 
@@ -373,8 +412,12 @@ namespace mongo {
                     return false;
                 }
             }
-            else if (!(mongoutils::str::equals("$isolated", elt.fieldName()) ||
-                       mongoutils::str::equals("$atomic", elt.fieldName()))) {
+            else if (elt.fieldName()[0] == '$' &&
+                     (mongoutils::str::equals("$isolated", elt.fieldName())||
+                      mongoutils::str::equals("$atomic", elt.fieldName()))) {
+                // ok, passthrough
+            }
+            else {
                 // If the field is not _id, it must be $isolated/$atomic.
                 return false;
             }
@@ -598,7 +641,7 @@ namespace mongo {
         return Status::OK();
     }
 
-    string CanonicalQuery::toString() const {
+    std::string CanonicalQuery::toString() const {
         mongoutils::str::stream ss;
         ss << "ns=" << _pq->ns() << " limit=" << _pq->getNumToReturn()
            << " skip=" << _pq->getSkip() << '\n';
@@ -606,6 +649,14 @@ namespace mongo {
         ss << "Tree: " << _root->toString();
         ss << "Sort: " << _pq->getSort().toString() << '\n';
         ss << "Proj: " << _pq->getProj().toString() << '\n';
+        return ss;
+    }
+
+    std::string CanonicalQuery::toStringShort() const {
+        mongoutils::str::stream ss;
+        ss << "query: " << _pq->getFilter().toString()
+           << " sort: " << _pq->getSort().toString()
+           << " projection: " << _pq->getProj().toString();
         return ss;
     }
 

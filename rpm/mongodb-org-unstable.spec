@@ -1,6 +1,6 @@
 Name: mongodb-org-unstable
 Conflicts: mongo-10gen, mongo-10gen-enterprise, mongo-10gen-enterprise-server, mongo-10gen-server, mongo-10gen-unstable, mongo-10gen-unstable-enterprise, mongo-10gen-unstable-enterprise-mongos, mongo-10gen-unstable-enterprise-server, mongo-10gen-unstable-enterprise-shell, mongo-10gen-unstable-enterprise-tools, mongo-10gen-unstable-mongos, mongo-10gen-unstable-server, mongo-10gen-unstable-shell, mongo-10gen-unstable-tools, mongo18-10gen, mongo18-10gen-server, mongo20-10gen, mongo20-10gen-server, mongodb, mongodb-server, mongodb-dev, mongodb-clients, mongodb-10gen, mongodb-10gen-enterprise, mongodb-10gen-unstable, mongodb-10gen-unstable-enterprise, mongodb-10gen-unstable-enterprise-mongos, mongodb-10gen-unstable-enterprise-server, mongodb-10gen-unstable-enterprise-shell, mongodb-10gen-unstable-enterprise-tools, mongodb-10gen-unstable-mongos, mongodb-10gen-unstable-server, mongodb-10gen-unstable-shell, mongodb-10gen-unstable-tools, mongodb-enterprise, mongodb-enterprise-mongos, mongodb-enterprise-server, mongodb-enterprise-shell, mongodb-enterprise-tools, mongodb-nightly, mongodb-org, mongodb-org-mongos, mongodb-org-server, mongodb-org-shell, mongodb-org-tools, mongodb-stable, mongodb18-10gen, mongodb20-10gen, mongodb-enterprise-unstable, mongodb-enterprise-unstable-mongos, mongodb-enterprise-unstable-server, mongodb-enterprise-unstable-shell, mongodb-enterprise-unstable-tools
-Version: 2.6.0-rc0
+Version: 2.6.0-rc1
 Release: 1%{?dist}
 Summary: MongoDB cross-platform document-oriented database system (metapackage)
 License: AGPL 3.0
@@ -87,7 +87,7 @@ mkdir -p $RPM_BUILD_ROOT/etc
 cp -v rpm/mongod.conf $RPM_BUILD_ROOT/etc/mongod.conf
 mkdir -p $RPM_BUILD_ROOT/etc/sysconfig
 cp -v rpm/mongod.sysconfig $RPM_BUILD_ROOT/etc/sysconfig/mongod
-mkdir -p $RPM_BUILD_ROOT/var/lib/mongodb
+mkdir -p $RPM_BUILD_ROOT/var/lib/mongo
 mkdir -p $RPM_BUILD_ROOT/var/log/mongodb
 mkdir -p $RPM_BUILD_ROOT/var/run/mongodb
 touch $RPM_BUILD_ROOT/var/log/mongodb/mongod.log
@@ -96,11 +96,11 @@ touch $RPM_BUILD_ROOT/var/log/mongodb/mongod.log
 rm -rf $RPM_BUILD_ROOT
 
 %pre server
-if ! /usr/bin/id -g mongodb &>/dev/null; then
-    /usr/sbin/groupadd -r mongodb
+if ! /usr/bin/id -g mongod &>/dev/null; then
+    /usr/sbin/groupadd -r mongod
 fi
-if ! /usr/bin/id mongodb &>/dev/null; then
-    /usr/sbin/useradd -M -r -g mongodb -d /var/lib/mongodb -s /bin/false 	-c mongodb mongodb > /dev/null 2>&1
+if ! /usr/bin/id mongod &>/dev/null; then
+    /usr/sbin/useradd -M -r -g mongod -d /var/lib/mongo -s /bin/false 	-c mongod mongod > /dev/null 2>&1
 fi
 
 %post server
@@ -130,10 +130,10 @@ fi
 %{_mandir}/man1/mongod.1*
 /etc/rc.d/init.d/mongod
 /etc/sysconfig/mongod
-%attr(0755,mongodb,mongodb) %dir /var/lib/mongodb
-%attr(0755,mongodb,mongodb) %dir /var/log/mongodb
-%attr(0755,mongodb,mongodb) %dir /var/run/mongodb
-%attr(0640,mongodb,mongodb) %config(noreplace) %verify(not md5 size mtime) /var/log/mongodb/mongod.log
+%attr(0755,mongod,mongod) %dir /var/lib/mongo
+%attr(0755,mongod,mongod) %dir /var/log/mongodb
+%attr(0755,mongod,mongod) %dir /var/run/mongodb
+%attr(0640,mongod,mongod) %config(noreplace) %verify(not md5 size mtime) /var/log/mongodb/mongod.log
 
 %files shell
 %defattr(-,root,root,-)

@@ -51,6 +51,7 @@ DBCollection.prototype.help = function () {
     print("\tdb." + shortName + ".findOne([query])");
     print("\tdb." + shortName + ".findAndModify( { update : ... , remove : bool [, query: {}, sort: {}, 'new': false] } )");
     print("\tdb." + shortName + ".getDB() get DB object associated with collection");
+    print("\tdb." + shortName + ".getPlanCache() get query plan cache associated with collection");
     print("\tdb." + shortName + ".getIndexes()");
     print("\tdb." + shortName + ".group( { key : ..., initial: ..., reduce : ...[, cond: ...] } )");
     // print("\tdb." + shortName + ".indexStats({expandNodes: [<expanded child numbers>}, <detailed: t/f>) - output aggregate/per-depth btree bucket stats");
@@ -234,12 +235,14 @@ DBCollection.prototype.insert = function( obj , options, _allow_dot ){
             obj.forEach(function(doc) {
                 batch.insert(doc);
             });
+            // Do not return a SingleWriteResult if inserting an array
+            result = batch.execute(wc);
         }
         else {
             batch.insert(obj);
+            result = batch.execute(wc).toSingleResult();
         }
 
-        result = batch.execute(wc).toSingleResult();
     }
     else {
         if ( ! _allow_dot ) {
@@ -492,11 +495,8 @@ DBCollection.prototype.createIndex = function( keys , options ){
     var o = this._indexSpec( keys, options );
 
     if ( this.getMongo().writeMode() != "legacy" ) {
-        // TODO: Use createIndexes command once fully supported by upgrade process
-        var bulk = this.getDB().system.indexes.initializeOrderedBulkOp();
-        bulk.insert(o);
-
-        return bulk.execute().toSingleResult();
+        delete o.ns; // ns is passed to the first element in the command.
+        return this._db.runCommand({ createIndexes: this.getName(), indexes: [o] });
     }
     else {
         this._db.getCollection( "system.indexes" ).insert( o , 0, true );
@@ -807,7 +807,7 @@ DBCollection.prototype.getIndexStats = function(params, detailed) {
         return;
     }
 
-    print("-- index \"" + stats.name + "\" --");
+    print("-- index \"" + stats.index + "\" --");
     print("  version " + stats.version + " | key pattern " +
           tojsononeline(stats.keyPattern) + (stats.isIdIndex ? " [id index]" : "") +
           " | storage namespace \"" + stats.storageNs + "\"");
@@ -1491,6 +1491,18 @@ PlanCache.prototype._parseQueryShape = function(query, projection, sort) {
     if (query == undefined) {
         throw new Error("required parameter query missing");
     }
+
+    // Accept query shape object as only argument.
+    // Query shape contains exactly 3 fields (query, projection and sort)
+    // as generated in the listQueryShapes() result.
+    if (typeof(query) == 'object' && projection == undefined && sort == undefined) {
+        var keysSorted = Object.keys(query).sort();
+        // Expected keys must be sorted for the comparison to work.
+        if (bsonWoCompare(keysSorted, ['projection', 'query', 'sort']) == 0) {
+            return query;
+        }
+    }
+
     var shape = {
         query: query,
         projection: projection == undefined ? {} : projection,

@@ -11,6 +11,9 @@ jsTest.log("Starting insert tests...");
 
 var request;
 var result;
+var batch;
+
+var maxWriteBatchSize = 1000;
 
 function resultOK( result ) {
     return result.ok &&
@@ -93,6 +96,31 @@ printjson( result = coll.runCommand(request) );
 assert(resultOK(result));
 assert.eq(1, result.n);
 assert.eq(coll.count(), 1);
+
+//
+// Large batch under the size threshold should insert successfully
+coll.remove({});
+batch = [];
+for (var i = 0; i < maxWriteBatchSize; ++i) {
+    batch.push({});
+}
+printjson( request = {insert : coll.getName(), documents: batch, writeConcern:{w:1}, ordered:false} );
+printjson( result = coll.runCommand(request) );
+assert(resultOK(result));
+assert.eq(batch.length, result.n);
+assert.eq(coll.count(), batch.length);
+
+//
+// Large batch above the size threshold should fail to insert
+coll.remove({});
+batch = [];
+for (var i = 0; i < maxWriteBatchSize + 1; ++i) {
+    batch.push({});
+}
+printjson( request = {insert : coll.getName(), documents: batch, writeConcern:{w:1}, ordered:false} );
+printjson( result = coll.runCommand(request) );
+assert(resultNOK(result));
+assert.eq(coll.count(), 0);
 
 //
 //
@@ -189,8 +217,7 @@ printjson(request = {insert : "system.indexes",
 printjson( result = coll.runCommand(request) );
 assert(result.ok);
 assert.eq(1, result.n);
-// Background index may or may not be created
-assert.lte(coll.getIndexes().length, 2);
+assert.eq(coll.getIndexes().length, 2);
 
 //
 // Duplicate index insertion gives n = 0
@@ -213,8 +240,7 @@ printjson(request = {insert : "system.indexes",
                                    key : {x : 1}, name : "x_1", unique : true}]});
 printjson(result = coll.runCommand(request));
 assert(!result.ok);
-//This is LTE since we may or may not actually create the database
-assert.lte(coll.getIndexes().length, 1);
+assert.eq(coll.getIndexes().length, 0);
 
 //
 // Empty index insertion
@@ -222,8 +248,7 @@ coll.drop();
 printjson(request = {insert : "system.indexes", documents : [{}]});
 printjson(result = coll.runCommand(request));
 assert(!result.ok);
-// This is LTE since we may or may not actually create the database
-assert.lte(coll.getIndexes().length, 1);
+assert.eq(coll.getIndexes().length, 0);
 
 //
 // Invalid index desc
@@ -265,6 +290,5 @@ printjson(request = {insert : "system.indexes",
                                   {ns : coll.toString(), key : {y : 1}, name : "y_1"}]});
 printjson(result = coll.runCommand(request));
 assert(!result.ok);
-// This is LTE since we may or may not actually create the database
-assert.lte(coll.getIndexes().length, 1);
+assert.eq(coll.getIndexes().length, 0);
 

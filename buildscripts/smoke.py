@@ -34,6 +34,7 @@
 #   jobs on the same host at once.  So something's gotta change.
 
 from datetime import datetime
+from itertools import izip
 import glob
 from optparse import OptionParser
 import os
@@ -154,16 +155,22 @@ class mongod(object):
         sock.settimeout(1)
         sock.connect(("localhost", int(port)))
         sock.close()
-
+        
+    def is_mongod_up(self, port=mongod_port):
+        try:
+            self.check_mongo_port(int(port))
+            return True
+        except Exception,e:
+            print >> sys.stderr, e
+            return False
+        
     def did_mongod_start(self, port=mongod_port, timeout=300):
         while timeout > 0:
             time.sleep(1)
-            try:
-                self.check_mongo_port(int(port))
+            is_up = self.is_mongod_up(port)
+            if is_up:
                 return True
-            except Exception,e:
-                print >> sys.stderr, e
-                timeout = timeout - 1
+            timeout = timeout - 1
         print >> sys.stderr, "timeout starting mongod"
         return False
 
@@ -340,7 +347,7 @@ def check_db_hashes(master, slave):
     replicated_collections += master.dict.keys()
 
     for coll in replicated_collections:
-        if coll not in slave.dict:
+        if coll not in slave.dict and coll not in lost_in_slave:
             lost_in_slave.append(coll)
         mhash = master.dict[coll]
         shash = slave.dict[coll]
@@ -352,8 +359,16 @@ def check_db_hashes(master, slave):
             stats = {'hashes': {'master': mhash, 'slave': shash},
                      'counts':{'master': mCount, 'slave': sCount}}
             try:
-                stats["docs"] = {'master':list(mTestDB[coll].find(limit=10).sort("$natural", -1)),
-                                  'slave':list(sTestDB[coll].find(limit=10).sort("$natural", -1))}
+                mDocs = list(mTestDB[coll].find().sort("_id", 1))
+                sDocs = list(sTestDB[coll].find().sort("_id", 1))
+                mDiffDocs = list()
+                sDiffDocs = list()
+                for left, right in izip(mDocs, sDocs):
+                    if left != right:
+                        mDiffDocs.append(left)
+                        sDiffDocs.append(right)
+
+                stats["docs"] = {'master': mDiffDocs, 'slave': sDiffDocs }
             except Exception, e:
                 stats["error-docs"] = e;
 
@@ -368,7 +383,7 @@ def check_db_hashes(master, slave):
 
 
     for db in slave.dict.keys():
-        if db not in master.dict:
+        if db not in master.dict and db not in lost_in_master:
             lost_in_master.append(db)
 
 
@@ -411,7 +426,6 @@ def skipTest(path):
 
         authTestsToSkip = [("jstests", "drop2.js"), # SERVER-8589,
                            ("jstests", "killop.js"), # SERVER-10128
-                           ("sharding", "trace_missing_docs_test.js"), # SERVER-10640
                            ("sharding", "sync3.js"), # SERVER-6388 for this and those below
                            ("sharding", "sync6.js"),
                            ("sharding", "parallel.js"),
@@ -437,6 +451,10 @@ def runTest(test, result):
 
     (path, usedb) = test
     (ignore, ext) = os.path.splitext(path)
+    test_mongod = mongod()
+    mongod_is_up = test_mongod.is_mongod_up(mongod_port)
+    result["mongod_running_at_start"] = mongod_is_up;
+
     if file_of_commands_mode:
         # smoke.py was invoked like "--mode files --from-file foo",
         # so don't try to interpret the test path too much
@@ -450,7 +468,7 @@ def runTest(test, result):
             path = argv[1]
     elif ext == ".js":
         argv = [shell_executable, "--port", mongod_port, '--authenticationMechanism', authMechanism]
-        if use_write_commands:
+        if use_write_commands or "aggregation" in path or "replsets" in path:
             argv += ["--writeMode", "commands"]
         else:
             argv += ["--writeMode", shell_write_mode]
@@ -482,8 +500,6 @@ def runTest(test, result):
         raise Bug("fell off in extension case: %s" % path)
 
     mongo_test_filename = os.path.basename(path)
-    if 'sharedclient' in path:
-        mongo_test_filename += "-sharedclient"
 
     # sys.stdout.write() is more atomic than print, so using it prevents
     # lines being interrupted by, e.g., child processes
@@ -578,16 +594,17 @@ def runTest(test, result):
 
     result["exit_code"] = r
 
+    is_mongod_still_up = test_mongod.is_mongod_up(mongod_port)
+    if not is_mongod_still_up:
+        print "mongod is not running after test"
+        result["mongod_running_at_end"] = is_mongod_still_up;
+        if start_mongod:
+            raise TestServerFailure(path)
+
+    result["mongod_running_at_end"] = is_mongod_still_up;
+
     if r != 0:
         raise TestExitFailure(path, r)
-
-    if start_mongod:
-        try:
-            # The purpose of this Connection is to verify that the smoke.py mongod is still up  
-            c = Connection(host="127.0.0.1", port=int(mongod_port), ssl=use_ssl)
-        except Exception,e:
-            print "Exception from pymongo: ", e
-            raise TestServerFailure(path)
 
     print ""
 
@@ -650,6 +667,7 @@ def run_tests(tests):
             tests_run = 0
             for tests_run, test in enumerate(tests):
                 test_result = { "start": time.time() }
+
                 (test_path, use_db) = test
 
                 if test_path.startswith(mongo_repo + os.path.sep):
@@ -674,7 +692,6 @@ def run_tests(tests):
                     test_result["end"] = time.time()
                     test_result["elapsed"] = test_result["end"] - test_result["start"]
                     test_report["results"].append( test_result )
-
                     if small_oplog or small_oplog_rs:
                         master.wait_for_repl()
                         # check the db_hashes
@@ -737,12 +754,20 @@ at the end of testing:""" % (src, dst)
 at the end of testing:"""
         for coll in screwy_in_slave.keys():
             stats = screwy_in_slave[coll]
-            print "collection: %s\t (master/slave) hashes: %s/%s counts: %i/%i" % (coll, stats['hashes']['master'], stats['hashes']['slave'], stats['counts']['master'], stats['counts']['slave'])
+            # Counts are "approx" because they are collected after the dbhash runs and may not
+            # reflect the states of the collections that were hashed. If the hashes differ, one
+            # possibility is that a test exited with writes still in-flight.
+            print "collection: %s\t (master/slave) hashes: %s/%s counts (approx): %i/%i" % (coll, stats['hashes']['master'], stats['hashes']['slave'], stats['counts']['master'], stats['counts']['slave'])
             if "docs" in stats:
-                print "Master docs (limited):"
-                pprint.pprint(stats["docs"]["master"], indent=2)
-                print "Slave docs (limited):"
-                pprint.pprint(stats["docs"]["slave"], indent=2)
+                if (("master" in stats["docs"] and len(stats["docs"]["master"]) != 0) or
+                    ("slave" in stats["docs"] and len(stats["docs"]["slave"]) != 0)):
+                    print "All docs matched!"
+                else:
+                    print "Different Docs"
+                    print "Master docs:"
+                    pprint.pprint(stats["docs"]["master"], indent=2)
+                    print "Slave docs:"
+                    pprint.pprint(stats["docs"]["slave"], indent=2)
             if "error-docs" in stats:
                 print "Error getting docs to diff:"
                 pprint.pprint(stats["error-docs"])
@@ -865,7 +890,7 @@ def expand_suites(suites,expandUseDB=True):
     module_suites = get_module_suites()
     for suite in suites:
         if suite == 'all':
-            return expand_suites(['test', 'perf', 'client', 'js', 'jsPerf', 'jsSlowNightly', 'jsSlowWeekly', 'clone', 'parallel', 'repl', 'auth', 'sharding', 'tool'],expandUseDB=expandUseDB)
+            return expand_suites(['test', 'perf', 'js', 'jsPerf', 'jsSlowNightly', 'jsSlowWeekly', 'clone', 'parallel', 'repl', 'auth', 'sharding', 'tool'],expandUseDB=expandUseDB)
         if suite == 'test':
             if os.sys.platform == "win32":
                 program = 'test.exe'
@@ -878,20 +903,6 @@ def expand_suites(suites,expandUseDB=True):
             else:
                 program = 'perftest'
             (globstr, usedb) = (program, False)
-        elif suite == 'client':
-            paths = ["firstExample", "secondExample", "whereExample", "authTest", "clientTest", "httpClientTest"]
-            if os.sys.platform == "win32":
-                paths = [path + '.exe' for path in paths]
-
-            if not test_path:
-                # If we are testing 'in-tree', then add any files of the same name from the
-                # sharedclient directory. The out of tree client build doesn't have shared clients.
-                scpaths = ["sharedclient/" + path for path in paths]
-                scfiles = glob.glob("sharedclient/*")
-                paths += [scfile for scfile in scfiles if scfile in scpaths]
-
-            # hack
-            tests += [(test_path and path or os.path.join(mongo_repo, path), False) for path in paths]
         elif suite == 'mongosTest':
             if os.sys.platform == "win32":
                 program = 'mongos.exe'
@@ -974,17 +985,9 @@ def set_globals(options, tests):
     set_parameters = options.set_parameters
     set_parameters_mongos = options.set_parameters_mongos
     no_preallocj = options.no_preallocj
-    if options.mode == 'suite' and tests == ['client']:
-        # The client suite doesn't work with authentication
-        if options.auth:
-            print "Not running client suite with auth even though --auth was provided"
-        auth = False;
-        keyFile = False;
-        authMechanism = None
-    else:
-        auth = options.auth
-        authMechanism = options.authMechanism
-        keyFile = options.keyFile
+    auth = options.auth
+    authMechanism = options.authMechanism
+    keyFile = options.keyFile
 
     if auth and not keyFile:
         # if only --auth was given to smoke.py, load the
@@ -1243,6 +1246,7 @@ def main():
         call([utils.find_python(), "buildscripts/cleanbb.py", "--nokill", dbroot])
 
     test_report["start"] = time.time()
+    test_report["mongod_running_at_start"] = mongod().is_mongod_up(mongod_port)
     try:
         run_tests(tests)
     finally:
@@ -1251,6 +1255,11 @@ def main():
         test_report["end"] = time.time()
         test_report["elapsed"] = test_report["end"] - test_report["start"]
         test_report["failures"] = len(losers.keys())
+        test_report["mongod_running_at_end"] = mongod().is_mongod_up(mongod_port)
+        if report_file:
+            f = open( report_file, "wb" )
+            f.write( json.dumps( test_report, indent=4, separators=(',', ': ')) )
+            f.close()
 
         report()
 
