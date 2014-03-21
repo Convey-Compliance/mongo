@@ -35,16 +35,15 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/query_knobs.h"
 
 namespace mongo {
 
     struct PlanEnumeratorParams {
 
-        // How many choices do we want when computing ixisect solutions in an AND?
-        static const size_t kDefaultMaxIntersectPerAnd = 3;
-
         PlanEnumeratorParams() : intersect(false),
-                                 maxIntersectPerAnd(3) { }
+                                 maxSolutionsPerOr(internalQueryEnumerationMaxOrSolutions),
+                                 maxIntersectPerAnd(internalQueryEnumerationMaxIntersectPerAnd) { }
 
         // Do we provide solutions that use more indices than the minimum required to provide
         // an indexed solution?
@@ -55,6 +54,11 @@ namespace mongo {
 
         // Not owned here.
         const vector<IndexEntry>* indices;
+
+        // How many plans are we willing to ouput from an OR? We currently consider
+        // all possibly OR plans, which means the product of the number of possibilities
+        // for each clause of the OR. This could grow disastrously large.
+        size_t maxSolutionsPerOr;
 
         // How many intersect plans are we willing to output from an AND?  Given that we pursue an
         // all-pairs approach, we could wind up creating a lot of enumeration possibilities for
@@ -183,12 +187,16 @@ namespace mongo {
         };
 
         struct OrAssignment {
+            OrAssignment() : counter(0) { }
+
+            // Each child of an OR must be indexed for the OR to be indexed. When an OR moves to a
+            // subsequent state it just asks all its children to move their states forward.
+
             // Must use all of subnodes.
             vector<MemoID> subnodes;
 
-            // No enumeration state.  Each child of an OR must be indexed for the OR to be indexed.
-            // When an OR moves to a subsequent state it just asks all its children to move their
-            // states forward.
+            // The number of OR states that we've enumerated so far.
+            size_t counter;
         };
 
         // This is used by AndAssignment and is not an actual assignment.
@@ -251,14 +259,18 @@ namespace mongo {
          * information due to flattening.
          *
          * Nodes that cannot be deeply traversed are returned via the output
-         * vector 'subnodesOut'.
+         * vectors 'subnodesOut' and 'mandatorySubnodes'. Subnodes are "mandatory"
+         * if they *must* use an index (TEXT and GEO).
          *
          * Does not take ownership of arguments.
+         *
+         * Returns false if the AND cannot be indexed. Otherwise returns true.
          */
-        void partitionPreds(MatchExpression* node,
+        bool partitionPreds(MatchExpression* node,
                             PrepMemoContext context,
                             vector<MatchExpression*>* indexOut,
-                            vector<MemoID>* subnodesOut);
+                            vector<MemoID>* subnodesOut,
+                            vector<MemoID>* mandatorySubnodes);
 
         /**
          * Finds a set of predicates that can be safely compounded with 'assigned',
@@ -360,7 +372,7 @@ namespace mongo {
                       const IndexEntry& thisIndex,
                       OneIndexAssignment* assign);
 
-        void dumpMemo();
+        std::string dumpMemo();
 
         // Map from expression to its MemoID.
         unordered_map<MatchExpression*, MemoID> _nodeToId;
@@ -384,6 +396,9 @@ namespace mongo {
 
         // Do we output >1 index per AND (index intersection)?
         bool _ixisect;
+
+        // How many enumerations are we willing to produce from each OR?
+        size_t _orLimit;
 
         // How many things do we want from each AND?
         size_t _intersectLimit;

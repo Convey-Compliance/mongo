@@ -46,6 +46,8 @@ namespace mongo {
     StatusWithMatchExpression MatchExpressionParser::_parseComparison( const char* name,
                                                                        ComparisonMatchExpression* cmp,
                                                                        const BSONElement& e ) {
+        std::auto_ptr<ComparisonMatchExpression> temp(cmp);
+
         // Non-equality comparison match expressions cannot have
         // a regular expression as the argument (e.g. {a: {$gt: /b/}} is illegal).
         if (MatchExpression::EQ != cmp->matchType() && RegEx == e.type()) {
@@ -53,8 +55,6 @@ namespace mongo {
             ss << "Can't have RegEx as arg to predicate over field '" << name << "'.";
             return StatusWithMatchExpression(Status(ErrorCodes::BadValue, ss.str()));
         }
-
-        std::auto_ptr<ComparisonMatchExpression> temp( cmp );
 
         Status s = temp->init( name, e );
         if ( !s.isOK() )
@@ -245,9 +245,16 @@ namespace mongo {
                                           mongoutils::str::stream() << "not handled: " << e.fieldName() );
     }
 
-    StatusWithMatchExpression MatchExpressionParser::_parse( const BSONObj& obj, bool topLevel ) {
+    StatusWithMatchExpression MatchExpressionParser::_parse( const BSONObj& obj, int level ) {
+        if (level > kMaximumTreeDepth) {
+            return StatusWithMatchExpression( ErrorCodes::BadValue,
+                                              "exceeded maximum query tree depth" );
+        }
 
         std::auto_ptr<AndMatchExpression> root( new AndMatchExpression() );
+
+        bool topLevel = (level == 0);
+        level++;
 
         BSONObjIterator i( obj );
         while ( i.more() ){
@@ -262,7 +269,7 @@ namespace mongo {
                         return StatusWithMatchExpression( ErrorCodes::BadValue,
                                                      "$or needs an array" );
                     std::auto_ptr<OrMatchExpression> temp( new OrMatchExpression() );
-                    Status s = _parseTreeList( e.Obj(), temp.get() );
+                    Status s = _parseTreeList( e.Obj(), temp.get(), level );
                     if ( !s.isOK() )
                         return StatusWithMatchExpression( s );
                     root->add( temp.release() );
@@ -272,7 +279,7 @@ namespace mongo {
                         return StatusWithMatchExpression( ErrorCodes::BadValue,
                                                      "and needs an array" );
                     std::auto_ptr<AndMatchExpression> temp( new AndMatchExpression() );
-                    Status s = _parseTreeList( e.Obj(), temp.get() );
+                    Status s = _parseTreeList( e.Obj(), temp.get(), level );
                     if ( !s.isOK() )
                         return StatusWithMatchExpression( s );
                     root->add( temp.release() );
@@ -282,7 +289,7 @@ namespace mongo {
                         return StatusWithMatchExpression( ErrorCodes::BadValue,
                                                      "and needs an array" );
                     std::auto_ptr<NorMatchExpression> temp( new NorMatchExpression() );
-                    Status s = _parseTreeList( e.Obj(), temp.get() );
+                    Status s = _parseTreeList( e.Obj(), temp.get(), level );
                     if ( !s.isOK() )
                         return StatusWithMatchExpression( s );
                     root->add( temp.release() );
@@ -399,8 +406,10 @@ namespace mongo {
                                                                               sub);
                     if (s.isOK()) {
                         root->add(s.getValue());
-                        return Status::OK();
                     }
+
+                    // Propagate geo parsing result to caller.
+                    return s.getStatus();
                 }
             }
         }
@@ -603,7 +612,25 @@ namespace mongo {
             return StatusWithMatchExpression( ErrorCodes::BadValue, "$elemMatch needs an Object" );
 
         BSONObj obj = e.Obj();
+
+        // $elemMatch value case applies when the children all
+        // work on the field 'name'.
+        // This is the case when:
+        //     1) the argument is an expression document; and
+        //     2) expression is not a AND/NOR/OR logical operator. Children of
+        //        these logical operators are initialized with field names.
+        bool isElemMatchValue = false;
         if ( _isExpressionDocument( e, true ) ) {
+            BSONObj o = e.Obj();
+            BSONElement elt = o.firstElement();
+            invariant( !elt.eoo() );
+
+            isElemMatchValue = !mongoutils::str::equals( "$and", elt.fieldName() ) &&
+                               !mongoutils::str::equals( "$nor", elt.fieldName() ) &&
+                               !mongoutils::str::equals( "$or", elt.fieldName() );
+        }
+
+        if ( isElemMatchValue ) {
             // value case
 
             AndMatchExpression theAnd;

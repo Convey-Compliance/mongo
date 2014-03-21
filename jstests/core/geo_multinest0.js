@@ -11,7 +11,7 @@ var res = t.insert( { zip : "10003", data : [ { loc : [ 30, 30 ], type : "home" 
                                               { loc : [ 50, 50 ], type : "work" } ] } );
 assert.writeOK( res );
 
-assert.writeOK(t.ensureIndex( { "data.loc" : "2d", zip : 1 } ));
+assert.commandWorked(t.ensureIndex( { "data.loc" : "2d", zip : 1 } ));
 assert.eq( 2, t.getIndexKeys().length )
 
 res = t.insert( { zip : "10004", data : [ { loc : [ 40, 40 ], type : "home" }, 
@@ -39,9 +39,9 @@ t.insert( { zip : "10001", data : [ { loc : [ [ 10, 10 ], { lat : 50, long : 50 
 t.insert( { zip : "10002", data : [ { loc : [ 20, 20 ], type : "home" }, 
 									{ loc : [ 50, 50 ], type : "work" } ] } )
 res = t.insert({ zip: "10003", data: [{ loc: [{ x: 30, y: 30 }, [ 50, 50 ]], type: "home" }]});
-assert( !res.hasWriteErrors() );
+assert( !res.hasWriteError() );
 
-assert.writeOK(t.ensureIndex( { "data.loc" : "2d", zip : 1 } ));
+assert.commandWorked(t.ensureIndex( { "data.loc" : "2d", zip : 1 } ));
 assert.eq( 2, t.getIndexKeys().length )
 
 res = t.insert( { zip : "10004", data : [ { loc : [ 40, 40 ], type : "home" },

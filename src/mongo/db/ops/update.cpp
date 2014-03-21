@@ -47,6 +47,7 @@
 #include "mongo/db/pagefault.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/runner_yield_policy.h"
 #include "mongo/db/queryutil.h"
@@ -110,7 +111,12 @@ namespace mongo {
             return Status::OK();
         }
 
-        Status validateDBRef(const mb::ConstElement elem, const bool deep) {
+        /**
+         * Validates an element that has a field name which starts with a dollar sign ($).
+         * In the case of a DBRef field ($id, $ref, [$db]) these fields may be valid in
+         * the correct order/context only.
+         */
+        Status validateDollarPrefixElement(const mb::ConstElement elem, const bool deep) {
             mb::ConstElement curr = elem;
             StringData currName = elem.getFieldName();
 
@@ -160,8 +166,11 @@ namespace mongo {
             else {
                 // not an okay, $ prefixed field name.
                 return Status(ErrorCodes::DollarPrefixedFieldName,
-                              str::stream() << elem.getFieldName()
-                              << " is not valid for storage.");
+                              str::stream() << "The dollar ($) prefixed field '"
+                                            << elem.getFieldName() << "' in '"
+                                            << mb::getFullName(elem)
+                                            << "' is not valid for storage.");
+
             }
 
             return Status::OK();
@@ -182,18 +191,19 @@ namespace mongo {
 
             if (!childOfArray) {
                 StringData fieldName = elem.getFieldName();
-                // Cannot start with "$", unless dbref which must start with ($ref, $id)
+                // Cannot start with "$", unless dbref
                 if (fieldName[0] == '$') {
-                    // Check if it is a DBRef has this field {$ref, $id, [$db]}
-                    Status status = validateDBRef(elem, deep);
+                    Status status = validateDollarPrefixElement(elem, deep);
                     if (!status.isOK())
                         return status;
                 }
                 else if (fieldName.find(".") != string::npos) {
                     // Field name cannot have a "." in it.
                     return Status(ErrorCodes::DottedFieldName,
-                                  str::stream() << elem.getFieldName()
-                                                << " is not valid for storage.");
+                                  str::stream() << "The dotted field '"
+                                                << elem.getFieldName() << "' in '"
+                                                << mb::getFullName(elem)
+                                                << "' is not valid for storage.");
                 }
             }
 
@@ -478,18 +488,6 @@ namespace mongo {
         return executor.execute();
     }
 
-    static bool isQueryIsolated(const BSONObj& query) {
-        BSONObjIterator iter(query);
-        while (iter.more()) {
-            BSONElement elt = iter.next();
-            if (str::equals(elt.fieldName(), "$isolated") && elt.trueValue())
-                return true;
-            if (str::equals(elt.fieldName(), "$atomic") && elt.trueValue())
-                return true;
-        }
-        return false;
-    }
-
     UpdateResult update(
             const UpdateRequest& request,
             OpDebug* opDebug,
@@ -536,7 +534,7 @@ namespace mongo {
         // yield while evaluating the update loop below.
         const bool isolated =
             (cq && QueryPlannerCommon::hasNode(cq->root(), MatchExpression::ATOMIC)) ||
-            isQueryIsolated(request.getQuery());
+            LiteParsedQuery::isQueryIsolated(request.getQuery());
 
         //
         // We'll start assuming we have one or more documents for this update. (Otherwise,
@@ -749,6 +747,10 @@ namespace mongo {
 
                 // The updates were not in place. Apply them through the file manager.
                 newObj = doc.getObject();
+                uassert(17419,
+                        str::stream() << "Resulting document after update is larger than "
+                                      << BSONObjMaxUserSize,
+                        newObj.objsize() <= BSONObjMaxUserSize);
                 StatusWith<DiskLoc> res = collection->updateDocument(loc,
                                                                      newObj,
                                                                      true,
@@ -880,6 +882,10 @@ namespace mongo {
 
         // Insert the doc
         BSONObj newObj = doc.getObject();
+        uassert(17420,
+                str::stream() << "Document to upsert is larger than " << BSONObjMaxUserSize,
+                newObj.objsize() <= BSONObjMaxUserSize);
+
         StatusWith<DiskLoc> newLoc = collection->insertDocument(newObj,
                                                                 !request.isGod() /*enforceQuota*/);
         uassertStatusOK(newLoc.getStatus());

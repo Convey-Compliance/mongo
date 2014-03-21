@@ -12,7 +12,6 @@ Import("testEnv")
 Import("has_option")
 Import("get_option")
 Import("usev8")
-Import("installSetup")
 Import("enforce_glibc")
 Import("darwin windows solaris linux nix")
 
@@ -589,6 +588,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/index/btree_based_access_method.cpp",
                     "db/index/btree_index_cursor.cpp",
                     "db/index/btree_interface.cpp",
+                    "db/index/index_descriptor.cpp",
                     "db/index/fts_access_method.cpp",
                     "db/index/hash_access_method.cpp",
                     "db/index/haystack_access_method.cpp",
@@ -628,6 +628,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/geo/s2common.cpp",
                     "db/ops/count.cpp",
                     "db/ops/delete.cpp",
+                    "db/ops/delete_executor.cpp",
                     "db/ops/insert.cpp",
                     "db/ops/update.cpp",
                     "db/ops/update_executor.cpp",
@@ -962,7 +963,8 @@ env.Library("alltools",
                      "coreserver",
                      "coredb",
                      "$BUILD_DIR/mongo/util/options_parser/options_parser",
-                     "$BUILD_DIR/mongo/db/auth/authmocks"])
+                     "$BUILD_DIR/mongo/db/auth/authmocks",
+                     "$BUILD_DIR/mongo/db/auth/authmongod"])
 
 normalTools = [ "dump", "restore", "export", "import", "stat", "top", "oplog" ]
 env.Alias( "tools", [ "#/${PROGPREFIX}mongo" + name + "${PROGSUFFIX}" for name in normalTools ] )
@@ -1162,10 +1164,6 @@ def installBinary( e, name ):
         e.AddPostAction(name, 'strip $TARGET')
 
     distBinaries.append(name)
-
-    if not installSetup.binaries:
-        return
-
     inst = e.Install( "$INSTALL_DIR/bin", name )
 
     if nix:

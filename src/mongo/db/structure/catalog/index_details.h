@@ -93,9 +93,6 @@ namespace mongo {
         int keyPatternOffset( const string& key ) const;
         bool inKeyPattern( const string& key ) const { return keyPatternOffset( key ) >= 0; }
 
-        /* true if the specified key is in the index */
-        bool hasKey(const BSONObj& key);
-
         // returns name of this index's storage area (database.collection.$index)
         string indexNamespace() const {
             return indexNamespaceFromObj(info.obj());
@@ -179,14 +176,6 @@ namespace mongo {
         string toString() const {
             return info.obj().toString();
         }
-
-        /**
-         * @param newSpec the new index specification to check.
-         *
-         * @return true if the given newSpec has the same options as the
-         *     existing index assuming the key spec matches.
-         */
-        bool areIndexOptionsEquivalent( const BSONObj& newSpec ) const;
 
         /** @return true if supported.  supported means we can use the index, including adding new keys.
                     it may not mean we can build the index version in question: we may not maintain building 

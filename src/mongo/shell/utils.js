@@ -241,6 +241,7 @@ if ( typeof _threadInject != "undefined" ){
                                    "jstests/currentop.js", // SERVER-8673, plus rwlock yielding issues
                                    "jstests/set_param1.js", // changes global state
                                    "jstests/geo_update_btree2.js", // SERVER-11132 test disables table scans
+                                   "jstests/update_setOnInsert.js", // SERVER-9982
                                   ] );
         
         // some tests can't be run in parallel with each other
@@ -886,7 +887,7 @@ shellHelper.show = function (what) {
             });
         });
 
-        dbinfo.sort(function (a,b) { a.name - b.name });
+        dbinfo.sort(compareOn('name'))
         dbinfo.forEach(function (db) {
             var namePadding = maxNameLength - db.name_size;
             var sizePadding = maxGbDigits   - db.gb_digits;

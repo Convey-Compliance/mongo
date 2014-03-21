@@ -33,16 +33,14 @@
 #include <memory>
 #include "boost/thread/locks.hpp"
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/client/dbclientinterface.h"   // For QueryOption_foobar
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-    const int PlanCache::kPlanCacheMaxWriteOperations = 1000;
-
-    const int PlanCache::kMaxCacheSize = 200;
 
     //
     // Cache-related functions for CanonicalQuery
@@ -82,6 +80,16 @@ namespace mongo {
         // stale information from the cache for the losing plans, allPlans would
         // simply be wrong.
         if (lpq.isExplain()) {
+            return false;
+        }
+
+        // Tailable cursors won't get cached, just turn into collscans.
+        if (query.getParsed().hasOption(QueryOption_CursorTailable)) {
+            return false;
+        }
+
+        // Snapshot is really a hint.
+        if (query.getParsed().isSnapshot()) {
             return false;
         }
 
@@ -189,11 +197,9 @@ namespace mongo {
         return ss;
     }
 
-    // static
-    const size_t PlanCacheEntry::kMaxFeedback = 20;
 
     // static
-    const double PlanCacheEntry::kStdDevThreshold = 2.0;
+    const double PlanCacheEntry::kMinDeviation = 0.0001;
 
     //
     // PlanCacheIndexTree
@@ -282,13 +288,14 @@ namespace mongo {
     // PlanCache
     //
 
-    PlanCache::PlanCache() : _cache(kMaxCacheSize) { }
+    PlanCache::PlanCache() : _cache(internalQueryCacheSize) { }
 
-    PlanCache::PlanCache(const std::string& ns) : _cache(kMaxCacheSize), _ns(ns) { }
+    PlanCache::PlanCache(const std::string& ns) : _cache(internalQueryCacheSize), _ns(ns) { }
 
     PlanCache::~PlanCache() { }
 
-    Status PlanCache::add(const CanonicalQuery& query, const std::vector<QuerySolution*>& solns,
+    Status PlanCache::add(const CanonicalQuery& query,
+                          const std::vector<QuerySolution*>& solns,
                           PlanRankingDecision* why) {
         invariant(why);
 
@@ -381,23 +388,29 @@ namespace mongo {
             }
             double stddev = sqrt(sum_of_squares / (entry->feedback.size() - 1));
 
-            // If the score has gotten more than a standard deviation lower than
-            // its initial value, we should uncache the entry.
-            double initialScore = entry->decision->scores[0];
-            if ((initialScore - mean) > (PlanCacheEntry::kStdDevThreshold * stddev)) {
-                return true;
-            }
-
             entry->averageScore.reset(mean);
             entry->stddevScore.reset(stddev);
         }
 
         // If the latest use of this plan cache entry is too far from the expected
-        // performance, then we should uncache the entry.
-        if ((*entry->averageScore - latestFeedback->score)
-             > (PlanCacheEntry::kStdDevThreshold * (*entry->stddevScore))) {
+        // performance, then we should uncache the entry. Only uncache if the deviation
+        // also exceeds a minimum value.
+        double deviation = *entry->averageScore - latestFeedback->score;
+
+        if (deviation < PlanCacheEntry::kMinDeviation) {
+            // The plan performed better then the average or is only worse by
+            // epsilon. Keep the cache entry, regardless of the std dev.
+            return false;
+        }
+
+        if (deviation > (internalQueryCacheStdDeviations * (*entry->stddevScore))) {
+            // This run of the plan was much worse than average.
+            // Kick it out of the plan cache.
             return true;
         }
+
+        // If we're here, the performance deviated from the average, but
+        // not by enough to warrant uncaching.
 
         return false;
     }
@@ -417,7 +430,7 @@ namespace mongo {
         }
         invariant(entry);
 
-        if (entry->feedback.size() >= PlanCacheEntry::kMaxFeedback) {
+        if (entry->feedback.size() >= size_t(internalQueryCacheFeedbacksStored)) {
             // If we have enough feedback, then use it to determine whether
             // we should get rid of the cached solution.
             if (hasCachedPlanPerformanceDegraded(entry, autoFeedback.get())) {
@@ -487,11 +500,13 @@ namespace mongo {
     void PlanCache::notifyOfWriteOp() {
         // It's fine to clear the cache multiple times if multiple threads
         // increment the counter to kPlanCacheMaxWriteOperations or greater.
-        if (_writeOperations.addAndFetch(1) < kPlanCacheMaxWriteOperations) {
+        if (_writeOperations.addAndFetch(1) < internalQueryCacheWriteOpsBetweenFlush) {
             return;
         }
-        LOG(1) << _ns << ": clearing collection plan cache - " << kPlanCacheMaxWriteOperations
-               << " write operations on detected since last refresh.";
+
+        LOG(1) << _ns << ": clearing collection plan cache - "
+               << internalQueryCacheWriteOpsBetweenFlush
+               << " write operations detected since last refresh.";
         clear();
     }
 
