@@ -189,7 +189,6 @@ namespace mongo {
             _include = include;
         }
         else {
-            // XXX document
             _include = !include;
 
             const size_t dot = field.find('.');
@@ -250,7 +249,23 @@ namespace mongo {
         }
 
         BSONObjBuilder bob;
-        if (!requiresDocument()) {
+        if (member->hasObj()) {
+            MatchDetails matchDetails;
+
+            // If it's a positional projection we need a MatchDetails.
+            if (transformRequiresDetails()) {
+                matchDetails.requestElemMatchKey();
+                verify(NULL != _queryExpression);
+                verify(_queryExpression->matchesBSON(member->obj, &matchDetails));
+            }
+
+            Status projStatus = transform(member->obj, &bob, &matchDetails);
+            if (!projStatus.isOK()) {
+                return projStatus;
+            }
+        }
+        else {
+            verify(!requiresDocument());
             // Go field by field.
             if (_includeID) {
                 BSONElement elt;
@@ -272,24 +287,6 @@ namespace mongo {
                 if (member->getFieldDotted(specElt.fieldName(), &keyElt) && !keyElt.eoo()) {
                     bob.appendAs(keyElt, specElt.fieldName());
                 }
-            }
-        }
-        else {
-            // Planner should have done this.
-            verify(member->hasObj());
-
-            MatchDetails matchDetails;
-
-            // If it's a positional projection we need a MatchDetails.
-            if (transformRequiresDetails()) {
-                matchDetails.requestElemMatchKey();
-                verify(NULL != _queryExpression);
-                verify(_queryExpression->matchesBSON(member->obj, &matchDetails));
-            }
-
-            Status projStatus = transform(member->obj, &bob, &matchDetails);
-            if (!projStatus.isOK()) {
-                return projStatus;
             }
         }
 
@@ -479,6 +476,14 @@ namespace mongo {
                                   const BSONElement& elt,
                                   const MatchDetails* details,
                                   const ArrayOpType arrayOpType) const {
+
+
+        // Skip if the field name matches a computed $meta field.
+        // $meta projection fields can exist at the top level of
+        // the result document and the field names cannot be dotted.
+        if (_meta.find(elt.fieldName()) != _meta.end()) {
+            return Status::OK();
+        }
 
         FieldMap::const_iterator field = _fields.find(elt.fieldName());
         if (field == _fields.end()) {

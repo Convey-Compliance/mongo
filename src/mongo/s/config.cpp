@@ -34,6 +34,7 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/lasterror.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/chunk.h"
@@ -46,6 +47,8 @@
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/s/type_database.h"
+#include "mongo/s/type_locks.h"
+#include "mongo/s/type_lockpings.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_shard.h"
 #include "mongo/util/net/message.h"
@@ -329,6 +332,10 @@ namespace mongo {
 
 
     ChunkManagerPtr DBConfig::getChunkManagerIfExists( const string& ns, bool shouldReload, bool forceReload ){
+	
+        // Don't report exceptions here as errors in GetLastError
+        LastError::Disabled ignoreForGLE(lastError.get(false));
+         
         try{
             return getChunkManager( ns, shouldReload, forceReload );
         }
@@ -1121,6 +1128,40 @@ namespace mongo {
 
         if ( !result.isOK() ) {
             warning() << "couldn't create host_1 index on config db: "
+                      << result.reason() << endl;
+        }
+
+        result = clusterCreateIndex( LocksType::ConfigNS,
+                                     BSON( LocksType::lockID() << 1 ),
+                                     true, // unique
+                                     WriteConcernOptions::AllConfigs,
+                                     NULL );
+
+        if ( !result.isOK() ) {
+            warning() << "couldn't create lock id index on config db: "
+                      << result.reason() << endl;
+        }
+
+        result = clusterCreateIndex( LocksType::ConfigNS,
+                                     BSON( LocksType::state() << 1 <<
+                                           LocksType::process() << 1 ),
+                                     false, // unique
+                                     WriteConcernOptions::AllConfigs,
+                                     NULL );
+
+        if ( !result.isOK() ) {
+            warning() << "couldn't create state and process id index on config db: "
+                      << result.reason() << endl;
+        }
+
+        result = clusterCreateIndex( LockpingsType::ConfigNS,
+                                     BSON( LockpingsType::ping() << 1 ),
+                                     false, // unique
+                                     WriteConcernOptions::AllConfigs,
+                                     NULL );
+
+        if ( !result.isOK() ) {
+            warning() << "couldn't create lockping ping time index on config db: "
                       << result.reason() << endl;
         }
     }

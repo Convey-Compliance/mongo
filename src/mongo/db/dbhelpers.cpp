@@ -67,9 +67,14 @@ namespace mongo {
         if ( !collection )
             return;
 
+        ensureIndex( collection, keyPattern, unique, name );
+    }
+
+    void Helpers::ensureIndex(Collection* collection,
+                              BSONObj keyPattern, bool unique, const char *name) {
         BSONObjBuilder b;
         b.append("name", name);
-        b.append("ns", ns);
+        b.append("ns", collection->ns());
         b.append("key", keyPattern);
         b.appendBool("unique", unique);
         BSONObj o = b.done();
@@ -288,9 +293,13 @@ namespace mongo {
         Collection* collection = cc().database()->getCollection( ns );
         if ( !collection )
             return false;
+
+        // Allow multiKey based on the invariant that shard keys must be single-valued.
+        // Therefore, any multi-key index prefixed by shard key cannot be multikey over
+        // the shard key fields.
         const IndexDescriptor* idx =
             collection->getIndexCatalog()->findIndexByPrefix(shardKeyPattern,
-                                                             true /* require single key */);
+                                                             false /* allow multi key */);
 
         if ( idx == NULL )
             return false;

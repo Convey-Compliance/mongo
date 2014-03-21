@@ -1,7 +1,10 @@
 var myShardingTest = new ShardingTest("sharding_passthrough", 2, 0, 1);
 myShardingTest.adminCommand({ enablesharding : "test" });
+
 var db = myShardingTest.getDB("test");
-db.getMongo()._useWriteCommands = true;
+db.getMongo().forceWriteMode("commands");
+_useWriteCommandsDefault = function() { return true; }; // for tests launching parallel shells.
+
 var res = db.adminCommand({ setParameter: 1, useClusterWriteCommands: true });
 var files = listFiles("jstests/core");
 
@@ -118,6 +121,7 @@ files.forEach(function(x) {
         'mr_auth|' +
         'queryoptimizera|' +
         'indexStatsCommand|' +
+        'storageDetailsCommand|' +
         'reversecursor|' +
         'block_check_supported|' +
         'stages.*|' +

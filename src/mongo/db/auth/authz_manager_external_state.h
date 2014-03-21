@@ -62,6 +62,7 @@ namespace mongo {
 
         /**
          * Retrieves the schema version of the persistent data describing users and roles.
+         * Will leave *outVersion unmodified on non-OK status return values.
          */
         virtual Status getStoredAuthorizationVersion(int* outVersion) = 0;
 
@@ -208,7 +209,7 @@ namespace mongo {
                               bool upsert,
                               bool multi,
                               const BSONObj& writeConcern,
-                              int* numUpdated) = 0;
+                              int* nMatched) = 0;
 
         /**
          * Removes all documents matching "query" from "collectionName".

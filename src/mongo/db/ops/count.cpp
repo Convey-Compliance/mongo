@@ -35,6 +35,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/query/get_runner.h"
+#include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
 
@@ -84,22 +85,46 @@ namespace mongo {
         }
 
         Runner* rawRunner;
+        long long skip = cmd["skip"].numberLong();
+        long long limit = cmd["limit"].numberLong();
+
+        if (limit < 0) {
+            limit = -limit;
+        }
+
         uassertStatusOK(getRunnerCount(collection, query, hintObj, &rawRunner));
         auto_ptr<Runner> runner(rawRunner);
 
+        ElapsedTracker timeToStartYielding(128, 10);
         try {
             const ScopedRunnerRegistration safety(runner.get());
-            runner->setYieldPolicy(Runner::YIELD_AUTO);
 
             long long count = 0;
             Runner::RunnerState state;
             while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, NULL))) {
-                ++count;
+
+                // Lazily yield, avoiding a performance regression when
+                // scanning a very small number of documents.
+                if (timeToStartYielding.intervalHasElapsed()) {
+                    runner->setYieldPolicy(Runner::YIELD_AUTO);
+                }
+
+                if (skip > 0) {
+                    --skip;
+                }
+                else {
+                    ++count;
+                    // Fast-path. There's no point in iterating all over the runner if limit
+                    // is set.
+                    if (count >= limit && limit != 0) {
+                        break;
+                    }
+                }
             }
 
             // Emulate old behavior and return the count even if the runner was killed.  This
             // happens when the underlying collection is dropped.
-            return applySkipLimit(count, cmd);
+            return count;
         }
         catch (const DBException &e) {
             err = e.toString();

@@ -90,8 +90,8 @@ namespace mongo {
 #if defined(_WIN32)
     ntservice::NtServiceDefaultStrings defaultServiceStrings = {
         L"MongoS",
-        L"Mongo DB Router",
-        L"Mongo DB Sharding Router"
+        L"MongoDB Router",
+        L"MongoDB Sharding Router"
     };
     static void initService();
 #endif
@@ -141,12 +141,6 @@ namespace mongo {
             try {
                 r.init();
                 r.process();
-
-                // Release connections after non-write op 
-                if ( r.expectResponse() ) {
-                    LOG(2) << "release thread local connections back to pool" << endl;
-                    ShardConnection::releaseMyConnections();
-                }
             }
             catch ( const AssertionException& ex ) {
 
@@ -158,28 +152,27 @@ namespace mongo {
                     m.header()->id = r.id();
                     replyToQuery( ResultFlag_ErrSet, p , m , buildErrReply( ex ) );
                 }
-                else {
-                    le->raiseError( ex.getCode() , ex.what() );
-                }
+
+                // We *always* populate the last error for now
+                le->raiseError( ex.getCode() , ex.what() );
             }
             catch ( const DBException& ex ) {
 
                 log() << "Exception thrown"
-                    << " while processing " << opToString( m.operation() ) << " op"
-                    << " for " << r.getns() << causedBy( ex ) << endl;
+                      << " while processing " << opToString( m.operation() ) << " op"
+                      << " for " << r.getns() << causedBy( ex ) << endl;
 
                 if ( r.expectResponse() ) {
                     m.header()->id = r.id();
                     replyToQuery( ResultFlag_ErrSet, p , m , buildErrReply( ex ) );
                 }
-                else {
-                    le->raiseError( ex.getCode() , ex.what() );
-                }
+
+                // We *always* populate the last error for now
+                le->raiseError( ex.getCode() , ex.what() );
             }
 
-            // Clear out the last error for GLE unless it's been explicitly disabled
-            if ( r.expectResponse() && !le->disabled )
-                le->reset();
+            // Release connections back to pool, if any still cached
+            ShardConnection::releaseMyConnections();
         }
 
         virtual void disconnected( AbstractMessagingPort* p ) {
@@ -374,6 +367,11 @@ static bool runMongosServer( bool doUpgrade ) {
         error() << "error upgrading config database to v" << CURRENT_CONFIG_VERSION
                 << causedBy(errMsg) << endl;
         return false;
+    }
+
+    if ( doUpgrade ) {
+        log() << "Config database is at version v" << CURRENT_CONFIG_VERSION;
+        return true;
     }
 
     configServer.reloadSettings();

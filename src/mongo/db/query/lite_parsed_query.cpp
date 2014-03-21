@@ -48,6 +48,7 @@ namespace mongo {
                                  const BSONObj& hint,
                                  const BSONObj& minObj, const BSONObj& maxObj,
                                  bool snapshot,
+                                 bool explain,
                                  LiteParsedQuery** out) {
         auto_ptr<LiteParsedQuery> pq(new LiteParsedQuery());
         pq->_sort = sort;
@@ -55,6 +56,7 @@ namespace mongo {
         pq->_min = minObj;
         pq->_max = maxObj;
         pq->_snapshot = snapshot;
+        pq->_explain = explain;
 
         Status status = pq->init(ns, ntoskip, ntoreturn, queryOptions, query, proj, false);
         if (status.isOK()) { *out = pq.release(); }
@@ -160,6 +162,11 @@ namespace mongo {
         BSONObjIterator i(sortObj);
         while (i.more()) {
             BSONElement e = i.next();
+            // fieldNameSize() includes NULL terminator. For empty field name,
+            // we should be checking for 1 instead of 0.
+            if (1 == e.fieldNameSize()) {
+                return false;
+            }
             if (isTextScoreMeta(e)) {
                 continue;
             }
@@ -169,6 +176,19 @@ namespace mongo {
             }
         }
         return true;
+    }
+
+    // static
+    bool LiteParsedQuery::isQueryIsolated(const BSONObj& query) {
+        BSONObjIterator iter(query);
+        while (iter.more()) {
+            BSONElement elt = iter.next();
+            if (str::equals(elt.fieldName(), "$isolated") && elt.trueValue())
+                return true;
+            if (str::equals(elt.fieldName(), "$atomic") && elt.trueValue())
+                return true;
+        }
+        return false;
     }
 
     // static
@@ -359,7 +379,8 @@ namespace mongo {
                         _returnKey = true;
                         BSONObjBuilder projBob;
                         projBob.appendElements(_proj);
-                        // XXX: what's the syntax here?
+                        // We use $$ because it's never going to show up in a user's projection.
+                        // The exact text doesn't matter.
                         BSONObj indexKey = BSON("$$" <<
                                                 BSON("$meta" << LiteParsedQuery::metaIndexKey));
                         projBob.append(indexKey.firstElement());

@@ -219,7 +219,6 @@ namespace {
 
         namespace mmb = mutablebson;
         UpdateDriver::Options updateOptions;
-        updateOptions.upsert = upsert;
         UpdateDriver driver(updateOptions);
         Status status = driver.parse(updatePattern);
         if (!status.isOK())
@@ -272,7 +271,7 @@ namespace {
                                                  bool upsert,
                                                  bool multi,
                                                  const BSONObj& writeConcern,
-                                                 int* numUpdated) {
+                                                 int* nMatched) {
         return Status(ErrorCodes::InternalError,
                       "AuthzManagerExternalStateMock::update not implemented in mock.");
     }

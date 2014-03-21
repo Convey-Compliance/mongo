@@ -77,35 +77,10 @@ namespace mongo {
 
         uassert( 13644 , "can't use 'local' database through mongos" , ! str::startsWith( getns() , "local." ) );
 
-        // TODO: Deprecated, keeping to preserve codepath for now
-        const string nsStr (getns()); // use in functions taking string rather than char*
-
-        _config = grid.getDBConfig( nsStr );
-
-        // TODO:  In general, throwing an exception when the cm doesn't exist is really annoying
-        if ( _config->isSharded( nsStr ) ) {
-            _chunkManager = _config->getChunkManagerIfExists( nsStr );
-        }
-        else {
-            _chunkManager.reset();
-        }
+        grid.getDBConfig( getns() );
 
         _m.header()->id = _id;
         _clientInfo->clearRequestInfo();
-    }
-
-    // Deprecated, will move to the strategy itself
-    Shard Request::primaryShard() const {
-        verify( _didInit );
-
-        if ( _chunkManager ) {
-            if ( _chunkManager->numChunks() > 1 )
-                throw UserException( 8060 , "can't call primaryShard on a sharded collection" );
-            return _chunkManager->findIntersectingChunk( _chunkManager->getShardKey().globalMin() )->getShard();
-        }
-        Shard s = _config->getShard( getns() );
-        uassert( 10194 ,  "can't call primaryShard on a sharded collection!" , s.ok() );
-        return s;
     }
 
     void Request::process( int attempt ) {
@@ -127,6 +102,7 @@ namespace mongo {
         bool iscmd = false;
         if ( op == dbKillCursors ) {
             cursorCache.gotKillCursors( _m );
+            globalOpCounters.gotOp( op , iscmd );
         }
         else if ( op == dbQuery ) {
             NamespaceString nss(getns());
@@ -143,12 +119,16 @@ namespace mongo {
             else {
                 STRATEGY->queryOp( *this );
             }
+
+            globalOpCounters.gotOp( op , iscmd );
         }
         else if ( op == dbGetMore ) {
             STRATEGY->getMore( *this );
+            globalOpCounters.gotOp( op , iscmd );
         }
         else {
             STRATEGY->writeOp( op, *this );
+            // globalOpCounters are handled by write commands.
         }
 
         LOG(3) << "Request::process end ns: " << getns()
@@ -157,12 +137,6 @@ namespace mongo {
                << " attempt: " << attempt
                << " " << t.millis() << "ms"
                << endl;
-
-        globalOpCounters.gotOp( op , iscmd );
-    }
-
-    void Request::gotInsert() {
-        globalOpCounters.gotInsert();
     }
 
     void Request::reply( Message & response , const string& fromServer ) {

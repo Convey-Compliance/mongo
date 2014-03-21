@@ -140,7 +140,10 @@ namespace mongo {
                       const MatchDetails* details = NULL,
                       const ArrayOpType arrayOpType = ARRAY_OP_NORMAL) const;
 
-        // XXX document
+        /**
+         * Like append, but for arrays.
+         * Deals with slice and calls appendArray to preserve the array-ness.
+         */
         void appendArray(BSONObjBuilder* bob, const BSONObj& array, bool nested = false) const;
 
         // True if default at this level is to include.
@@ -151,7 +154,10 @@ namespace mongo {
 
         // We must group projections with common prefixes together.
         // TODO: benchmark vector<pair> vs map
-        // XXX: document
+        //
+        // Projection is a rooted tree.  If we have {a.b: 1, a.c: 1} we don't want to
+        // double-traverse the document when we're projecting it.  Instead, we have an entry in
+        // _fields for 'a' with two sub projections: b:1 and c:1.
         FieldMap _fields;
 
         // The raw projection spec. that is passed into init(...)
@@ -172,10 +178,10 @@ namespace mongo {
 
         ArrayOpType _arrayOpType;
 
-        // Is there an elemMatch or positional operator?
+        // Is there an slice, elemMatch or meta operator?
         bool _hasNonSimple;
 
-        // Is there a projection over a dotted field?
+        // Is there a projection over a dotted field or a $ positional operator?
         bool _hasDottedField;
 
         // The full query expression.  Used when we need MatchDetails.

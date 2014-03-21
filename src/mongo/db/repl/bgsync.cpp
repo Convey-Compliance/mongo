@@ -134,25 +134,16 @@ namespace replset {
 
     void BackgroundSync::notifierThread() {
         Client::initThread("rsSyncNotifier");
-        bool meEnsured = false;
-        while (!inShutdown() && !meEnsured) {
-            try {
-                theReplSet->syncSourceFeedback.ensureMe();
-                meEnsured = true;
-            }
-            catch (const DBException& e) {
-                warning() << "failed to initiate notifier thread: " << e.what()
-                          << " trying again in one second";
-                sleepsecs(1);
-            }
-        }
         replLocalAuth();
 
         // This makes the initial connection to our sync source for oplog position notification.
         // It also sets the supportsUpdater flag so we know which method to use.
         // If this function fails, we ignore that situation because it will be taken care of
         // the first time markOplog() is called in the loop below.
-        connectOplogNotifier();
+        {
+            boost::unique_lock<boost::mutex> oplogLockSSF(theReplSet->syncSourceFeedback.oplock);
+            connectOplogNotifier();
+        }
         theReplSet->syncSourceFeedback.go();
 
         while (!inShutdown()) {
@@ -208,7 +199,9 @@ namespace replset {
             theReplSet->syncSourceFeedback.updateSelfInMap(theReplSet->lastOpTimeWritten);
         }
         else {
+            boost::unique_lock<boost::mutex> oplogLockSSF(theReplSet->syncSourceFeedback.oplock);
             if (!hasCursor()) {
+                oplogLockSSF.unlock();
                 sleepmillis(500);
                 return;
             }
@@ -450,6 +443,8 @@ namespace replset {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _lastH = o["h"].numberLong();
                 _lastOpTimeFetched = o["ts"]._opTime();
+                LOG(3) << "replSet lastOpTimeFetched: "
+                       << _lastOpTimeFetched.toStringPretty() << rsLog;
             }
         }
     }
@@ -502,8 +497,6 @@ namespace replset {
             log() << "replSet remoteOldestOp:    " << remoteTs.toStringLong() << rsLog;
             log() << "replSet lastOpTimeFetched: " << _lastOpTimeFetched.toStringLong() << rsLog;
         }
-        LOG(3) << "replSet remoteOldestOp: " << remoteTs.toStringLong() << rsLog;
-        LOG(3) << "replSet lastOpTimeFetched: " << _lastOpTimeFetched.toStringLong() << rsLog;
 
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
@@ -563,6 +556,8 @@ namespace replset {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _currentSyncTarget = target;
             }
+
+            boost::unique_lock<boost::mutex> oplogLockSSF(theReplSet->syncSourceFeedback.oplock);
             theReplSet->syncSourceFeedback.connect(target);
 
             return;

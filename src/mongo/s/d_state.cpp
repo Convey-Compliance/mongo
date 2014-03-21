@@ -89,14 +89,23 @@ namespace mongo {
         configServer.init(server);
     }
 
+    // TODO: Consolidate and eliminate these various ways of setting / validating shard names
     bool ShardingState::setShardName( const string& name ) {
+        return setShardNameAndHost( name, "" );
+    }
+
+    bool ShardingState::setShardNameAndHost( const string& name, const string& host ) {
         scoped_lock lk(_mutex);
         if ( _shardName.size() == 0 ) {
             // TODO SERVER-2299 remotely verify the name is sound w.r.t IPs
             _shardName = name;
 
             string clientAddr = cc().clientAddress(true);
-            log() << "remote client " << clientAddr << " initialized this host as shard " << name;
+
+            log() << "remote client " << clientAddr << " initialized this host "
+                  << ( host.empty() ? string( "" ) : string( "(" ) + host + ") " )
+                  << "as shard " << name;
+
             return true;
         }
 
@@ -104,22 +113,32 @@ namespace mongo {
             return true;
 
         string clientAddr = cc().clientAddress(true);
-        warning() << "remote client " << clientAddr << " tried to initialize this host as shard "
-                  << name << ", but shard name was previously initialized as " << _shardName;
+
+        warning() << "remote client " << clientAddr << " tried to initialize this host "
+                  << ( host.empty() ? string( "" ) : string( "(" ) + host + ") " )
+                  << "as shard " << name
+                  << ", but shard name was previously initialized as " << _shardName;
 
         return false;
     }
 
     void ShardingState::gotShardName( const string& name ) {
-        if ( setShardName( name ) )
+        gotShardNameAndHost( name, "" );
+    }
+
+    void ShardingState::gotShardNameAndHost( const string& name, const string& host ) {
+        if ( setShardNameAndHost( name, host ) )
             return;
 
         string clientAddr = cc().clientAddress(true);
         stringstream ss;
 
         // Same error as above, to match for reporting
-        ss << "remote client " << clientAddr << " tried to initialize this host as shard " << name
+        ss << "remote client " << clientAddr << " tried to initialize this host "
+           << ( host.empty() ? string( "" ) : string( "(" ) + host + ") " )
+           << "as shard " << name
            << ", but shard name was previously initialized as " << _shardName;
+
         msgasserted( 13298 , ss.str() );
     }
 
@@ -616,21 +635,19 @@ namespace mongo {
         //
         // Do messaging based on what happened above
         //
-
-        string versionMsg = str::stream()
-            << " (loaded metadata version : " << remoteCollVersion.toString()
-            << ( beforeCollVersion.epoch() == afterCollVersion.epoch() ?
-                     string( ", stored version : " ) + afterCollVersion.toString() :
-                     string( ", stored versions : " ) +
-                         beforeCollVersion.toString() + " / " + afterCollVersion.toString() )
-            << ", took " << refreshMillis << "ms)";
+        string localShardVersionMsg =
+                beforeShardVersion.epoch() == afterShardVersion.epoch() ?
+                        afterShardVersion.toString() :
+                        beforeShardVersion.toString() + " / " + afterShardVersion.toString();
 
         if ( choice == ChunkVersion::VersionChoice_Unknown ) {
 
-            string errMsg =
-                str::stream() << "need to retry loading metadata for " << ns
-                              << ", collection may have been dropped or recreated during load"
-                              << versionMsg;
+            string errMsg = str::stream()
+                << "need to retry loading metadata for " << ns
+                << ", collection may have been dropped or recreated during load"
+                << " (loaded shard version : " << remoteShardVersion.toString()
+                << ", stored shard versions : " << localShardVersionMsg
+                << ", took " << refreshMillis << "ms)";
 
             warning() << errMsg << endl;
             return Status( ErrorCodes::RemoteChangeDetected, errMsg );
@@ -638,7 +655,9 @@ namespace mongo {
 
         if ( choice == ChunkVersion::VersionChoice_Local ) {
 
-            LOG( 0 ) << "newer metadata not found for " << ns << versionMsg << endl;
+            LOG( 0 ) << "metadata of collection " << ns << " already up to date (shard version : "
+                     << afterShardVersion.toString() << ", took " << refreshMillis << "ms)"
+                     << endl;
             return Status::OK();
         }
 
@@ -646,20 +665,32 @@ namespace mongo {
 
         switch( installType ) {
         case InstallType_New:
-            LOG( 0 ) << "loaded new metadata for " << ns << versionMsg << endl;
+            LOG( 0 ) << "collection " << ns << " was previously unsharded"
+                     << ", new metadata loaded with shard version " << remoteShardVersion
+                     << endl;
             break;
         case InstallType_Update:
-            LOG( 0 ) << "loaded newer metadata for " << ns << versionMsg << endl;
+            LOG( 0 ) << "updating metadata for " << ns << " from shard version "
+                     << localShardVersionMsg << " to shard version " << remoteShardVersion
+                     << endl;
             break;
         case InstallType_Replace:
-            LOG( 0 ) << "replacing metadata for " << ns << versionMsg << endl;
+            LOG( 0 ) << "replacing metadata for " << ns << " at shard version "
+                     << localShardVersionMsg << " with a new epoch (shard version "
+                     << remoteShardVersion << ")" << endl;
             break;
         case InstallType_Drop:
-            LOG( 0 ) << "dropping metadata for " << ns << versionMsg << endl;
+            LOG( 0 ) << "dropping metadata for " << ns << " at shard version "
+                     << localShardVersionMsg << ", took " << refreshMillis << "ms" << endl;
             break;
         default:
             verify( false );
             break;
+        }
+
+        if ( installType != InstallType_Drop ) {
+            LOG( 0 ) << "collection version was loaded at version " << remoteCollVersion
+                     << ", took " << refreshMillis << "ms" << endl;
         }
 
         return Status::OK();
@@ -919,9 +950,12 @@ namespace mongo {
             if ( ! checkConfigOrInit( cmdObj["configdb"].valuestrsafe() , authoritative , errmsg , result ) )
                 return false;
 
-            // check shard name/hosts are correct
+            // check shard name is correct
             if ( cmdObj["shard"].type() == String ) {
-                shardingState.gotShardName( cmdObj["shard"].String() );
+                // The shard host is also sent when using setShardVersion, report this host if there
+                // is an error.
+                shardingState.gotShardNameAndHost( cmdObj["shard"].String(),
+                                                   cmdObj["shardHost"].str() );
             }
             
             // Handle initial shard connection

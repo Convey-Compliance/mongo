@@ -9,7 +9,7 @@ assert.eq( 2, res.numIndexesAfter );
 
 res = t.runCommand( "createIndexes", { indexes : [ { key : { "x" : 1 }, name : "x_1" } ] } );
 assert.eq( 2, res.numIndexesBefore );
-assert( res.noChangesMade );
+assert.isnull( res.numIndexesAfter );
 
 res = t.runCommand( "createIndexes", { indexes : [ { key : { "x" : 1 }, name : "x_1" },
                                                    { key : { "y" : 1 }, name : "y_1" } ] } );
@@ -26,7 +26,7 @@ assert.eq( 5, res.numIndexesAfter );
 res = t.runCommand( "createIndexes", { indexes : [ { key : { "a" : 1 }, name : "a_1" },
                                                    { key : { "b" : 1 }, name : "b_1" } ] } );
 assert.eq( 5, res.numIndexesBefore );
-assert( res.noChangesMade );
+assert.isnull( res.numIndexesAfter );
 
 res = t.runCommand( "createIndexes", { indexes : [ {} ] } );
 assert( !res.ok );

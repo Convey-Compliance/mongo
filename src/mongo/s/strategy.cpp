@@ -64,6 +64,58 @@ namespace mongo {
         return nsToCollectionSubstring(ns) == "system.indexes";
     }
 
+    /**
+     * Returns true if request is a query for sharded indexes.
+     */
+    static bool doShardedIndexQuery( Request& r, const QuerySpec& qSpec ) {
+
+        // Extract the ns field from the query, which may be embedded within the "query" or
+        // "$query" field.
+        string indexNSQuery(qSpec.filter()["ns"].str());
+        DBConfigPtr config = grid.getDBConfig( r.getns() );
+
+        if ( !config->isSharded( indexNSQuery )) {
+            return false;
+        }
+
+        // if you are querying on system.indexes, we need to make sure we go to a shard
+        // that actually has chunks. This is not a perfect solution (what if you just
+        // look at all indexes), but better than doing nothing.
+
+        ShardPtr shard;
+        ChunkManagerPtr cm;
+        config->getChunkManagerOrPrimary( indexNSQuery, cm, shard );
+        if ( cm ) {
+            set<Shard> shards;
+            cm->getAllShards( shards );
+            verify( shards.size() > 0 );
+            shard.reset( new Shard( *shards.begin() ) );
+        }
+
+        ShardConnection dbcon( *shard , r.getns() );
+        DBClientBase &c = dbcon.conn();
+
+        string actualServer;
+
+        Message response;
+        bool ok = c.call( r.m(), response, true , &actualServer );
+        uassert( 10200 , "mongos: error calling db", ok );
+
+        {
+            QueryResult *qr = (QueryResult *) response.singleData();
+            if ( qr->resultFlags() & ResultFlag_ShardConfigStale ) {
+                dbcon.done();
+                // Version is zero b/c this is deprecated codepath
+                throw RecvStaleConfigException( r.getns() , "Strategy::doQuery", ChunkVersion( 0, OID() ), ChunkVersion( 0, OID() ) );
+            }
+        }
+
+        r.reply( response , actualServer.size() ? actualServer : c.getServerAddress() );
+        dbcon.done();
+
+        return true;
+    }
+
     void Strategy::queryOp( Request& r ) {
 
         verify( !NamespaceString( r.getns() ).isCommand() );
@@ -92,22 +144,7 @@ namespace mongo {
                  maxTimeMS.getStatus().reason(),
                  maxTimeMS.isOK() );
 
-        if ( _isSystemIndexes( q.ns ) && q.query["ns"].type() == String && r.getConfig()->isSharded( q.query["ns"].String() ) ) {
-            // if you are querying on system.indexes, we need to make sure we go to a shard that actually has chunks
-            // this is not a perfect solution (what if you just look at all indexes)
-            // but better than doing nothing
-
-            ShardPtr myShard;
-            ChunkManagerPtr cm;
-            r.getConfig()->getChunkManagerOrPrimary( q.query["ns"].String(), cm, myShard );
-            if ( cm ) {
-                set<Shard> shards;
-                cm->getAllShards( shards );
-                verify( shards.size() > 0 );
-                myShard.reset( new Shard( *shards.begin() ) );
-            }
-            
-            doIndexQuery( r, *myShard );
+        if ( _isSystemIndexes( q.ns ) && doShardedIndexQuery( r, qSpec )) {
             return;
         }
 
@@ -176,30 +213,6 @@ namespace mongo {
             // We don't want to kill the cursor remotely if there's still data left
             shardCursor->decouple();
         }
-    }
-
-    void Strategy::doIndexQuery( Request& r , const Shard& shard ) {
-
-        ShardConnection dbcon( shard , r.getns() );
-        DBClientBase &c = dbcon.conn();
-
-        string actualServer;
-
-        Message response;
-        bool ok = c.call( r.m(), response, true , &actualServer );
-        uassert( 10200 , "mongos: error calling db", ok );
-
-        {
-            QueryResult *qr = (QueryResult *) response.singleData();
-            if ( qr->resultFlags() & ResultFlag_ShardConfigStale ) {
-                dbcon.done();
-                // Version is zero b/c this is deprecated codepath
-                throw RecvStaleConfigException( r.getns() , "Strategy::doQuery", ChunkVersion( 0, OID() ), ChunkVersion( 0, OID() ) );
-            }
-        }
-
-        r.reply( response , actualServer.size() ? actualServer : c.getServerAddress() );
-        dbcon.done();
     }
 
     void Strategy::clientCommandOp( Request& r ) {
@@ -416,7 +429,8 @@ namespace mongo {
 
         // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
         // for now has same semantics as legacy request
-        ChunkManagerPtr info = r.getChunkManager();
+        DBConfigPtr config = grid.getDBConfig( ns );
+        ChunkManagerPtr info = config->getChunkManagerIfExists( ns );
 
         //
         // TODO: Cleanup cursor cache, consolidate into single codepath
@@ -547,20 +561,11 @@ namespace mongo {
             (void) parsed; // for compile
             dassert( parsed && response.isValid( NULL ) );
 
-            // Populate the lastError object based on the write
+            // Populate the lastError object based on the write response
             lastError.get( false )->reset();
-            bool hadError = batchErrorToLastError( *request,
-                                                   response,
-                                                   lastError.get( false ) );
+            bool hadError = batchErrorToLastError( *request, response, lastError.get( false ) );
 
-            // Need to specially count inserts
-            if ( op == dbInsert ) {
-                for( int i = 0; i < response.getN(); ++i )
-                    r.gotInsert();
-            }
-
-            // If this is an ordered batch and we had a non-write-concern error, we should
-            // stop sending.
+            // Check if this is an ordered batch and we had an error which should stop processing
             if ( request->getOrdered() && hadError )
                 break;
         }

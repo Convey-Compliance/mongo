@@ -70,7 +70,7 @@ namespace mongo {
          * Do not delete the returned pointer as the WorkingSet retains ownership. Call free() to
          * release it.
          */
-        WorkingSetMember* get(const WorkingSetID& i) {
+        WorkingSetMember* get(const WorkingSetID& i) const {
             dassert(i < _data.size()); // ID has been allocated.
             dassert(_data[i].nextFreeOrSelf == i); // ID currently in use.
             return _data[i].member;
@@ -247,6 +247,11 @@ namespace mongo {
          * Returns false otherwise.  Returning false indicates a query planning error.
          */
         bool getFieldDotted(const string& field, BSONElement* out) const;
+
+        /**
+         * Returns expected memory usage of working set member.
+         */
+        size_t getMemUsage() const;
 
     private:
         boost::scoped_ptr<WorkingSetComputedData> _computed[WSM_COMPUTED_NUM_TYPES];

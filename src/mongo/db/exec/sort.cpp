@@ -30,29 +30,12 @@
 
 #include <algorithm>
 
+#include "mongo/db/index_names.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/query_planner.h"
-
-namespace {
-
-    using mongo::DiskLoc;
-    using mongo::WorkingSet;
-    using mongo::WorkingSetID;
-    using mongo::WorkingSetMember;
-
-    /**
-     * Returns expected memory usage of working set member
-     */
-    size_t getMemUsage(WorkingSet* ws, WorkingSetID wsid) {
-        WorkingSetMember* member = ws->get(wsid);
-        size_t memUsage = sizeof(DiskLoc) + member->obj.objsize();
-        return memUsage;
-    }
-
-} // namespace
 
 namespace mongo {
 
@@ -129,11 +112,18 @@ namespace mongo {
         }
     }
 
-    BSONObj SortStageKeyGenerator::getSortKey(const WorkingSetMember& member) const {
-        BSONObj btreeKeyToUse = getBtreeKey(member.obj);
+    Status SortStageKeyGenerator::getSortKey(const WorkingSetMember& member,
+                                             BSONObj* objOut) const {
+        BSONObj btreeKeyToUse;
+
+        Status btreeStatus = getBtreeKey(member.obj, &btreeKeyToUse);
+        if (!btreeStatus.isOK()) {
+            return btreeStatus;
+        }
 
         if (!_sortHasMeta) {
-            return btreeKeyToUse;
+            *objOut = btreeKeyToUse;
+            return Status::OK();
         }
 
         BSONObjBuilder mergedKeyBob;
@@ -160,12 +150,15 @@ namespace mongo {
             }
         }
 
-        return mergedKeyBob.obj();
+        *objOut = mergedKeyBob.obj();
+        return Status::OK();
     }
 
-    BSONObj SortStageKeyGenerator::getBtreeKey(const BSONObj& memberObj) const {
+    Status SortStageKeyGenerator::getBtreeKey(const BSONObj& memberObj, BSONObj* objOut) const {
+        // Not sorting by anything in the key, just bail out early.
         if (_btreeObj.isEmpty()) {
-            return BSONObj();
+            *objOut = BSONObj();
+            return Status::OK();
         }
 
         // We will sort '_data' in the same order an index over '_pattern' would have.  This is
@@ -174,24 +167,31 @@ namespace mongo {
         BSONObjCmp patternCmp(_btreeObj);
         BSONObjSet keys(patternCmp);
 
-        // keyGen can throw on a "parallel array."  Previously we'd error out of sort.
-        // For now we just accept the doc verbatim.  TODO: Do we want to error?
         try {
             _keyGen->getKeys(memberObj, &keys);
         }
+        catch (const UserException& e) {
+            // Probably a parallel array.
+            if (BtreeKeyGenerator::ParallelArraysCode == e.getCode()) {
+                return Status(ErrorCodes::BadValue,
+                              "cannot sort with keys that are parallel arrays");
+            }
+            else {
+                return e.toStatus();
+            }
+        }
         catch (...) {
-            return memberObj;
+            return Status(ErrorCodes::InternalError, "unknown error during sort key generation");
         }
 
-        if (keys.empty()) {
-            // TODO: will this ever happen?  don't think it should.
-            return memberObj;
-        }
+        // Key generator isn't sparse so we should at least get an all-null key.
+        invariant(!keys.empty());
 
         // No bounds?  No problem!  Use the first key.
         if (!_hasBounds) {
             // Note that we sort 'keys' according to the pattern '_btreeObj'.
-            return *keys.begin();
+            *objOut = *keys.begin();
+            return Status::OK();
         }
 
         // To decide which key to use in sorting, we must consider not only the sort pattern but
@@ -203,13 +203,15 @@ namespace mongo {
         verify(NULL != _boundsChecker.get());
         for (BSONObjSet::const_iterator it = keys.begin(); it != keys.end(); ++it) {
             if (_boundsChecker->isValidKey(*it)) {
-                return *it;
+                *objOut = *it;
+                return Status::OK();
             }
         }
 
-        // No key in our bounds.
+        // No key is in our bounds.
         // TODO: will this ever happen?  don't think it should.
-        return *keys.begin();
+        *objOut = *keys.begin();
+        return Status::OK();
     }
 
     void SortStageKeyGenerator::getBoundsForSort(const BSONObj& queryObj, const BSONObj& sortObj) {
@@ -217,7 +219,7 @@ namespace mongo {
         params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
         // We're creating a "virtual index" with key pattern equal to the sort order.
-        IndexEntry sortOrder(sortObj, true, false, "doesnt_matter", BSONObj());
+        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, "doesnt_matter", BSONObj());
         params.indices.push_back(sortOrder);
 
         CanonicalQuery* rawQueryForSort;
@@ -307,6 +309,11 @@ namespace mongo {
         }
 
         if (_memUsage > kMaxBytes) {
+            mongoutils::str::stream ss;
+            ss << "sort stage buffered data usage of " << _memUsage
+               << " bytes exceeds internal limit of " << kMaxBytes << " bytes";
+            Status status(ErrorCodes::Overflow, ss);
+            *out = WorkingSetCommon::allocateStatusMember( _ws, status);
             return PlanStage::FAILURE;
         }
 
@@ -314,7 +321,7 @@ namespace mongo {
 
         // Still reading in results to sort.
         if (!_sorted) {
-            WorkingSetID id;
+            WorkingSetID id = WorkingSet::INVALID_ID;
             StageState code = _child->work(&id);
 
             if (PlanStage::ADVANCED == code) {
@@ -333,7 +340,11 @@ namespace mongo {
 
                 // The data remains in the WorkingSet and we wrap the WSID with the sort key.
                 SortableDataItem item;
-                item.sortKey = _sortKeyGen->getSortKey(*member);
+                Status sortKeyStatus = _sortKeyGen->getSortKey(*member, &item.sortKey);
+                if (!_sortKeyGen->getSortKey(*member, &item.sortKey).isOK()) {
+                    *out = WorkingSetCommon::allocateStatusMember(_ws, sortKeyStatus);
+                    return PlanStage::FAILURE;
+                }
                 item.wsid = id;
                 if (member->hasLoc()) {
                     // The DiskLoc breaks ties when sorting two WSMs with the same sort key.
@@ -353,6 +364,19 @@ namespace mongo {
                 _sorted = true;
                 ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
+            }
+            else if (PlanStage::FAILURE == code) {
+                *out = id;
+                // If a stage fails, it may create a status WSM to indicate why it
+                // failed, in which case 'id' is valid.  If ID is invalid, we
+                // create our own error message.
+                if (WorkingSet::INVALID_ID == id) {
+                    mongoutils::str::stream ss;
+                    ss << "sort stage failed to read in results to sort from child";
+                    Status status(ErrorCodes::InternalError, ss);
+                    *out = WorkingSetCommon::allocateStatusMember( _ws, status);
+                }
+                return code;
             }
             else {
                 if (PlanStage::NEED_FETCH == code) {
@@ -422,6 +446,8 @@ namespace mongo {
 
     PlanStageStats* SortStage::getStats() {
         _commonStats.isEOF = isEOF();
+        _specificStats.memLimit = kMaxBytes;
+        _specificStats.memUsage = _memUsage;
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_SORT));
         ret->specific.reset(new SortStats(_specificStats));
@@ -455,12 +481,12 @@ namespace mongo {
 
         if (_limit == 0) {
             _data.push_back(item);
-            _memUsage += getMemUsage(_ws, item.wsid);
+            _memUsage += _ws->get(item.wsid)->getMemUsage();
         }
         else if (_limit == 1) {
             if (_data.empty()) {
                 _data.push_back(item);
-                _memUsage = getMemUsage(_ws, item.wsid);
+                _memUsage = _ws->get(item.wsid)->getMemUsage();
                 return;
             }
             wsidToFree = item.wsid;
@@ -469,7 +495,7 @@ namespace mongo {
             if (cmp(item, _data[0])) {
                 wsidToFree = _data[0].wsid;
                 _data[0] = item;
-                _memUsage = getMemUsage(_ws, item.wsid);
+                _memUsage = _ws->get(item.wsid)->getMemUsage();
             }
         }
         else {
@@ -478,7 +504,7 @@ namespace mongo {
             vector<SortableDataItem>::size_type limit(_limit);
             if (_dataSet->size() < limit) {
                 _dataSet->insert(item);
-                _memUsage += getMemUsage(_ws, item.wsid);
+                _memUsage += _ws->get(item.wsid)->getMemUsage();
                 return;
             }
             // Limit will be exceeded - compare with item with lowest key
@@ -489,7 +515,8 @@ namespace mongo {
             const SortableDataItem& lastItem = *lastItemIt;
             const WorkingSetComparator& cmp = *_sortKeyComparator;
             if (cmp(item, lastItem)) {
-                _memUsage += getMemUsage(_ws, item.wsid) - getMemUsage(_ws, lastItem.wsid);
+                _memUsage += _ws->get(item.wsid)->getMemUsage() -
+                             _ws->get(lastItem.wsid)->getMemUsage();
                 wsidToFree = lastItem.wsid;
                 // According to std::set iterator validity rules,
                 // it does not matter which of erase()/insert() happens first.

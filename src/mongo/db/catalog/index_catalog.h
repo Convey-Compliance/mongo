@@ -35,9 +35,11 @@
 #include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/unordered_map.h"
 
 namespace mongo {
 
+    class Client;
     class Collection;
     class NamespaceDetails;
 
@@ -96,7 +98,9 @@ namespace mongo {
         IndexDescriptor* findIndexByPrefix( const BSONObj &keyPattern,
                                             bool requireSingleKey ) const;
 
-        void findIndexByType( const string& type , vector<IndexDescriptor*>& matches ) const;
+        void findIndexByType( const string& type,
+                              vector<IndexDescriptor*>& matches,
+                              bool includeUnfinishedIndexes = false ) const;
 
         // never returns NULL
         IndexAccessMethod* getIndex( const IndexDescriptor* desc );
@@ -143,7 +147,7 @@ namespace mongo {
                             bool mayInterrupt,
                             ShutdownBehavior shutdownBehavior = SHUTDOWN_CLEANUP );
 
-        Status okToAddIndex( const BSONObj& spec ) const;
+        StatusWith<BSONObj> prepareSpecForCreate( const BSONObj& original ) const;
 
         Status dropAllIndexes( bool includingIdIndex );
 
@@ -154,6 +158,20 @@ namespace mongo {
          * after this, the indexes can be rebuilt
          */
         vector<BSONObj> getAndClearUnfinishedIndexes();
+
+
+        struct IndexKillCriteria {
+            std::string ns;
+            std::string name;
+            BSONObj key;
+        };
+
+        /**
+         * Given some criteria, will search through all in-progress index builds
+         * and will kill ones that match. (namespace, index name, and/or index key spec)
+         * Returns the list of index specs that were killed, for use in restarting them later.
+         */
+        std::vector<BSONObj> killMatchingIndexBuilds(const IndexKillCriteria& criteria);
 
         // ---- modify single index
 
@@ -234,21 +252,18 @@ namespace mongo {
             return _getAccessMethodName( keyPattern );
         }
 
+        Status _upgradeDatabaseMinorVersionIfNeeded( const string& newPluginName );
+
         // public static helpers
-
-        static bool validKeyPattern( const BSONObj& obj );
-
-        static BSONObj fixIndexSpec( const BSONObj& spec );
 
         static BSONObj fixIndexKey( const BSONObj& key );
 
     private:
+        typedef unordered_map<IndexDescriptor*, Client*> InProgressIndexesMap;
 
         // creates a new thing, no caching
         IndexAccessMethod* _createAccessMethod( const IndexDescriptor* desc,
                                                 IndexCatalogEntry* entry );
-
-        Status _upgradeDatabaseMinorVersionIfNeeded( const string& newPluginName );
 
         int _removeFromSystemIndexes( const StringData& indexName );
 
@@ -288,6 +303,12 @@ namespace mongo {
         // descriptor ownership passes to _setupInMemoryStructures
         IndexCatalogEntry* _setupInMemoryStructures( IndexDescriptor* descriptor );
 
+        static BSONObj _fixIndexSpec( const BSONObj& spec );
+
+        Status _isSpecOk( const BSONObj& spec ) const;
+
+        Status _doesSpecConflictWithExisting( const BSONObj& spec ) const;
+
         int _magic;
         Collection* _collection;
         NamespaceDetails* _details;
@@ -302,6 +323,8 @@ namespace mongo {
 
         static const BSONObj _idObj; // { _id : 1 }
 
+        // Track in-progress index builds, in order to find and stop them when necessary.
+        InProgressIndexesMap _inProgressIndexes;
     };
 
 }

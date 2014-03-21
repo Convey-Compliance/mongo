@@ -29,6 +29,7 @@
  */
 
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/structure/catalog/namespace.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -40,7 +41,8 @@ namespace mongo {
             return StatusWith<BSONObj>( ErrorCodes::BadValue,
                                         str::stream()
                                         << "object to insert too large"
-                                        << doc.objsize() );
+                                        << ". size in bytes: " << doc.objsize()
+                                        << ", max size: " << BSONObjMaxUserSize );
 
         bool firstElementIsId = doc.firstElement().fieldNameStringData() == "_id";
         bool hasTimestampToFix = false;
@@ -79,6 +81,12 @@ namespace mongo {
                     if ( e.type() == Array ) {
                         return StatusWith<BSONObj>( ErrorCodes::BadValue,
                                                     "can't use an array for _id" );
+                    }
+                    if ( e.type() == Object ) {
+                        BSONObj o = e.Obj();
+                        Status s = o.storageValidEmbedded();
+                        if ( !s.isOK() )
+                            return StatusWith<BSONObj>( s );
                     }
                 }
 
@@ -146,6 +154,12 @@ namespace mongo {
 
         if ( !NamespaceString::validCollectionName( coll ) )
             return Status( ErrorCodes::BadValue, "invalid collection name" );
+
+        if ( db.size() + 1 /* dot */ + coll.size() > Namespace::MaxNsColletionLen )
+            return Status( ErrorCodes::BadValue,
+                           str::stream()
+                             << "fully qualified namespace " << db << '.' << coll << " is too long "
+                             << "(max is " << Namespace::MaxNsColletionLen << " bytes)" );
 
         // check spceial areas
 

@@ -57,6 +57,7 @@
 #include "mongo/db/dur_recover.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
+#include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
@@ -64,11 +65,13 @@
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/count.h"
-#include "mongo/db/ops/delete.h"
+#include "mongo/db/ops/delete_executor.h"
+#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_driver.h"
+#include "mongo/db/ops/update_executor.h"
+#include "mongo/db/ops/update_request.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/query/new_find.h"
 #include "mongo/db/repl/is_master.h"
@@ -78,6 +81,7 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/gcov.h"
@@ -345,7 +349,8 @@ namespace mongo {
         const char *ns = m.singleData()->_data + 4;
 
         Client& c = cc();
-        c.getAuthorizationSession()->startRequest();
+        if (!c.isGod())
+            c.getAuthorizationSession()->startRequest();
 
         if ( op == dbQuery ) {
             if( strstr(ns, ".$cmd") ) {
@@ -595,59 +600,19 @@ namespace mongo {
         op.debug().query = query;
         op.setQuery(query);
 
-        // This code should look quite familiar, since it is basically the prelude code in the
-        // other overload of _updateObjectsNEW. We could factor it into a common function, but
-        // that would require that we heap allocate the driver, which doesn't seem worth it
-        // right now, especially considering that we will probably rewrite much of this code in
-        // the near term.
+        UpdateRequest request(ns);
 
-        UpdateDriver::Options options;
-        options.multi = multi;
-        options.upsert = upsert;
-
-        // TODO: This is wasteful. We really shouldn't need to generate the oplog entry
-        // just to throw it away if we are not generating an oplog.
-        options.logOp = true;
-
-        // Select the right modifier options. We aren't in a replication context here, so
-        // the only question is whether this update is against the 'config' database, in
-        // which case we want to disable checks, since config db docs can have field names
-        // containing a dot (".").
-        options.modOptions = ( NamespaceString( ns ).isConfigDB() ) ?
-            ModifierInterface::Options::unchecked() :
-            ModifierInterface::Options::normal();
-
-        UpdateDriver driver( options );
-
-        status = driver.parse( toupdate );
-        if ( !status.isOK() ) {
-            uasserted( 17009, status.reason() );
-        }
-
-        const NamespaceString requestNs(ns);
-        const bool isSimpleIdQuery = CanonicalQuery::isSimpleIdQuery(query);
-        CanonicalQuery* cqRaw;
-        if (isSimpleIdQuery) {
-            cqRaw = NULL;
-        }
-        else {
-            status = CanonicalQuery::canonicalize(requestNs, query, &cqRaw);
-            if (status == ErrorCodes::NoClientContext) {
-                cqRaw = NULL;
-            }
-            else if (!status.isOK()) {
-                uasserted(17349,
-                          "could not canonicalize query " + query.toString() + "; " +
-                          causedBy(status));
-            }
-        }
-        std::auto_ptr<CanonicalQuery> cq(cqRaw);
+        request.setUpsert(upsert);
+        request.setMulti(multi);
+        request.setQuery(query);
+        request.setUpdates(toupdate);
+        request.setUpdateOpLog(); // TODO: This is wasteful if repl is not active.
+        UpdateLifecycleImpl updateLifecycle(broadcast, ns);
+        request.setLifecycle(&updateLifecycle);
+        UpdateExecutor executor(&request, &op.debug());
+        uassertStatusOK(executor.prepare());
 
         Lock::DBWrite lk(ns.ns());
-
-        // void ReplSetImpl::relinquish() uses big write lock so this is thus
-        // synchronized given our lock above.
-        uassert( 17010 ,  "not master", isMasterNs( ns.ns().c_str() ) );
 
         // if this ever moves to outside of lock, need to adjust check
         // Client::Context::_finishInit
@@ -656,26 +621,7 @@ namespace mongo {
 
         Client::Context ctx( ns );
 
-        if (!isSimpleIdQuery && !cq.get()) {
-            status = CanonicalQuery::canonicalize(requestNs, query, &cqRaw);
-            if (!status.isOK()) {
-                uasserted(17350,
-                          "could not canonicalize query " + query.toString() + "; " +
-                          causedBy(status));
-            }
-            cq.reset(cqRaw);
-        }
-
-        UpdateRequest request(requestNs);
-
-        request.setUpsert(upsert);
-        request.setMulti(multi);
-        request.setQuery(query);
-        request.setUpdates(toupdate);
-        request.setUpdateOpLog(); // TODO: This is wasteful if repl is not active.
-        UpdateLifecycleImpl updateLifecycle(broadcast, requestNs);
-        request.setLifecycle(&updateLifecycle);
-        UpdateResult res = update(request, &op.debug(), &driver, cq.release());
+        UpdateResult res = executor.execute();
 
         // for getlasterror
         lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
@@ -703,18 +649,21 @@ namespace mongo {
         PageFaultRetryableSection s;
         while ( 1 ) {
             try {
+                DeleteRequest request(ns);
+                request.setQuery(pattern);
+                request.setMulti(!justOne);
+                request.setUpdateOpLog(true);
+                DeleteExecutor executor(&request);
+                uassertStatusOK(executor.prepare());
                 Lock::DBWrite lk(ns.ns());
-                
-                // writelock is used to synchronize stepdowns w/ writes
-                uassert( 10056 ,  "not master", isMasterNs( ns.ns().c_str() ) );
-                
+
                 // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
                 if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
                     return;
-                
+
                 Client::Context ctx(ns);
-                
-                long long n = deleteObjects(ns.ns(), pattern, justOne, true);
+
+                long long n = executor.execute();
                 lastError.getSafe()->recordDelete( n );
                 op.debug().ndeleted = n;
                 break;
@@ -727,14 +676,6 @@ namespace mongo {
     }
 
     QueryResult* emptyMoreResult(long long);
-
-    #define CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION \
-        if( waitNotification != 0) {\
-            if ( collection != 0 ) {\
-                collection->unsubcribeToChange( waitNotification );\
-            }\
-            delete waitNotification;\
-        }
 
     bool receivedGetMore(DbResponse& dbresponse, Message& m, CurOp& curop ) {
         bool ok = true;
@@ -755,109 +696,98 @@ namespace mongo {
         bool exhaust = false;
         QueryResult* msgdata = 0;
         OpTime last;
-        NotifyAll* waitNotification = 0;        
         Collection* collection = 0;
-        try{
-            while( 1 ) {
-                bool isCursorAuthorized = false;
-                NotifyAll::When lastWaitTime;
-                try {
-                    const NamespaceString nsString( ns );
-                    uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
+        NotifyAll::When lastWaitTime = 0;
+        while( 1 ) {
+            bool isCursorAuthorized = false;
+            try {
+                const NamespaceString nsString( ns );
+                uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
-                    Status status = cc().getAuthorizationSession()->checkAuthForGetMore(
-                            nsString, cursorid);
-                    audit::logGetMoreAuthzCheck(&cc(), nsString, cursorid, status.code());
-                    uassertStatusOK(status);
+                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(
+                        nsString, cursorid);
+                audit::logGetMoreAuthzCheck(&cc(), nsString, cursorid, status.code());
+                uassertStatusOK(status);
 
-                    if (str::startsWith(ns, "local.oplog.")){
-                        while (MONGO_FAIL_POINT(rsStopGetMore)) {
-                            sleepmillis(0);
-                        }
-
-                        if (pass == 0) {
-                            mutex::scoped_lock lk(OpTime::m);
-                            last = OpTime::getLast(lk);
-                        }
-                        else {
-                            last.waitForDifferent(1000/*ms*/);
-                        }
+                if (str::startsWith(ns, "local.oplog.")){
+                    while (MONGO_FAIL_POINT(rsStopGetMore)) {
+                        sleepmillis(0);
                     }
 
-                    msgdata = newGetMore(ns,
-                                             ntoreturn,
-                                             cursorid,
-                                             curop,
-                                             pass,
-                                             exhaust,
-                                             &isCursorAuthorized);
-                }
-                catch ( AssertionException& e ) {
-                    if ( isCursorAuthorized ) {
-                        // If a cursor with id 'cursorid' was authorized, it may have been advanced
-                        // before an exception terminated processGetMore.  Erase the ClientCursor
-                        // because it may now be out of sync with the client's iteration state.
-                        // SERVER-7952
-                        // TODO Temporary code, see SERVER-4563 for a cleanup overview.
-                        CollectionCursorCache::eraseCursorGlobal( cursorid );
-                    }
-                    ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
-                    ok = false;
-                    break;
-                }
-                
-                if (msgdata == 0) {
-                    // this should only happen with QueryOption_AwaitData
-                    exhaust = false;
-                    massert(13073, "shutting down", !inShutdown() );
-                    if ( ! timer ) {
-                        timer.reset( new Timer() );
+                    if (pass == 0) {
+                        mutex::scoped_lock lk(OpTime::m);
+                        last = OpTime::getLast(lk);
                     }
                     else {
-                        if ( timer->seconds() >= 4 ) {
-                            // after about 4 seconds, return. pass stops at 1000 normally.
-                            // we want to return occasionally so slave can checkpoint.
-                            pass = 10000;
-                        }
+                        last.waitForDifferent(1000/*ms*/);
                     }
-                    pass++;
-                    if (debug)
-                        sleepmillis(20);
-                    else if( waitNotification == 0 ) {
-                        waitNotification = new NotifyAll();
-                        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(ns));
-                        collection = ctx->ctx().db()->getCollection(ns);
-                        /* TODO: Replace this number when changes (if ever) changes are merged into upstream */
-                        uassert( 77383, "collection dropped between newGetMore calls", collection );
-                        lastWaitTime = waitNotification->now();
-                        collection->subscribeToChange( waitNotification );
-                        /* After creating the notification and subscripting we will do one more loop before waiting
-                           because of concurrency, a new item *may* have been inserted in the collection while we were
-                           setting up our notification and subscribing to the event */
-                    } else {
-                        /* TODO: Review this wait.
-                           Bellow we could wait even for the full 4 seconds, but there's something I don't understand
-                           with the call to setExpectedLatencyMs(), so I figure I better break the wait every so often to call
-                           that notification method */          
-                        waitNotification->timedWaitFor( lastWaitTime, 200 );
-                        lastWaitTime = waitNotification->now();
-                    }
+                }
 
-                    // note: the 1100 is because of the waitForDifferent above
-                    // should eventually clean this up a bit
-                    curop.setExpectedLatencyMs( 1100 + timer->millis() );
-                    
-                    continue;
-                }                       
+                msgdata = newGetMore(ns,
+                                     ntoreturn,
+                                     cursorid,
+                                     curop,
+                                     pass,
+                                     exhaust,
+                                     &isCursorAuthorized);
+            }
+            catch ( AssertionException& e ) {
+                if ( isCursorAuthorized ) {
+                    // If a cursor with id 'cursorid' was authorized, it may have been advanced
+                    // before an exception terminated processGetMore.  Erase the ClientCursor
+                    // because it may now be out of sync with the client's iteration state.
+                    // SERVER-7952
+                    // TODO Temporary code, see SERVER-4563 for a cleanup overview.
+                    CollectionCursorCache::eraseCursorGlobal( cursorid );
+                }
+                ex.reset( new AssertionException( e.getInfo().msg, e.getCode() ) );
+                ok = false;
                 break;
-            };
-        } catch(...){
-            /* We don't want to leave a dangling change notification on the collection object. That's why we will catch
-               any exception do cleanup, and re-throw */
-            CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION; 
-            throw;                   
-        }             
-        CLEANUP_COLLECTION_CHANGE_SUBSCRIPTION; 
+            }
+            
+            if (msgdata == 0) {
+                // this should only happen with QueryOption_AwaitData
+                exhaust = false;
+                massert(13073, "shutting down", !inShutdown() );
+                if ( ! timer ) {
+                    timer.reset( new Timer() );
+                }
+                else {
+                    if ( timer->seconds() >= 4 ) {
+                        // after about 4 seconds, return. pass stops at 1000 normally.
+                        // we want to return occasionally so slave can checkpoint.
+                        pass = 10000;
+                    }
+                }
+                pass++;
+                if (debug)
+                    sleepmillis(20);
+                else if( lastWaitTime == 0 ) {
+                    scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(ns));
+                    collection = ctx->ctx().db()->getCollection(ns);
+                    /* TODO: Replace this number when changes (if ever) changes are merged into upstream */
+                    uassert( 77383, "collection dropped between newGetMore calls", collection );
+                    lastWaitTime = collection->documentInsertedNotificationNow();
+                    /* After creating the notification and acquiring lastWaitTime we will do one more loop,
+                       a new item *may* have been inserted in the collection while we were
+                       acquiring lastWaitTime */
+                } else {
+                    /* TODO: Review this wait.
+                       Bellow we could wait even for the full 4 seconds, but there's something I don't understand
+                       with the call to setExpectedLatencyMs(), so I figure I better break the wait every so often to call
+                       that notification method */
+                    collection->waitForDocumentInsertedEvent( lastWaitTime, 200 );
+                    lastWaitTime = collection->documentInsertedNotificationNow();
+                }
+
+                // note: the 1100 is because of the waitForDifferent above
+                // should eventually clean this up a bit
+                curop.setExpectedLatencyMs( 1100 + timer->millis() );
+                
+                continue;
+            }
+            break;
+        };
 
         if (ex) {
             BSONObjBuilder err;
@@ -906,6 +836,7 @@ namespace mongo {
             // operation might not support interrupts.
             bool mayInterrupt = cc().curop()->parent() == NULL;
 
+            cc().curop()->setQuery(js);
             Status status = collection->getIndexCatalog()->createIndex( js, mayInterrupt );
 
             if ( status.code() == ErrorCodes::IndexAlreadyExists )
@@ -1123,6 +1054,14 @@ namespace {
 
     DBClientBase * createDirectClient() {
         return new DBDirectClient();
+    }
+
+    MONGO_INITIALIZER(CreateJSDirectClient)
+        (InitializerContext* context) {
+
+        directDBClient = createDirectClient();
+
+        return Status::OK();
     }
 
     mongo::mutex exitMutex("exit");

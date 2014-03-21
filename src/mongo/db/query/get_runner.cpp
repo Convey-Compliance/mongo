@@ -28,10 +28,14 @@
 
 #include "mongo/db/query/get_runner.h"
 
+#include <limits>
+
+#include "mongo/base/parse_number.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/query/cached_plan_runner.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/eof_runner.h"
+#include "mongo/db/query/explain_plan.h"
 #include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/idhack_runner.h"
 #include "mongo/db/query/index_bounds_builder.h"
@@ -39,25 +43,20 @@
 #include "mongo/db/query/multi_plan_runner.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/single_solution_runner.h"
 #include "mongo/db/query/stage_builder.h"
+#include "mongo/db/query/subplan_runner.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/s/d_logic.h"
 
 namespace mongo {
-
-    MONGO_EXPORT_SERVER_PARAMETER(enableIndexIntersection, bool, true);
-
-    static bool canUseIDHack(const CanonicalQuery& query) {
-        return !query.getParsed().isExplain()
-            && !query.getParsed().showDiskLoc()
-            && CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter())
-            && !query.getParsed().hasOption(QueryOption_CursorTailable);
-    }
 
     // static
     void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
@@ -109,6 +108,8 @@ namespace mongo {
                      size_t plannerOptions) {
 
         if (!collection) {
+            LOG(2) << "Collection " << ns << " does not exist."
+                   << " Using EOF runner: " << unparsedQuery.toString();
             *outCanonicalQuery = NULL;
             *outRunner = new EOFRunner(NULL, ns);
             return Status::OK();
@@ -125,6 +126,8 @@ namespace mongo {
             return getRunner(collection, *outCanonicalQuery, outRunner, plannerOptions);
         }
 
+        LOG(2) << "Using idhack: " << unparsedQuery.toString();
+
         *outCanonicalQuery = NULL;
         *outRunner = new IDHackRunner(collection, unparsedQuery["_id"].wrap());
         return Status::OK();
@@ -134,6 +137,143 @@ namespace mongo {
         // The body is below in the "count hack" section but getRunner calls it.
         bool turnIxscanIntoCount(QuerySolution* soln);
     }  // namespace
+
+
+    void fillOutPlannerParams(Collection* collection,
+                              CanonicalQuery* canonicalQuery,
+                              QueryPlannerParams* plannerParams) {
+        // If it's not NULL, we may have indices.  Access the catalog and fill out IndexEntry(s)
+        IndexCatalog::IndexIterator ii = collection->getIndexCatalog()->getIndexIterator(false);
+        while (ii.more()) {
+            const IndexDescriptor* desc = ii.next();
+            plannerParams->indices.push_back(IndexEntry(desc->keyPattern(),
+                                                        desc->getAccessMethodName(),
+                                                        desc->isMultikey(),
+                                                        desc->isSparse(),
+                                                        desc->indexName(),
+                                                        desc->infoObj()));
+        }
+
+        // If query supports index filters, filter params.indices by indices in query settings.
+        QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
+        AllowedIndices* allowedIndicesRaw;
+
+        // Filter index catalog if index filters are specified for query.
+        // Also, signal to planner that application hint should be ignored.
+        if (querySettings->getAllowedIndices(*canonicalQuery, &allowedIndicesRaw)) {
+            boost::scoped_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
+            filterAllowedIndexEntries(*allowedIndices, &plannerParams->indices);
+            plannerParams->indexFiltersApplied = true;
+        }
+
+        // We will not output collection scans unless there are no indexed solutions. NO_TABLE_SCAN
+        // overrides this behavior by not outputting a collscan even if there are no indexed
+        // solutions.
+        if (storageGlobalParams.noTableScan) {
+            const string& ns = canonicalQuery->ns();
+            // There are certain cases where we ignore this restriction:
+            bool ignore = canonicalQuery->getQueryObj().isEmpty()
+                          || (string::npos != ns.find(".system."))
+                          || (0 == ns.find("local."));
+            if (!ignore) {
+                plannerParams->options |= QueryPlannerParams::NO_TABLE_SCAN;
+            }
+        }
+
+        // If the caller wants a shard filter, make sure we're actually sharded.
+        if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
+            CollectionMetadataPtr collMetadata =
+                shardingState.getCollectionMetadata(canonicalQuery->ns());
+
+            if (collMetadata) {
+                plannerParams->shardKey = collMetadata->getKeyPattern();
+            }
+            else {
+                // If there's no metadata don't bother w/the shard filter since we won't know what
+                // the key pattern is anyway...
+                plannerParams->options &= ~QueryPlannerParams::INCLUDE_SHARD_FILTER;
+            }
+        }
+
+        if (internalQueryPlannerEnableIndexIntersection) {
+            plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
+        }
+
+        plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
+        plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+    }
+
+    Status getRunnerFromCache(CanonicalQuery* canonicalQuery,
+                              Collection* collection,
+                              const QueryPlannerParams& plannerParams,
+                              Runner** out) {
+        // Skip cache look up for non-cacheable queries.
+        if (!PlanCache::shouldCacheQuery(*canonicalQuery)) {
+            return Status(ErrorCodes::BadValue, "query is not cacheable");
+        }
+
+        CachedSolution* rawCS;
+        Status cacheLookupStatus = collection->infoCache()->getPlanCache()->get(*canonicalQuery,
+                                                                                &rawCS);
+        if (!cacheLookupStatus.isOK()) {
+            return cacheLookupStatus;
+        }
+
+        // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
+        boost::scoped_ptr<CachedSolution> cs(rawCS);
+        QuerySolution *qs, *backupQs;
+        Status status = QueryPlanner::planFromCache(*canonicalQuery,
+                                                    plannerParams,
+                                                    *cs,
+                                                    &qs,
+                                                    &backupQs);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // If our cached solution is a hit for a count query, try to turn it into a fast count
+        // thing.
+        if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
+            if (turnIxscanIntoCount(qs)) {
+                LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
+                       << ", planSummary: " << getPlanSummary(*qs);
+
+                WorkingSet* ws;
+                PlanStage* root;
+                verify(StageBuilder::build(*qs, &root, &ws));
+                *out = new SingleSolutionRunner(collection,
+                                                canonicalQuery, qs, root, ws);
+                if (NULL != backupQs) {
+                    delete backupQs;
+                }
+                return Status::OK();
+            }
+        }
+
+        // If we're here, we're going to used the cached plan and things are normal.
+        LOG(2) << "Using cached query plan: " << canonicalQuery->toStringShort()
+               << ", planSummary: " << getPlanSummary(*qs);
+
+        WorkingSet* ws;
+        PlanStage* root;
+        verify(StageBuilder::build(*qs, &root, &ws));
+        CachedPlanRunner* cpr = new CachedPlanRunner(collection,
+                                                     canonicalQuery,
+                                                     qs,
+                                                     root,
+                                                     ws);
+
+        // If there's a backup solution, let the CachedPlanRunner know about it.
+        if (NULL != backupQs) {
+            WorkingSet* backupWs;
+            PlanStage* backupRoot;
+            verify(StageBuilder::build(*backupQs, &backupRoot, &backupWs));
+            cpr->setBackupPlan(backupQs, backupRoot, backupWs);
+        }
+
+        *out = cpr;
+        return Status::OK();
+    }
 
     /**
      * For a given query, get a runner.  The runner could be a SingleSolutionRunner, a
@@ -150,39 +290,18 @@ namespace mongo {
         // This can happen as we're called by internal clients as well.
         if (NULL == collection) {
             const string& ns = canonicalQuery->ns();
+            LOG(2) << "Collection " << ns << " does not exist."
+                   << " Using EOF runner: " << canonicalQuery->toStringShort();
             *out = new EOFRunner(canonicalQuery.release(), ns);
             return Status::OK();
         }
 
         // If we have an _id index we can use the idhack runner.
-        if (canUseIDHack(*canonicalQuery) && collection->getIndexCatalog()->findIdIndex()) {
+        if (IDHackRunner::supportsQuery(*canonicalQuery) &&
+            collection->getIndexCatalog()->findIdIndex()) {
+            LOG(2) << "Using idhack: " << canonicalQuery->toStringShort();
             *out = new IDHackRunner(collection, canonicalQuery.release());
             return Status::OK();
-        }
-
-        // If it's not NULL, we may have indices.  Access the catalog and fill out IndexEntry(s)
-        QueryPlannerParams plannerParams;
-
-        IndexCatalog::IndexIterator ii = collection->getIndexCatalog()->getIndexIterator(false);
-        while (ii.more()) {
-            const IndexDescriptor* desc = ii.next();
-            plannerParams.indices.push_back(IndexEntry(desc->keyPattern(),
-                                                       desc->isMultikey(),
-                                                       desc->isSparse(),
-                                                       desc->indexName(),
-                                                       desc->infoObj()));
-        }
-
-        // If query supports index filters, filter params.indices by indices in query settings.
-        QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
-        AllowedIndices* allowedIndicesRaw;
-
-        // Filter index catalog if index filters are specified for query.
-        // Also, signal to planner that application hint should be ignored.
-        if (querySettings->getAllowedIndices(*canonicalQuery, &allowedIndicesRaw)) {
-            boost::scoped_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
-            filterAllowedIndexEntries(*allowedIndices, &plannerParams.indices);
-            plannerParams.indexFiltersApplied = true;
         }
 
         // Tailable: If the query requests tailable the collection must be capped.
@@ -204,112 +323,43 @@ namespace mongo {
             }
         }
 
-        // Process the planning options.
+        // Fill out the planning params.  We use these for both cached solutions and non-cached.
+        QueryPlannerParams plannerParams;
         plannerParams.options = plannerOptions;
-        if (storageGlobalParams.noTableScan) {
-            const string& ns = canonicalQuery->ns();
-            // There are certain cases where we ignore this restriction:
-            bool ignore = canonicalQuery->getQueryObj().isEmpty()
-                          || (string::npos != ns.find(".system."))
-                          || (0 == ns.find("local."));
-            if (!ignore) {
-                plannerParams.options |= QueryPlannerParams::NO_TABLE_SCAN;
-            }
+        fillOutPlannerParams(collection, rawCanonicalQuery, &plannerParams);
+
+        // See if the cache has what we're looking for.
+        Status cacheStatus = getRunnerFromCache(canonicalQuery.get(),
+                                                collection,
+                                                plannerParams,
+                                                out);
+
+        // This can be not-OK and we can carry on.  It just means the query wasn't cached.
+        if (cacheStatus.isOK()) {
+            // We got a cached runner.
+            canonicalQuery.release();
+            return cacheStatus;
         }
 
-        if (!(plannerParams.options & QueryPlannerParams::NO_TABLE_SCAN)) {
-            plannerParams.options |= QueryPlannerParams::INCLUDE_COLLSCAN;
+        if (internalQueryPlanOrChildrenIndependently
+            && SubplanRunner::canUseSubplanRunner(*canonicalQuery)) {
+
+            LOG(2) << "Running query as sub-queries: " << canonicalQuery->toStringShort();
+            *out = new SubplanRunner(collection, plannerParams, canonicalQuery.release());
+            return Status::OK();
         }
 
-        // If the caller wants a shard filter, make sure we're actually sharded.
-        if (plannerParams.options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-            CollectionMetadataPtr collMetadata =
-                shardingState.getCollectionMetadata(canonicalQuery->ns());
+        return getRunnerAlwaysPlan(collection, canonicalQuery.release(), plannerParams, out);
+    }
 
-            if (collMetadata) {
-                plannerParams.shardKey = collMetadata->getKeyPattern();
-            }
-            else {
-                // If there's no metadata don't bother w/the shard filter since we won't know what
-                // the key pattern is anyway...
-                plannerParams.options &= ~QueryPlannerParams::INCLUDE_SHARD_FILTER;
-            }
-        }
+    Status getRunnerAlwaysPlan(Collection* collection,
+                               CanonicalQuery* rawCanonicalQuery,
+                               const QueryPlannerParams& plannerParams,
+                               Runner** out) {
 
-        // Try to look up a cached solution for the query.
-        //
-        // Skip cache look up for non-cacheable queries.
-        // See PlanCache::shouldCacheQuery()
-        //
-        // TODO: Can the cache have negative data about a solution?
-        CachedSolution* rawCS;
-        if (PlanCache::shouldCacheQuery(*canonicalQuery) &&
-            collection->infoCache()->getPlanCache()->get(*canonicalQuery, &rawCS).isOK()) {
-            // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
-            boost::scoped_ptr<CachedSolution> cs(rawCS);
-            QuerySolution *qs, *backupQs;
-            Status status = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs,
-                                                        &qs, &backupQs);
-
-            // XXX: SERVER-12438. Unfortunately we have to defer to the backup solution
-            // if both a batch size is set and a sort is requested.
-            //
-            // TODO: it would be really nice to delete this block in the future.
-            if (status.isOK() && NULL != backupQs &&
-                0 < canonicalQuery->getParsed().getNumToReturn() &&
-                !canonicalQuery->getParsed().getSort().isEmpty()) {
-                delete qs;
-
-                WorkingSet* ws;
-                PlanStage* root;
-                verify(StageBuilder::build(*backupQs, &root, &ws));
-
-                // And, run the plan.
-                *out = new SingleSolutionRunner(collection,
-                                                canonicalQuery.release(),
-                                                backupQs, root, ws);
-                return Status::OK();
-            }
-
-            if (status.isOK()) {
-                if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
-                    if (turnIxscanIntoCount(qs)) {
-                        WorkingSet* ws;
-                        PlanStage* root;
-                        verify(StageBuilder::build(*qs, &root, &ws));
-                        *out = new SingleSolutionRunner(collection,
-                                                        canonicalQuery.release(), qs, root, ws);
-                        if (NULL != backupQs) {
-                            delete backupQs;
-                        }
-                        return Status::OK();
-                    }
-                }
-
-                WorkingSet* ws;
-                PlanStage* root;
-                verify(StageBuilder::build(*qs, &root, &ws));
-                CachedPlanRunner* cpr = new CachedPlanRunner(collection,
-                                                             canonicalQuery.release(), qs,
-                                                             root, ws);
-
-                if (NULL != backupQs) {
-                    WorkingSet* backupWs;
-                    PlanStage* backupRoot;
-                    verify(StageBuilder::build(*backupQs, &backupRoot, &backupWs));
-                    cpr->setBackupPlan(backupQs, backupRoot, backupWs);
-                }
-
-                *out = cpr;
-                return Status::OK();
-            }
-        }
-
-        if (enableIndexIntersection) {
-            plannerParams.options |= QueryPlannerParams::INDEX_INTERSECTION;
-        }
-
-        plannerParams.options |= QueryPlannerParams::KEEP_MUTATIONS;
+        invariant(collection);
+        invariant(rawCanonicalQuery);
+        auto_ptr<CanonicalQuery> canonicalQuery(rawCanonicalQuery);
 
         vector<QuerySolution*> solutions;
         Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions);
@@ -340,6 +390,9 @@ namespace mongo {
                         }
                     }
 
+                    LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
+                           << ", planSummary: " << getPlanSummary(*solutions[i]);
+
                     // We're not going to cache anything that's fast count.
                     WorkingSet* ws;
                     PlanStage* root;
@@ -355,6 +408,10 @@ namespace mongo {
         }
 
         if (1 == solutions.size()) {
+            LOG(2) << "Only one plan is available; it will be run but will not be cached. "
+                   << canonicalQuery->toStringShort()
+                   << ", planSummary: " << getPlanSummary(*solutions[0]);
+
             // Only one possible plan.  Run it.  Build the stages from the solution.
             WorkingSet* ws;
             PlanStage* root;
@@ -362,41 +419,13 @@ namespace mongo {
 
             // And, run the plan.
             *out = new SingleSolutionRunner(collection,
-                                            canonicalQuery.release(),solutions[0], root, ws);
+                                            canonicalQuery.release(),
+                                            solutions[0],
+                                            root,
+                                            ws);
             return Status::OK();
         }
         else {
-            // XXX: SERVER-12438. In an ideal world we should not arbitrarily prefer certain
-            // solutions over others. But unfortunately for historical reasons we are forced
-            // to prefer a solution where the index provides the sort, if the batch size
-            // is set and a sort is requested. Read SERVER-12438 for details, if you dare.
-            //
-            // TODO: it would be really nice to delete this entire block in the future.
-            if (0 < canonicalQuery->getParsed().getNumToReturn()
-                && !canonicalQuery->getParsed().getSort().isEmpty()) {
-                // Look for a solution without a blocking sort stage.
-                for (size_t i = 0; i < solutions.size(); ++i) {
-                    if (!solutions[i]->hasSortStage) {
-                        WorkingSet* ws;
-                        PlanStage* root;
-                        verify(StageBuilder::build(*solutions[i], &root, &ws));
-
-                        // Free unused solutions.
-                        for (size_t j = 0; j < solutions.size(); ++j) {
-                            if (j != i) {
-                                delete solutions[j];
-                            }
-                        }
-
-                        // And, run the plan.
-                        *out = new SingleSolutionRunner(collection,
-                                                       canonicalQuery.release(),
-                                                       solutions[i], root, ws);
-                        return Status::OK();
-                    }
-                }
-            }
-
             // Many solutions.  Let the MultiPlanRunner pick the best, update the cache, and so on.
             auto_ptr<MultiPlanRunner> mpr(new MultiPlanRunner(collection,canonicalQuery.release()));
 
@@ -420,139 +449,6 @@ namespace mongo {
     //
 
     namespace {
-
-        /**
-         * Returns 'true' if the bounds 'bounds' can be represented as an interval between two the two
-         * values 'startKey' and 'endKey'.  Inclusivity of each bound is set through the relevant
-         * fooKeyInclusive parameter.
-         *
-         * Returns 'false' otherwise.
-         *
-         * XXX: unit test this.
-         */
-        bool isSingleInterval(const IndexBounds& bounds,
-                              BSONObj* startKey,
-                              bool* startKeyInclusive,
-                              BSONObj* endKey,
-                              bool* endKeyInclusive) {
-            // We build our start/end keys as we go.
-            BSONObjBuilder startBob;
-            BSONObjBuilder endBob;
-
-            // The start and end keys are inclusive unless we have a non-point interval, in which case
-            // we take the inclusivity from there.
-            *startKeyInclusive = true;
-            *endKeyInclusive = true;
-
-            size_t fieldNo = 0;
-
-            // First, we skip over point intervals.
-            for (; fieldNo < bounds.fields.size(); ++fieldNo) {
-                const OrderedIntervalList& oil = bounds.fields[fieldNo];
-                // A point interval requires just one interval...
-                if (1 != oil.intervals.size()) {
-                    break;
-                }
-                if (!oil.intervals[0].isPoint()) {
-                    break;
-                }
-                // Since it's a point, start == end.
-                startBob.append(oil.intervals[0].start);
-                endBob.append(oil.intervals[0].end);
-            }
-
-            if (fieldNo >= bounds.fields.size()) {
-                // All our intervals are points.  We count for all values of one field.
-                *startKey = startBob.obj();
-                *endKey = endBob.obj();
-                return true;
-            }
-
-            // After point intervals we can have exactly one non-point interval.
-            const OrderedIntervalList& nonPoint = bounds.fields[fieldNo];
-            if (1 != nonPoint.intervals.size()) {
-                return false;
-            }
-
-            // Add the non-point interval to our builder and set the inclusivity from it.
-            startBob.append(nonPoint.intervals[0].start);
-            *startKeyInclusive = nonPoint.intervals[0].startInclusive;
-            endBob.append(nonPoint.intervals[0].end);
-            *endKeyInclusive = nonPoint.intervals[0].endInclusive;
-
-            ++fieldNo;
-
-            // Get some "all values" intervals for comparison's sake.
-            // TODO: make static?
-            Interval minMax = IndexBoundsBuilder::allValues();
-            Interval maxMin = minMax;
-            maxMin.reverse();
-
-            // And after the non-point interval we can have any number of "all values" intervals.
-            for (; fieldNo < bounds.fields.size(); ++fieldNo) {
-                const OrderedIntervalList& oil = bounds.fields[fieldNo];
-                // "All Values" is just one point.
-                if (1 != oil.intervals.size()) {
-                    break;
-                }
-
-                // Must be min->max or max->min.
-                if (oil.intervals[0].equals(minMax)) {
-                    // As an example for the logic below, consider the index {a:1, b:1} and a count for
-                    // {a: {$gt: 2}}.  Our start key isn't inclusive (as it's $gt: 2) and looks like
-                    // {"":2} so far.  If we move to the key greater than {"":2, "": MaxKey} we will get
-                    // the first value of 'a' that is greater than 2.
-                    if (!*startKeyInclusive) {
-                        startBob.appendMaxKey("");
-                    }
-                    else {
-                        // In this case, consider the index {a:1, b:1} and a count for {a:{$gte: 2}}.
-                        // We want to look at all values where a is 2, so our start key is {"":2,
-                        // "":MinKey}.
-                        startBob.appendMinKey("");
-                    }
-
-                    // Same deal as above.  Consider the index {a:1, b:1} and a count for {a: {$lt: 2}}.
-                    // Our end key isn't inclusive as ($lt: 2) and looks like {"":2} so far.  We can't
-                    // look at any values where a is 2 so we have to stop at {"":2, "": MinKey} as
-                    // that's the smallest key where a is still 2.
-                    if (!*endKeyInclusive) {
-                        endBob.appendMinKey("");
-                    }
-                    else {
-                        endBob.appendMaxKey("");
-                    }
-                }
-                else if (oil.intervals[0].equals(maxMin)) {
-                    // The reasoning here is the same as above but with the directions reversed.
-                    if (!*startKeyInclusive) {
-                        startBob.appendMinKey("");
-                    }
-                    else {
-                        startBob.appendMaxKey("");
-                    }
-                    if (!*endKeyInclusive) {
-                        endBob.appendMaxKey("");
-                    }
-                    else {
-                        endBob.appendMinKey("");
-                    }
-                }
-                else {
-                    // No dice.
-                    break;
-                }
-            }
-
-            if (fieldNo >= bounds.fields.size()) {
-                *startKey = startBob.obj();
-                *endKey = endBob.obj();
-                return true;
-            }
-            else {
-                return false;
-            }
-        }
 
         /**
          * Returns 'true' if the provided solution 'soln' can be rewritten to use
@@ -580,7 +476,9 @@ namespace mongo {
             IndexScanNode* isn = static_cast<IndexScanNode*>(root->children[0]);
 
             // No filters allowed and side-stepping isSimpleRange for now.  TODO: do we ever see
-            // isSimpleRange here?  because we could well use it.  I just don't think we ever do see it.
+            // isSimpleRange here?  because we could well use it.  I just don't think we ever do see
+            // it.
+
             if (NULL != isn->filter.get() || isn->bounds.isSimpleRange) {
                 return false;
             }
@@ -591,7 +489,11 @@ namespace mongo {
             BSONObj endKey;
             bool endKeyInclusive;
 
-            if (!isSingleInterval(isn->bounds, &startKey, &startKeyInclusive, &endKey, &endKeyInclusive)) {
+            if (!IndexBoundsBuilder::isSingleInterval( isn->bounds,
+                                                       &startKey,
+                                                       &startKeyInclusive,
+                                                       &endKey,
+                                                       &endKeyInclusive )) {
                 return false;
             }
 
@@ -605,6 +507,115 @@ namespace mongo {
             // Takes ownership of 'cn' and deletes the old root.
             soln->root.reset(cn);
             return true;
+        }
+
+        /**
+         * Returns true if indices contains an index that can be
+         * used with DistinctNode. Sets indexOut to the array index
+         * of PlannerParams::indices.
+         * Look for the index for the fewest fields.
+         * Criteria for suitable index is that the index cannot be special
+         * (geo, hashed, text, ...).
+         *
+         * Multikey indices are not suitable for DistinctNode when the projection
+         * is on an array element. Arrays are flattened in a multikey index which
+         * makes it impossible for the distinct scan stage (plan stage generated from
+         * DistinctNode) to select the requested element by array index.
+         *
+         * Multikey indices cannot be used for the fast distinct hack if the field is dotted.
+         * Currently the solution generated for the distinct hack includes a projection stage and
+         * the projection stage cannot be covered with a dotted field.
+         */
+        bool getDistinctNodeIndex(const std::vector<IndexEntry>& indices,
+                                  const std::string& field, size_t* indexOut) {
+            invariant(indexOut);
+            bool isDottedField = str::contains(field, '.');
+            int minFields = std::numeric_limits<int>::max();
+            for (size_t i = 0; i < indices.size(); ++i) {
+                // Skip special indices.
+                if (!IndexNames::findPluginName(indices[i].keyPattern).empty()) {
+                    continue;
+                }
+                // Skip multikey indices if we are projecting on a dotted field.
+                if (indices[i].multikey && isDottedField) {
+                    continue;
+                }
+                int nFields = indices[i].keyPattern.nFields();
+                // Pick the index with the lowest number of fields.
+                if (nFields < minFields) {
+                    minFields = nFields;
+                    *indexOut = i;
+                }
+            }
+            return minFields != std::numeric_limits<int>::max();
+        }
+
+        /**
+         * Checks dotted field for a projection and truncates the
+         * field name if we could be projecting on an array element.
+         * Sets 'isIDOut' to true if the projection is on a sub document of _id.
+         * For example, _id.a.2, _id.b.c.
+         */
+        std::string getProjectedDottedField(const std::string& field, bool* isIDOut) {
+            // Check if field contains an array index.
+            std::vector<std::string> res;
+            mongo::splitStringDelim(field, &res, '.');
+
+            // Since we could exit early from the loop,
+            // we should check _id here and set '*isIDOut' accordingly.
+            *isIDOut = ("_id" == res[0]);
+
+            // Skip the first dotted component. If the field starts
+            // with a number, the number cannot be an array index.
+            int arrayIndex = 0;
+            for (size_t i = 1; i < res.size(); ++i) {
+                if (mongo::parseNumberFromStringWithBase(res[i], 10, &arrayIndex).isOK()) {
+                    // Array indices cannot be negative numbers (this is not $slice).
+                    // Negative numbers are allowed as field names.
+                    if (arrayIndex >= 0) {
+                        // Generate prefix of field up to (but not including) array index.
+                        std::vector<std::string> prefixStrings(res);
+                        prefixStrings.resize(i);
+                        // Reset projectedField. Instead of overwriting, joinStringDelim() appends joined string
+                        // to the end of projectedField.
+                        std::string projectedField;
+                        mongo::joinStringDelim(prefixStrings, &projectedField, '.');
+                        return projectedField;
+                    }
+                }
+            }
+
+            return field;
+        }
+
+        /**
+         * Creates a projection spec for a distinct command from the requested field.
+         * In most cases, the projection spec will be {_id: 0, key: 1}.
+         * The exceptions are:
+         * 1) When the requested field is '_id', the projection spec will {_id: 1}.
+         * 2) When the requested field could be an array element (eg. a.0),
+         *    the projected field will be the prefix of the field up to the array element.
+         *    For example, a.b.2 => {_id: 0, 'a.b': 1}
+         *    Note that we can't use a $slice projection because the distinct command filters
+         *    the results from the runner using the dotted field name. Using $slice will
+         *    re-order the documents in the array in the results.
+         */
+        BSONObj getDistinctProjection(const std::string& field) {
+            std::string projectedField(field);
+
+            bool isID = false;
+            if ("_id" == field) {
+                isID = true;
+            }
+            else if (str::contains(field, '.')) {
+                projectedField = getProjectedDottedField(field, &isID);
+            }
+            BSONObjBuilder bob;
+            if (!isID) {
+                bob.append("_id", 0);
+            }
+            bob.append(projectedField, 1);
+            return bob.obj();
         }
 
     }  // namespace
@@ -716,6 +727,7 @@ namespace mongo {
             // if it's a win unless it's the first field.
             if (desc->keyPattern().firstElement().fieldName() == field) {
                 plannerParams.indices.push_back(IndexEntry(desc->keyPattern(),
+                                                           desc->getAccessMethodName(),
                                                            desc->isMultikey(),
                                                            desc->isSparse(),
                                                            desc->indexName(),
@@ -723,37 +735,51 @@ namespace mongo {
             }
         }
 
-        // We only care about the field that we're projecting over.  Have to drop the _id field
-        // explicitly because those are .find() semantics.
-        //
-        // Applying a projection allows the planner to try to give us covered plans.
-        BSONObj projection;
-        if ("_id" == field) {
-            projection = BSON("_id" << 1);
-        }
-        else {
-            projection = BSON("_id" << 0 << field << 1);
-        }
-
-        // Apply a projection of the key.  Empty BSONObj() is for the sort.
-        CanonicalQuery* cq;
-        Status status = CanonicalQuery::canonicalize(collection->ns().ns(), query, BSONObj(), projection, &cq);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // No index has the field we're looking for.  Punt to normal planning.
+        // If there are no suitable indices for the distinct hack bail out now into regular planning
+        // with no projection.
         if (plannerParams.indices.empty()) {
+            CanonicalQuery* cq;
+            Status status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                                         query,
+                                                         BSONObj(),
+                                                         BSONObj(),
+                                                         &cq);
+            if (!status.isOK()) {
+                return status;
+            }
+
             // Takes ownership of cq.
             return getRunner(cq, out);
         }
 
+        //
         // If we're here, we have an index prefixed by the field we're distinct-ing over.
+        //
+
+        // Applying a projection allows the planner to try to give us covered plans that we can turn
+        // into the projection hack.  getDistinctProjection deals with .find() projection semantics
+        // (ie _id:1 being implied by default).
+        BSONObj projection = getDistinctProjection(field);
+
+        // Apply a projection of the key.  Empty BSONObj() is for the sort.
+        CanonicalQuery* cq;
+        Status status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                                     query,
+                                                     BSONObj(),
+                                                     projection,
+                                                     &cq);
+        if (!status.isOK()) {
+            return status;
+        }
 
         // If there's no query, we can just distinct-scan one of the indices.
-        if (query.isEmpty()) {
+        // Not every index in plannerParams.indices may be suitable. Refer to
+        // getDistinctNodeIndex().
+        size_t distinctNodeIndex = 0;
+        if (query.isEmpty() &&
+            getDistinctNodeIndex(plannerParams.indices, field, &distinctNodeIndex)) {
             DistinctNode* dn = new DistinctNode();
-            dn->indexKeyPattern = plannerParams.indices[0].keyPattern;
+            dn->indexKeyPattern = plannerParams.indices[distinctNodeIndex].keyPattern;
             dn->direction = 1;
             IndexBoundsBuilder::allValuesBounds(dn->indexKeyPattern, &dn->bounds);
             dn->fieldNo = 0;
@@ -763,6 +789,9 @@ namespace mongo {
             // Takes ownership of 'dn'.
             QuerySolution* soln = QueryPlannerAnalysis::analyzeDataAccess(*cq, params, dn);
             verify(soln);
+
+            LOG(2) << "Using fast distinct: " << cq->toStringShort()
+                   << ", planSummary: " << getPlanSummary(*soln);
 
             WorkingSet* ws;
             PlanStage* root;
@@ -778,9 +807,6 @@ namespace mongo {
             return getRunner(cq, out);
         }
 
-        // XXX: why do we need to do this?  planner should prob do this internally
-        cq->root()->resetTag();
-
         // We look for a solution that has an ixscan we can turn into a distinctixscan
         for (size_t i = 0; i < solutions.size(); ++i) {
             if (turnIxscanIntoDistinctIxscan(solutions[i], field)) {
@@ -790,6 +816,9 @@ namespace mongo {
                         delete solutions[j];
                     }
                 }
+
+                LOG(2) << "Using fast distinct: " << cq->toStringShort()
+                       << ", planSummary: " << getPlanSummary(*solutions[i]);
 
                 // Build and return the SSR over solutions[i].
                 WorkingSet* ws;
@@ -807,6 +836,18 @@ namespace mongo {
             delete solutions[i];
         }
 
+        // We drop the projection from the 'cq'.  Unfortunately this is not trivial.
+        delete cq;
+        status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                              query,
+                                              BSONObj(),
+                                              BSONObj(),
+                                              &cq);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // Takes ownership of cq.
         return getRunner(cq, out);
     }
 

@@ -63,7 +63,7 @@ namespace QueryTests {
             if ( _collection ) {
                 _database->dropCollection( ns() );
             }
-            _collection = _database->createCollection( ns(), false, NULL, true );
+            _collection = _database->createCollection( ns() );
             addIndex( fromjson( "{\"a\":1}" ) );
         }
         ~Base() {
@@ -160,8 +160,7 @@ namespace QueryTests {
                 _collection = NULL;
                 db->dropCollection( ns() );
             }
-            BSONObj options = BSON("autoIndexId" << 0 );
-            _collection = db->createCollection( ns(), false, &options );
+            _collection = db->createCollection( ns(), CollectionOptions(), true, false );
             ASSERT( _collection );
 
             DBDirectClient cl;
@@ -603,6 +602,31 @@ namespace QueryTests {
             
             ClientCursorPin clientCursor( ctx.db()->getCollection( ns ), cursorId );
             ASSERT_EQUALS( three.millis, clientCursor.c()->getSlaveReadTill().asDate() );
+        }
+    };
+
+    class OplogReplayExplain : public ClientBase {
+    public:
+        ~OplogReplayExplain() {
+            client().dropCollection( "unittests.querytests.OplogReplayExplain" );
+        }
+        void run() {
+            const char *ns = "unittests.querytests.OplogReplayExplain";
+            insert( ns, BSON( "ts" << 0 ) );
+            insert( ns, BSON( "ts" << 1 ) );
+            insert( ns, BSON( "ts" << 2 ) );
+            auto_ptr< DBClientCursor > c = client().query(
+                ns, QUERY( "ts" << GT << 1 ).hint( BSON( "$natural" << 1 ) ).explain(),
+                0, 0, 0, QueryOption_OplogReplay );
+            ASSERT( c->more() );
+
+            // Check number of results and filterSet flag in explain.
+            // filterSet is not available in oplog replay mode.
+            BSONObj explainObj = c->next();
+            ASSERT_EQUALS( 1, explainObj.getIntField( "n" ) );
+            ASSERT_FALSE( explainObj.hasField( "filterSet" ) );
+
+            ASSERT( !c->more() );
         }
     };
 
@@ -1539,6 +1563,7 @@ namespace QueryTests {
             add< TailableQueryOnId >();
             add< OplogReplayMode >();
             add< OplogReplaySlaveReadTill >();
+            add< OplogReplayExplain >();
             add< ArrayId >();
             add< UnderscoreNs >();
             add< EmptyFieldSpec >();

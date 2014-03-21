@@ -112,6 +112,12 @@ namespace mongo {
             }
             (*explain)->setNScannedObjectsAllPlans((*explain)->getNScannedObjects());
             (*explain)->setNScannedAllPlans((*explain)->getNScanned());
+
+            // _solution could be NULL in certain cases such as when QueryOption_OplogReplay
+            // is enabled in the query flags.
+            if (_solution) {
+                (*explain)->setIndexFilterApplied(_solution->indexFilterApplied);
+            }
         }
         else if (NULL != planInfo) {
             if (NULL == _solution.get()) {

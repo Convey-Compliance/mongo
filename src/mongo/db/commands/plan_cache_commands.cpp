@@ -94,7 +94,6 @@ namespace {
         // the ActionType construction will be completed first.
         new PlanCacheListQueryShapes();
         new PlanCacheClear();
-        new PlanCacheDrop();
         new PlanCacheListPlans();
 
         return Status::OK();
@@ -212,7 +211,10 @@ namespace mongo {
         PlanCache* planCache;
         Status status = getPlanCache(ctx.db(), ns, &planCache);
         if (!status.isOK()) {
-            return status;
+            // No collection - return results with empty shapes array.
+            BSONArrayBuilder arrayBuilder(bob->subarrayStart("shapes"));
+            arrayBuilder.doneFast();
+            return Status::OK();
         }
         return list(*planCache, bob);
     }
@@ -244,7 +246,7 @@ namespace mongo {
     }
 
     PlanCacheClear::PlanCacheClear() : PlanCacheCommand("planCacheClear",
-        "Drops all cached queries in a collection.",
+        "Drops one or all cached queries in a collection.",
         ActionType::planCacheWrite) { }
 
     Status PlanCacheClear::runPlanCacheCommand(const string& ns, BSONObj& cmdObj,
@@ -255,55 +257,60 @@ namespace mongo {
         PlanCache* planCache;
         Status status = getPlanCache(ctx.db(), ns, &planCache);
         if (!status.isOK()) {
-            return status;
+            // No collection - nothing to do. Return OK status.
+            return Status::OK();
         }
-        return clear(ns, planCache);
+        return clear(planCache, ns, cmdObj);
     }
 
     // static
-    Status PlanCacheClear::clear(const std::string& ns, PlanCache* planCache) {
+    Status PlanCacheClear::clear(PlanCache* planCache, const string& ns, const BSONObj& cmdObj) {
         invariant(planCache);
+
+        // According to the specification, the planCacheClear command runs in two modes:
+        // - clear all query shapes; or
+        // - clear plans for single query shape when a query shape is described in the
+        //   command arguments.
+        if (cmdObj.hasField("query")) {
+            CanonicalQuery* cqRaw;
+            Status status = PlanCacheCommand::canonicalize(ns, cmdObj, &cqRaw);
+            if (!status.isOK()) {
+                return status;
+            }
+
+            scoped_ptr<CanonicalQuery> cq(cqRaw);
+
+            if (!planCache->contains(*cq)) {
+                // Log if asked to clear non-existent query shape.
+                LOG(1) << ns << ": query shape doesn't exist in PlanCache - "
+                       << cq->getQueryObj().toString()
+                       << "(sort: " << cq->getParsed().getSort()
+                       << "; projection: " << cq->getParsed().getProj() << ")";
+                return Status::OK();
+            }
+
+            Status result = planCache->remove(*cq);
+            if (!result.isOK()) {
+                return result;
+            }
+
+            LOG(1) << ns << ": removed plan cache entry - " << cq->getQueryObj().toString()
+                   << "(sort: " << cq->getParsed().getSort()
+                   << "; projection: " << cq->getParsed().getProj() << ")";
+
+            return Status::OK();
+        }
+
+        // If query is not provided, make sure sort and projection are not in arguments.
+        // We do not want to clear the entire cache inadvertently when the user
+        // forgets to provide a value for "query".
+        if (cmdObj.hasField("sort") || cmdObj.hasField("projection")) {
+            return Status(ErrorCodes::BadValue, "sort or projection provided without query");
+        }
 
         planCache->clear();
 
         LOG(1) << ns << ": cleared plan cache";
-
-        return Status::OK();
-    }
-
-    PlanCacheDrop::PlanCacheDrop() : PlanCacheCommand("planCacheDrop",
-        "Drops query shape from plan cache.",
-        ActionType::planCacheWrite) { }
-
-    Status PlanCacheDrop::runPlanCacheCommand(const string& ns, BSONObj& cmdObj,
-                                              BSONObjBuilder* bob) {
-        Client::ReadContext readCtx(ns);
-        Client::Context& ctx = readCtx.ctx();
-        PlanCache* planCache;
-        Status status = getPlanCache(ctx.db(), ns, &planCache);
-        if (!status.isOK()) {
-            return status;
-        }
-        return drop(planCache, ns, cmdObj);
-    }
-
-    // static
-    Status PlanCacheDrop::drop(PlanCache* planCache, const string& ns, const BSONObj& cmdObj) {
-        CanonicalQuery* cqRaw;
-        Status status = canonicalize(ns, cmdObj, &cqRaw);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        scoped_ptr<CanonicalQuery> cq(cqRaw);
-        Status result = planCache->remove(*cq);
-        if (!result.isOK()) {
-            return result;
-        }
-
-        LOG(1) << ns << ": removed plan cache entry - " << cq->getQueryObj().toString()
-               << "(sort: " << cq->getParsed().getSort()
-               << "; projection: " << cq->getParsed().getProj() << ")";
 
         return Status::OK();
     }
@@ -319,7 +326,10 @@ namespace mongo {
         PlanCache* planCache;
         Status status = getPlanCache(ctx.db(), ns, &planCache);
         if (!status.isOK()) {
-            return status;
+            // No collection - return empty plans array.
+            BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
+            plansBuilder.doneFast();
+            return Status::OK();
         }
         return list(*planCache, ns, cmdObj, bob);
     }
@@ -334,6 +344,15 @@ namespace mongo {
         }
 
         scoped_ptr<CanonicalQuery> cq(cqRaw);
+
+        if (!planCache.contains(*cq)) {
+            // Return empty plans in results if query shape does not
+            // exist in plan cache.
+            BSONArrayBuilder plansBuilder(bob->subarrayStart("plans"));
+            plansBuilder.doneFast();
+            return Status::OK();
+        }
+
         PlanCacheEntry* entryRaw;
         Status result = planCache.getEntry(*cq, &entryRaw);
         if (!result.isOK()) {

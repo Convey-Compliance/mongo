@@ -1,3 +1,5 @@
+// index_descriptor.cpp
+
 /**
 *    Copyright (C) 2013 10gen Inc.
 *
@@ -56,9 +58,10 @@ namespace mongo {
          * OnDiskIndexData is a pointer to the memory mapped per-index data.
          * infoObj is a copy of the index-describing BSONObj contained in the OnDiskIndexData.
          */
-        IndexDescriptor(Collection* collection, BSONObj infoObj)
+        IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj)
             : _magic(123987),
               _collection(collection),
+              _accessMethodName(accessMethodName),
               _infoObj(infoObj.getOwned()),
               _numFields(infoObj.getObjectField("key").nFields()),
               _keyPattern(infoObj.getObjectField("key").getOwned()),
@@ -102,13 +105,16 @@ namespace mongo {
         //
 
         // Return the name of the index.
-        const string& indexName() const { _checkOk(); return _indexName; }
+        const std::string& indexName() const { _checkOk(); return _indexName; }
 
         // Return the name of the indexed collection.
-        const string& parentNS() const { return _parentNS; }
+        const std::string& parentNS() const { return _parentNS; }
 
         // Return the name of this index's storage area (database.table.$index)
-        const string& indexNamespace() const { return _indexNamespace; }
+        const std::string& indexNamespace() const { return _indexNamespace; }
+
+        // Return the name of the access method we must use to access this index's data.
+        const std::string& getAccessMethodName() const { return _accessMethodName; }
 
         //
         // Properties every index has
@@ -144,13 +150,15 @@ namespace mongo {
         //
 
         // Return a (rather compact) string representation.
-        string toString() const { _checkOk(); return _infoObj.toString(); }
+        std::string toString() const { _checkOk(); return _infoObj.toString(); }
 
         // Return the info object.
         const BSONObj& infoObj() const { _checkOk(); return _infoObj; }
 
         // this is the owner of this IndexDescriptor
         IndexCatalog* getIndexCatalog() const { return _collection->getIndexCatalog(); }
+
+        bool areIndexOptionsEquivalent( const IndexDescriptor* other ) const;
 
     private:
 
@@ -166,6 +174,9 @@ namespace mongo {
         // Related catalog information of the parent collection
         Collection* _collection;
 
+        // What access method should we use for this index?
+        std::string _accessMethodName;
+
         // The BSONObj describing the index.  Accessed through the various members above.
         const BSONObj _infoObj;
 
@@ -173,9 +184,9 @@ namespace mongo {
 
         int64_t _numFields; // How many fields are indexed?
         BSONObj _keyPattern;
-        string _indexName;
-        string _parentNS;
-        string _indexNamespace;
+        std::string _indexName;
+        std::string _parentNS;
+        std::string _indexNamespace;
         bool _isIdIndex;
         bool _sparse;
         bool _dropDups;

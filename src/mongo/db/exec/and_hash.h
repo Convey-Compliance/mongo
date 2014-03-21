@@ -53,9 +53,21 @@ namespace mongo {
     class AndHashStage : public PlanStage {
     public:
         AndHashStage(WorkingSet* ws, const MatchExpression* filter);
+
+        /**
+         * For testing only. Allows tests to set memory usage threshold.
+         */
+        AndHashStage(WorkingSet* ws, const MatchExpression* filter, size_t maxMemUsage);
+
         virtual ~AndHashStage();
 
         void addChild(PlanStage* child);
+
+        /**
+         * Returns memory usage.
+         * For testing only.
+         */
+        size_t getMemUsage() const;
 
         virtual StageState work(WorkingSetID* out);
         virtual bool isEOF();
@@ -67,8 +79,11 @@ namespace mongo {
         virtual PlanStageStats* getStats();
 
     private:
+        static const size_t kLookAheadWorks;
+
         StageState readFirstChild(WorkingSetID* out);
         StageState hashOtherChildren(WorkingSetID* out);
+        StageState workChild(size_t childNo, WorkingSetID* out);
 
         // Not owned by us.
         WorkingSet* _ws;
@@ -77,7 +92,12 @@ namespace mongo {
         const MatchExpression* _filter;
 
         // The stages we read from.  Owned by us.
-        vector<PlanStage*> _children;
+        std::vector<PlanStage*> _children;
+
+        // We want to see if any of our children are EOF immediately.  This requires working them a
+        // few times to see if they hit EOF or if they produce a result.  If they produce a result,
+        // we place that result here.
+        std::vector<WorkingSetID> _lookAheadResults;
 
         // _dataMap is filled out by the first child and probed by subsequent children.  This is the
         // hash table that we create by intersecting _children and probe with the last child.
@@ -98,6 +118,15 @@ namespace mongo {
         // Stats
         CommonStats _commonStats;
         AndHashStats _specificStats;
+
+        // The usage in bytes of all buffered data that we're holding.
+        // Memory usage is calculated from keys held in _dataMap only.
+        // For simplicity, results in _lookAheadResults do not count towards the limit.
+        size_t _memUsage;
+
+        // Upper limit for buffered data memory usage.
+        // Defaults to 32 MB (See kMaxBytes in and_hash.cpp).
+        size_t _maxMemUsage;
     };
 
 }  // namespace mongo

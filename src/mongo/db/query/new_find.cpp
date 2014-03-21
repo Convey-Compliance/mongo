@@ -33,6 +33,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/oplogstart.h"
+#include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/query/find_constants.h"
@@ -94,8 +95,14 @@ namespace {
 
 namespace mongo {
 
-    // XXX clean up
-    static bool runCommands(const char *ns, BSONObj& jsobj, CurOp& curop, BufBuilder &b, BSONObjBuilder& anObjBuilder, bool fromRepl, int queryOptions) {
+    // TODO: Move this and the other command stuff in newRunQuery outta here and up a level.
+    static bool runCommands(const char *ns,
+                            BSONObj& jsobj,
+                            CurOp& curop,
+                            BufBuilder &b,
+                            BSONObjBuilder& anObjBuilder,
+                            bool fromRepl,
+                            int queryOptions) {
         try {
             return _runCommands(ns, jsobj, b, anObjBuilder, fromRepl, queryOptions);
         }
@@ -129,7 +136,7 @@ namespace mongo {
         Collection* collection = ctx->ctx().db()->getCollection(ns);
         uassert( 17356, "collection dropped between getMore calls", collection );
 
-        QLOG() << "running getMore in new system, cursorid " << cursorid << endl;
+        QLOG() << "Running getMore, cursorid: " << cursorid << endl;
 
         // This checks to make sure the operation is allowed on a replicated node.  Since we are not
         // passing in a query object (necessary to check SlaveOK query option), the only state where
@@ -168,8 +175,6 @@ namespace mongo {
             // time to this getmore.
             curop.setMaxTimeMicros(cc->getLeftoverMaxTimeMicros());
             killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
-
-            // XXX: what should we set for the curop.debug() etc. here?
 
             // TODO: What is pass?
             if (0 == pass) { cc->updateSlaveLocation(curop); }
@@ -217,8 +222,6 @@ namespace mongo {
                 }
             }
 
-            // XXX: should we update the execution stats in curop.debug() here?
-
             if (Runner::RUNNER_EOF == state && 0 == numResults
                 && (queryOptions & QueryOption_CursorTailable)
                 && (queryOptions & QueryOption_AwaitData) && (pass < 1000)) {
@@ -230,8 +233,24 @@ namespace mongo {
             bool saveClientCursor = false;
 
             if (Runner::RUNNER_DEAD == state || Runner::RUNNER_ERROR == state) {
+                // Propagate this error to caller.
+                if (Runner::RUNNER_ERROR == state) {
+                    // Stats are helpful when errors occur.
+                    TypeExplain* bareExplain;
+                    Status res = runner->getInfo(&bareExplain, NULL);
+                    if (res.isOK()) {
+                        boost::scoped_ptr<TypeExplain> errorExplain(bareExplain);
+                        error() << "Runner error, stats:\n"
+                                << errorExplain->stats.jsonString(Strict, true);
+                    }
+
+                    uasserted(17406, "getMore runner error: " +
+                              WorkingSetCommon::toStatusString(obj));
+                }
+
                 // If we're dead there's no way to get more results.
                 saveClientCursor = false;
+
                 // In the old system tailable capped cursors would be killed off at the
                 // cursorid level.  If a tailable capped cursor is nuked the cursorid
                 // would vanish.
@@ -256,7 +275,7 @@ namespace mongo {
                 // cc is now invalid, as is the runner
                 cursorid = 0;
                 cc = NULL;
-                QLOG() << "getMore NOT saving client cursor, ended w/state "
+                QLOG() << "getMore NOT saving client cursor, ended with state "
                        << Runner::statestr(state)
                        << endl;
             }
@@ -264,7 +283,7 @@ namespace mongo {
                 // Continue caching the ClientCursor.
                 cc->incPos(numResults);
                 runner->saveState();
-                QLOG() << "getMore saving client cursor ended w/state "
+                QLOG() << "getMore saving client cursor ended with state "
                        << Runner::statestr(state)
                        << endl;
 
@@ -397,7 +416,8 @@ namespace mongo {
         }
         verify(cq);
 
-        QLOG() << "Running query on new system: " << cq->toString();
+        QLOG() << "Running query:\n" << cq->toString();
+        LOG(2) << "Running query: " << cq->toStringShort();
 
         // Parse, canonicalize, plan, transcribe, and get a runner.
         Runner* rawRunner = NULL;
@@ -493,17 +513,11 @@ namespace mongo {
         // to fill in explain information
         const bool isExplain = pq.isExplain();
 
-        // Try to get information about the plan which the runner
-        // will use to execute the query.
+        // Have we retrieved info about which plan the runner will
+        // use to execute the query yet?
         bool gotPlanInfo = false;
         PlanInfo* rawInfo;
         boost::scoped_ptr<PlanInfo> planInfo;
-        Status infoStatus = runner->getInfo(NULL, &rawInfo);
-        if (infoStatus.isOK()) {
-            gotPlanInfo = true;
-            planInfo.reset(rawInfo);
-            curop.debug().planSummary = planInfo->planSummary;
-        }
 
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
             // Add result to output buffer. This is unnecessary if explain info is requested
@@ -522,11 +536,13 @@ namespace mongo {
             //
             // TODO: Do we ever want to output what the MPR is comparing?
             if (!gotPlanInfo) {
-                infoStatus = runner->getInfo(NULL, &rawInfo);
+                Status infoStatus = runner->getInfo(NULL, &rawInfo);
                 if (infoStatus.isOK()) {
                     gotPlanInfo = true;
                     planInfo.reset(rawInfo);
-                    curop.debug().planSummary = planInfo->planSummary;
+                    // planSummary is really a ThreadSafeString which copies the data from
+                    // the provided pointer.
+                    curop.debug().planSummary = planInfo->planSummary.c_str();
                 }
             }
 
@@ -564,6 +580,19 @@ namespace mongo {
             }
         }
 
+        // Try to get information about the plan which the runner
+        // will use to execute the query, it we don't have it already.
+        if (!gotPlanInfo) {
+            Status infoStatus = runner->getInfo(NULL, &rawInfo);
+            if (infoStatus.isOK()) {
+                gotPlanInfo = true;
+                planInfo.reset(rawInfo);
+                // planSummary is really a ThreadSafeString which copies the data from
+                // the provided pointer.
+                curop.debug().planSummary = planInfo->planSummary.c_str();
+            }
+        }
+
         // If we cache the runner later, we want to deregister it as it receives notifications
         // anyway by virtue of being cached.
         //
@@ -572,10 +601,16 @@ namespace mongo {
         // So, no matter what, deregister the runner.
         safety.reset();
 
-        // Caller expects exceptions thrown in certain cases:
-        // * in-memory sort using too much RAM.
+        // Caller expects exceptions thrown in certain cases.
         if (Runner::RUNNER_ERROR == state) {
-            uasserted(17144, "Runner error, memory limit for sort probably exceeded");
+            TypeExplain* bareExplain;
+            Status res = runner->getInfo(&bareExplain, NULL);
+            if (res.isOK()) {
+                boost::scoped_ptr<TypeExplain> errorExplain(bareExplain);
+                error() << "Runner error, stats:\n"
+                        << errorExplain->stats.jsonString(Strict, true);
+            }
+            uasserted(17144, "Runner error: " + WorkingSetCommon::toStatusString(obj));
         }
 
         // Why save a dead runner?
@@ -601,10 +636,19 @@ namespace mongo {
                                            shardingState.getVersion(pq.ns()));
         }
 
-        // Get explain information if it is needed by either the profiler
-        // or by an explain() query.
+        // Used to fill in explain and to determine if the query is slow enough to be logged.
+        int elapsedMillis = curop.elapsedMillis();
+
+        // Get explain information if:
+        // 1) it is needed by an explain query;
+        // 2) profiling is enabled; or
+        // 3) profiling is disabled but we still need explain details to log a "slow" query.
+        // Producing explain information is expensive and should be done only if we are certain
+        // the information will be used.
         boost::scoped_ptr<TypeExplain> explain(NULL);
-        if (isExplain || ctx.ctx().db()->getProfilingLevel() > 0) {
+        if (isExplain ||
+            ctx.ctx().db()->getProfilingLevel() > 0 ||
+            elapsedMillis > serverGlobalParams.slowMS) {
             // Ask the runner to produce explain information.
             TypeExplain* bareExplain;
             Status res = runner->getInfo(&bareExplain, NULL);
@@ -636,7 +680,7 @@ namespace mongo {
             explain->setN(numResults);
 
             // Clock the whole operation.
-            explain->setMillis(curop.elapsedMillis());
+            explain->setMillis(elapsedMillis);
 
             BSONObj explainObj = explain->toBSON();
             bb.appendBuf((void*)explainObj.objdata(), explainObj.objsize());
@@ -682,7 +726,7 @@ namespace mongo {
             cc->setLeftoverMaxTimeMicros(curop.getRemainingMaxTimeMicros());
         }
         else {
-            QLOG() << "not caching runner but returning " << numResults << " results\n";
+            QLOG() << "Not caching runner but returning " << numResults << " results.\n";
         }
 
         // Add the results from the query into the output buffer.
@@ -713,12 +757,26 @@ namespace mongo {
                 curop.debug().nscanned = explain->getNScanned();
             }
 
+            if (explain->isNScannedObjectsSet()) {
+                curop.debug().nscannedObjects = explain->getNScannedObjects();
+            }
+
             if (explain->isIDHackSet()) {
                 curop.debug().idhack = explain->getIDHack();
             }
 
             if (!explain->stats.isEmpty()) {
-                curop.debug().execStats = explain->stats;
+                // execStats is a CachedBSONObj because it lives in the race-prone
+                // curop.
+                curop.debug().execStats.set(explain->stats);
+
+                // Replace exec stats with plan summary if stats cannot fit into CachedBSONObj.
+                if (curop.debug().execStats.tooBig() && !curop.debug().planSummary.empty()) {
+                    BSONObjBuilder bob;
+                    bob.append("summary", curop.debug().planSummary.toString());
+                    curop.debug().execStats.set(bob.done());
+                }
+
             }
         }
 

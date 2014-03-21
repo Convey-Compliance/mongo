@@ -12,7 +12,6 @@ Import("testEnv")
 Import("has_option")
 Import("get_option")
 Import("usev8")
-Import("installSetup")
 Import("enforce_glibc")
 Import("darwin windows solaris linux nix")
 
@@ -68,7 +67,8 @@ env.CppUnitTest('util/time_support_test', 'util/time_support_test.cpp', LIBDEPS=
 env.Library('stringutils', ['util/stringutils.cpp', 'util/base64.cpp', 'util/hex.cpp'])
 
 env.Library('md5', [
-        'util/md5.cpp'
+        'util/md5.cpp',
+        'util/password_digest.cpp',
         ])
 
 env.CppUnitTest( "md5_test", ["util/md5_test.cpp", "util/md5main.cpp" ],
@@ -214,11 +214,13 @@ env.CppUnitTest('curop_test',
                 LIBDEPS=['serveronly', 'coredb', 'coreserver'],
                 NO_CRUTCH=True)
 
+env.Library('index_names',["db/index_names.cpp"])
+
 env.Library( 'mongohasher', [ "db/hasher.cpp" ] )
 
 env.Library('synchronization', [ 'util/concurrency/synchronization.cpp' ])
 
-env.Library('auth_helpers', ['client/auth_helpers.cpp'], LIBDEPS=['md5'])
+env.Library('auth_helpers', ['client/auth_helpers.cpp'])
 
 env.Library('spin_lock', ["util/concurrency/spin_lock.cpp"])
 env.CppUnitTest('spin_lock_test', ['util/concurrency/spin_lock_test.cpp'],
@@ -239,6 +241,17 @@ env.Library('network', [
                      'foundation',
                      'server_options_core',
             ])
+
+env.Library(
+    target='index_key_validate',
+    source=[
+        "db/catalog/index_key_validate.cpp",
+    ],
+    LIBDEPS=[
+        'bson',
+        'db/common',
+        'index_names',
+    ])
 
 env.Library('clientdriver', [
             "client/connpool.cpp",
@@ -412,7 +425,6 @@ env.Library("coredb", [
         "db/commands/write_commands/write_commands_common.cpp",
         "db/pipeline/pipeline.cpp",
         "db/dbcommands_generic.cpp",
-        "db/index_names.cpp",
         "db/keypattern.cpp",
         "db/matcher/matcher.cpp",
         "db/pipeline/accumulator_add_to_set.cpp",
@@ -457,6 +469,7 @@ env.Library("coredb", [
                            'expressions_geo',
                            'expressions_where',
                            'expressions_text',
+                           'index_names',
                            'db/exec/working_set',
                            'db/index/key_generator',
                            '$BUILD_DIR/mongo/foundation',
@@ -575,6 +588,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/index/btree_based_access_method.cpp",
                     "db/index/btree_index_cursor.cpp",
                     "db/index/btree_interface.cpp",
+                    "db/index/index_descriptor.cpp",
                     "db/index/fts_access_method.cpp",
                     "db/index/hash_access_method.cpp",
                     "db/index/haystack_access_method.cpp",
@@ -599,6 +613,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/catalog/database_holder.cpp",
                     "db/background.cpp",
                     "db/pdfile.cpp",
+                    "db/repair_database.cpp",
                     "db/storage/data_file.cpp",
                     "db/storage/extent.cpp",
                     "db/storage/extent_manager.cpp",
@@ -613,8 +628,10 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/geo/s2common.cpp",
                     "db/ops/count.cpp",
                     "db/ops/delete.cpp",
+                    "db/ops/delete_executor.cpp",
                     "db/ops/insert.cpp",
                     "db/ops/update.cpp",
+                    "db/ops/update_executor.cpp",
                     "db/dbcommands.cpp",
                     "db/dbcommands_admin.cpp",
                     "db/write_concern.cpp",
@@ -864,6 +881,7 @@ env.Library("serveronly", serverOnlyFiles,
                      "defaultversion",
                      "geoparser",
                      "geoquery",
+                     "index_key_validate",
                      "index_set",
                      'range_deleter',
                      's/metadata',
@@ -945,9 +963,10 @@ env.Library("alltools",
                      "coreserver",
                      "coredb",
                      "$BUILD_DIR/mongo/util/options_parser/options_parser",
-                     "$BUILD_DIR/mongo/db/auth/authmocks"])
+                     "$BUILD_DIR/mongo/db/auth/authmocks",
+                     "$BUILD_DIR/mongo/db/auth/authmongod"])
 
-normalTools = [ "dump", "restore", "export", "import", "stat", "top", "oplog", "admin" ]
+normalTools = [ "dump", "restore", "export", "import", "stat", "top", "oplog" ]
 env.Alias( "tools", [ "#/${PROGPREFIX}mongo" + name + "${PROGSUFFIX}" for name in normalTools ] )
 for name in normalTools:
     env.Install( '#/', env.Program("mongo" + name,
@@ -1063,9 +1082,19 @@ if darwin or env["_HAVEPCAP"]:
 
 # if you add a file here, you need to add it in scripting/engine.cpp and shell/createCPPfromJavaScriptFiles.js as well
 env.JSHeader("shell/mongo.cpp",
-             ["shell/assert.js", "shell/types.js", "shell/utils.js", "shell/utils_sh.js",
-              "shell/db.js", "shell/mongo.js", "shell/mr.js", "shell/query.js",
-              "shell/collection.js", "shell/batch_api.js"])
+             [
+                 "shell/assert.js",
+                 "shell/bulk_api.js",
+                 "shell/collection.js",
+                 "shell/db.js",
+                 "shell/mongo.js",
+                 "shell/mr.js",
+                 "shell/query.js",
+                 "shell/types.js",
+                 "shell/upgrade_check.js",
+                 "shell/utils.js",
+                 "shell/utils_sh.js",
+              ])
 
 # if you add a file here, you need to add it in shell/shell_utils.cpp and shell/createCPPfromJavaScriptFiles.js as well
 env.JSHeader("shell/mongo-server.cpp",
@@ -1084,6 +1113,8 @@ coreShellFiles = [ "shell/shell_utils.cpp",
 if shellEnv is not None:
     env.Library("shell_core", coreShellFiles,
                 LIBDEPS=['clientandshell',
+                         'db/index/external_key_generator',
+                         'index_key_validate',
                          'scripting',
                          'mongocommon'])
     # mongo shell options
@@ -1133,10 +1164,6 @@ def installBinary( e, name ):
         e.AddPostAction(name, 'strip $TARGET')
 
     distBinaries.append(name)
-
-    if not installSetup.binaries:
-        return
-
     inst = e.Install( "$INSTALL_DIR/bin", name )
 
     if nix:

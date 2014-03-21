@@ -125,6 +125,10 @@ namespace mongo {
         return Status::OK();
     }
 
+    size_t WriteOp::getNumTargeted() {
+        return _childOps.size();
+    }
+
     static bool isRetryErrCode( int errCode ) {
         return errCode == ErrorCodes::StaleShardVersion;
     }
@@ -154,6 +158,7 @@ namespace mongo {
         }
 
         error->setErrInfo( BSON( "causedBy" << errB.arr() ) );
+        error->setIndex( errOps.front()->error->getIndex() );
         error->setErrMessage( msg.str() );
     }
 

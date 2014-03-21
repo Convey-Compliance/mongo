@@ -63,28 +63,4 @@ namespace mongo {
         info.setInvalid();
     }
 
-    bool IndexDetails::areIndexOptionsEquivalent(const BSONObj& newSpec ) const {
-        if ( dropDups() != newSpec["dropDups"].trueValue() ) {
-            return false;
-        }
-
-        const BSONElement sparseSpecs = info.obj().getField("sparse");
-
-        if ( sparseSpecs.trueValue() != newSpec["sparse"].trueValue() ) {
-            return false;
-        }
-
-        // Note: { _id: 1 } or { _id: -1 } implies unique: true.
-        if ( !isIdIndex() &&
-             unique() != newSpec["unique"].trueValue() ) {
-            return false;
-        }
-
-        const BSONElement existingExpireSecs =
-                info.obj().getField("expireAfterSeconds");
-        const BSONElement newExpireSecs = newSpec["expireAfterSeconds"];
-
-        return existingExpireSecs == newExpireSecs;
-    }
-
 }

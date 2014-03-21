@@ -94,6 +94,10 @@ namespace mongo {
             "admin.system.backup_users");
     const NamespaceString AuthorizationManager::usersCollectionNamespace("admin.system.users");
     const NamespaceString AuthorizationManager::versionCollectionNamespace("admin.system.version");
+    const NamespaceString AuthorizationManager::defaultTempUsersCollectionNamespace(
+            "admin.tempusers");
+    const NamespaceString AuthorizationManager::defaultTempRolesCollectionNamespace(
+            "admin.temproles");
 
     const BSONObj AuthorizationManager::versionDocumentQuery = BSON("_id" << "authSchema");
 
@@ -256,7 +260,7 @@ namespace mongo {
         }
     }
 
-    int AuthorizationManager::getAuthorizationVersion() {
+    Status AuthorizationManager::getAuthorizationVersion(int* version) {
         CacheGuard guard(this, CacheGuard::fetchSynchronizationManual);
         int newVersion = _version;
         if (schemaVersionInvalid == newVersion) {
@@ -265,16 +269,19 @@ namespace mongo {
             guard.beginFetchPhase();
             Status status = _externalState->getStoredAuthorizationVersion(&newVersion);
             guard.endFetchPhase();
-            if (status.isOK()) {
-                if (guard.isSameCacheGeneration()) {
-                    _version = newVersion;
-                }
+            if (!status.isOK()) {
+                warning() << "Problem fetching the stored schema version of authorization data: "
+                          << status;
+                *version = schemaVersionInvalid;
+                return status;
             }
-            else {
-                warning() << "Could not determine schema version of authorization data. " << status;
+
+            if (guard.isSameCacheGeneration()) {
+                _version = newVersion;
             }
         }
-        return newVersion;
+        *version = newVersion;
+        return Status::OK();
     }
 
     void AuthorizationManager::setSupportOldStylePrivilegeDocuments(bool enabled) {
@@ -401,14 +408,14 @@ namespace mongo {
                                                       bool upsert,
                                                       bool multi,
                                                       const BSONObj& writeConcern,
-                                                      int* numUpdated) const {
+                                                      int* nMatched) const {
         return _externalState->update(collectionName,
                                       query,
                                       updatePattern,
                                       upsert,
                                       multi,
                                       writeConcern,
-                                      numUpdated);
+                                      nMatched);
     }
 
     Status AuthorizationManager::getBSONForPrivileges(const PrivilegeVector& privileges,
@@ -898,7 +905,7 @@ namespace {
      * Logs that the auth schema upgrade failed because of "status" and returns "status".
      */
     Status logUpgradeFailed(const Status& status) {
-        log() << "Auth schema upgraded failed with " << status;
+        log() << "Auth schema upgrade failed with " << status;
         return status;
     }
 
@@ -913,6 +920,24 @@ namespace {
                             const BSONObj& oldUserDoc,
                             const BSONObj& writeConcern) {
 
+        uassert(17387,
+                mongoutils::str::stream() << "While preparing to upgrade user doc from the 2.4 "
+                        "user data schema to the 2.6 schema, found a user doc with a "
+                        "\"credentials\" field, indicating that the doc already has the new "
+                        "schema. Make sure that all documents in admin.system.users have the same "
+                        "user data schema and that the version document in admin.system.version "
+                        "indicates the correct schema version.  User doc found: " <<
+                        oldUserDoc.toString(),
+                !oldUserDoc.hasField("credentials"));
+
+        uassert(17386,
+                mongoutils::str::stream() << "While preparing to upgrade user doc from "
+                        "the 2.4 user data schema to the 2.6 schema, found a user doc "
+                        "that doesn't conform to the 2.4 *or* 2.6 schema.  Doc found: "
+                        << oldUserDoc.toString(),
+                oldUserDoc.hasField("user") &&
+                        (oldUserDoc.hasField("userSource") || oldUserDoc.hasField("pwd")));
+
         std::string oldUserSource;
         uassertStatusOK(bsonExtractStringFieldWithDefault(
                                 oldUserDoc,
@@ -923,9 +948,90 @@ namespace {
         if (oldUserSource == "local")
             return;  // Skips users from "local" database, which cannot be upgraded.
 
-        BSONObj query;
-        BSONObj update;
-        auth::getUpdateToUpgradeUser(sourceDB, oldUserDoc, &query, &update);
+        const std::string oldUserName = oldUserDoc["user"].String();
+        BSONObj query = BSON("_id" << oldUserSource + "." + oldUserName);
+
+        BSONObjBuilder updateBuilder;
+        {
+            BSONObjBuilder toSetBuilder(updateBuilder.subobjStart("$set"));
+            toSetBuilder << "user" << oldUserName << "db" << oldUserSource;
+            BSONElement pwdElement = oldUserDoc["pwd"];
+            if (!pwdElement.eoo()) {
+                toSetBuilder << "credentials" << BSON("MONGODB-CR" << pwdElement.String());
+            }
+            else if (oldUserSource == "$external") {
+                toSetBuilder << "credentials" << BSON("external" << true);
+            }
+        }
+        {
+            BSONObjBuilder pushAllBuilder(updateBuilder.subobjStart("$pushAll"));
+            BSONArrayBuilder rolesBuilder(pushAllBuilder.subarrayStart("roles"));
+
+            const bool readOnly = oldUserDoc["readOnly"].trueValue();
+            const BSONElement rolesElement = oldUserDoc["roles"];
+            if (readOnly) {
+                // Handles the cases where there is a truthy readOnly field, which is a 2.2-style
+                // read-only user.
+                if (sourceDB == "admin") {
+                    rolesBuilder << BSON("role" << "readAnyDatabase" << "db" << "admin");
+                }
+                else {
+                    rolesBuilder << BSON("role" << "read" << "db" << sourceDB);
+                }
+            }
+            else if (rolesElement.eoo()) {
+                // Handles the cases where the readOnly field is absent or falsey, but the
+                // user is known to be 2.2-style because it lacks a roles array.
+                if (sourceDB == "admin") {
+                    rolesBuilder << BSON("role" << "root" << "db" << "admin");
+                }
+                else {
+                    rolesBuilder << BSON("role" << "dbOwner" << "db" << sourceDB);
+                }
+            }
+            else {
+                // Handles 2.4-style user documents, with roles arrays and (optionally, in admin db)
+                // otherDBRoles objects.
+                uassert(17252,
+                        "roles field in v2.4 user documents must be an array",
+                        rolesElement.type() == Array);
+                for (BSONObjIterator oldRoles(rolesElement.Obj());
+                     oldRoles.more();
+                     oldRoles.next()) {
+
+                    BSONElement roleElement = *oldRoles;
+                    rolesBuilder << BSON("role" << roleElement.String() << "db" << sourceDB);
+                }
+
+                BSONElement otherDBRolesElement = oldUserDoc["otherDBRoles"];
+                if (sourceDB == "admin" && !otherDBRolesElement.eoo()) {
+                    uassert(17253,
+                            "otherDBRoles field in v2.4 user documents must be an object.",
+                            otherDBRolesElement.type() == Object);
+
+                    for (BSONObjIterator otherDBs(otherDBRolesElement.Obj());
+                         otherDBs.more();
+                         otherDBs.next()) {
+
+                        BSONElement otherDBRoles = *otherDBs;
+                        if (otherDBRoles.fieldNameStringData() == "local")
+                            continue;
+                        uassert(17254,
+                                "Member fields of otherDBRoles objects must be arrays.",
+                                otherDBRoles.type() == Array);
+                        for (BSONObjIterator oldRoles(otherDBRoles.Obj());
+                             oldRoles.more();
+                             oldRoles.next()) {
+
+                            BSONElement roleElement = *oldRoles;
+                            rolesBuilder << BSON("role" << roleElement.String() <<
+                                                 "db" << otherDBRoles.fieldNameStringData());
+                        }
+                    }
+                }
+            }
+        }
+        BSONObj update = updateBuilder.obj();
 
         uassertStatusOK(externalState->updateOne(
                                 AuthorizationManager::usersAltCollectionNamespace,
@@ -1188,7 +1294,12 @@ namespace {
 }  // namespace
 
     Status AuthorizationManager::upgradeSchemaStep(const BSONObj& writeConcern, bool* isDone) {
-        int authzVersion = getAuthorizationVersion();
+        int authzVersion;
+        Status status = getAuthorizationVersion(&authzVersion);
+        if (!status.isOK()) {
+            return status;
+        }
+
         switch (authzVersion) {
         case schemaVersion24:
             *isDone = false;

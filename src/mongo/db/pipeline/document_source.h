@@ -50,12 +50,12 @@
 
 namespace mongo {
     class Accumulator;
-    class Cursor;
     class Document;
     class Expression;
     class ExpressionFieldPath;
     class ExpressionObject;
     class DocumentSourceLimit;
+    class Runner;
 
     class DocumentSource : public IntrusiveCounterUnsigned {
     public:
@@ -74,11 +74,6 @@ namespace mongo {
          * not be advanced until eof(), see SERVER-6123.
          */
         virtual void dispose();
-
-        /**
-         * See ClientCursor::kill()
-         */
-        virtual void kill();
 
         /**
            Get the source's name.
@@ -335,7 +330,7 @@ namespace mongo {
 
 
     /**
-     * Constructs and returns Documents from the BSONObj objects produced by a supplied Cursor.
+     * Constructs and returns Documents from the BSONObj objects produced by a supplied Runner.
      * An object of this type may only be used by one thread, see SERVER-6123.
      */
     class DocumentSourceCursor :
@@ -350,25 +345,16 @@ namespace mongo {
         virtual bool coalesce(const intrusive_ptr<DocumentSource>& nextSource);
         virtual bool isValidInitialSource() const { return true; }
         virtual void dispose();
-        virtual void kill();
 
         /**
-         * Create a document source based on a passed-in cursor.
+         * Create a document source based on a passed-in Runner.
          *
          * This is usually put at the beginning of a chain of document sources
          * in order to fetch data from the database.
-         *
-         * The DocumentSource takes ownership of the cursor and will destroy it
-         * when the DocumentSource is finished with the cursor, if it hasn't
-         * already been destroyed.
-         *
-         * @param ns the namespace the cursor is over
-         * @param cursorId the id of the cursor to use
-         * @param pExpCtx the expression context for the pipeline
          */
         static intrusive_ptr<DocumentSourceCursor> create(
             const string& ns,
-            CursorId cursorId,
+            const boost::shared_ptr<Runner>& runner,
             const intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /*
@@ -412,7 +398,7 @@ namespace mongo {
     private:
         DocumentSourceCursor(
             const string& ns,
-            CursorId cursorId,
+            const boost::shared_ptr<Runner>& runner,
             const intrusive_ptr<ExpressionContext> &pExpCtx);
 
         void loadBatch();
@@ -427,9 +413,8 @@ namespace mongo {
         intrusive_ptr<DocumentSourceLimit> _limit;
         long long _docsAddedToBatches; // for _limit enforcement
 
-        string _ns; // namespace
-        CursorId _cursorId;
-        bool _killed;
+        const string _ns;
+        boost::shared_ptr<Runner> _runner; // PipelineRunner holds a weak_ptr to this.
     };
 
 
@@ -452,17 +437,6 @@ namespace mongo {
          */
         static intrusive_ptr<DocumentSourceGroup> create(
             const intrusive_ptr<ExpressionContext> &pExpCtx);
-
-        /**
-          Set the Id Expression.
-
-          Documents that pass through the grouping Document are grouped
-          according to this key.  This will generate the id_ field in the
-          result documents.
-
-          @param pExpression the group key
-         */
-        void setIdExpression(const intrusive_ptr<Expression> &pExpression);
 
         /**
           Add an accumulator.
@@ -522,7 +496,22 @@ namespace mongo {
         void populate();
         bool populated;
 
-        intrusive_ptr<Expression> pIdExpression;
+        /**
+         * Parses the raw id expression into _idExpressions and possibly _idFieldNames.
+         */
+        void parseIdExpression(BSONElement groupField, const VariablesParseState& vps);
+
+        /**
+         * Computes the internal representation of the group key.
+         */
+        Value computeId(Variables* vars);
+
+        /**
+         * Converts the internal representation of the group key to the _id shape specified by the
+         * user.
+         */
+        Value expandId(const Value& val);
+
 
         typedef vector<intrusive_ptr<Accumulator> > Accumulators;
         typedef boost::unordered_map<Value, Accumulators, Value::Hash> GroupsMap;
@@ -552,6 +541,8 @@ namespace mongo {
         const bool _extSortAllowed;
         const int _maxMemoryUsageBytes;
         boost::scoped_ptr<Variables> _variables;
+        std::vector<std::string> _idFieldNames; // used when id is a document
+        std::vector<intrusive_ptr<Expression> > _idExpressions;
 
         // only used when !_spilled
         GroupsMap::iterator groupsIterator;
@@ -639,6 +630,12 @@ namespace mongo {
          *  This method should only be called at most once.
          */
         vector<DBClientCursor*> getCursors();
+
+        /**
+         * Returns the next object from the cursor, throwing an appropriate exception if the cursor
+         * reported an error. This is a better form of DBClientCursor::nextSafe.
+         */
+        static Document nextSafeFrom(DBClientCursor* cursor);
 
     private:
 
@@ -1108,14 +1105,4 @@ namespace mongo {
         BSONObj cmdOutput;
         boost::scoped_ptr<BSONObjIterator> resultsIterator; // iterator over cmdOutput["results"]
     };
-}
-
-
-/* ======================= INLINED IMPLEMENTATIONS ========================== */
-
-namespace mongo {
-    inline void DocumentSourceGroup::setIdExpression(
-        const intrusive_ptr<Expression> &pExpression) {
-        pIdExpression = pExpression;
-    }
 }

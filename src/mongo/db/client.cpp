@@ -161,19 +161,6 @@ namespace mongo {
         return *c;
     }
 
-    /* resets the client for the current thread */
-    void Client::resetThread( const StringData& origThreadName ) {
-        verify( currentClient.get() != 0 );
-
-        // Detach all client info from thread
-        mongo::lastError.reset(NULL);
-        currentClient.get()->shutdown();
-        currentClient.reset(NULL);
-
-        setThreadName( origThreadName.rawData() );
-    }
-
-
     Client::Client(const string& desc, AbstractMessagingPort *p) :
         ClientBasic(p),
         _context(0),
@@ -182,7 +169,8 @@ namespace mongo {
         _god(0),
         _lastOp(0)
     {
-        _hasWrittenThisPass = false;
+        _hasWrittenThisOperation = false;
+        _hasWrittenSinceCheckpoint = false;
         _pageFaultRetryableSection = 0;
         _connectionId = p ? p->connectionId() : 0;
         _curOp = new CurOp( this );
@@ -250,7 +238,7 @@ namespace mongo {
         return false;
     }
 
-    BSONObj CachedBSONObj::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
+    BSONObj CachedBSONObjBase::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
     Client::Context::Context(const std::string& ns , Database * db) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
@@ -533,9 +521,9 @@ namespace mongo {
     }
 
     bool Client::allowedToThrowPageFaultException() const {
-        if ( _hasWrittenThisPass )
+        if ( _hasWrittenThisOperation )
             return false;
-        
+
         if ( ! _pageFaultRetryableSection )
             return false;
 
@@ -565,9 +553,10 @@ namespace mongo {
         exhaust = false;
 
         nscanned = -1;
+        nscannedObjects = -1;
         idhack = false;
         scanAndOrder = false;
-        nupdated = -1;
+        nMatched = -1;
         nModified = -1;
         ninserted = -1;
         ndeleted = -1;
@@ -605,6 +594,7 @@ namespace mongo {
                     mutablebson::Document cmdToLog(curop.query(), 
                             mutablebson::Document::kInPlaceDisabled);
                     curCommand->redactForLogging(&cmdToLog);
+                    s << curCommand->name << " ";
                     s << cmdToLog.toString();
                 } 
                 else { // Should not happen but we need to handle curCommand == NULL gracefully
@@ -618,7 +608,7 @@ namespace mongo {
         }
 
         if (!planSummary.empty()) {
-            s << " planSummary: " << planSummary;
+            s << " planSummary: " << planSummary.toString();
         }
         
         if ( ! updateobj.isEmpty() ) {
@@ -632,10 +622,11 @@ namespace mongo {
         OPDEBUG_TOSTRING_HELP_BOOL( exhaust );
 
         OPDEBUG_TOSTRING_HELP( nscanned );
+        OPDEBUG_TOSTRING_HELP( nscannedObjects );
         OPDEBUG_TOSTRING_HELP_BOOL( idhack );
         OPDEBUG_TOSTRING_HELP_BOOL( scanAndOrder );
         OPDEBUG_TOSTRING_HELP( nmoved );
-        OPDEBUG_TOSTRING_HELP( nupdated );
+        OPDEBUG_TOSTRING_HELP( nMatched );
         OPDEBUG_TOSTRING_HELP( nModified );
         OPDEBUG_TOSTRING_HELP( ninserted );
         OPDEBUG_TOSTRING_HELP( ndeleted );
@@ -724,11 +715,12 @@ namespace mongo {
         OPDEBUG_APPEND_BOOL( exhaust );
 
         OPDEBUG_APPEND_NUMBER( nscanned );
+        OPDEBUG_APPEND_NUMBER( nscannedObjects );
         OPDEBUG_APPEND_BOOL( idhack );
         OPDEBUG_APPEND_BOOL( scanAndOrder );
         OPDEBUG_APPEND_BOOL( moved );
         OPDEBUG_APPEND_NUMBER( nmoved );
-        OPDEBUG_APPEND_NUMBER( nupdated );
+        OPDEBUG_APPEND_NUMBER( nMatched );
         OPDEBUG_APPEND_NUMBER( nModified );
         OPDEBUG_APPEND_NUMBER( ninserted );
         OPDEBUG_APPEND_NUMBER( ndeleted );
@@ -747,9 +739,7 @@ namespace mongo {
         OPDEBUG_APPEND_NUMBER( responseLength );
         b.append( "millis" , executionTime );
 
-        if (!execStats.isEmpty()) {
-            b.append("execStats", execStats);
-        }
+        execStats.append(b, "execStats");
 
         return true;
     }

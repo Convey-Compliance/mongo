@@ -402,9 +402,12 @@ namespace mongo {
             invariant( _dummyRunner.get() == NULL );
             _dummyRunner.reset( new DummyRunner( _ns, collection ) );
 
+            // Allow multiKey based on the invariant that shard keys must be single-valued.
+            // Therefore, any multi-key index prefixed by shard key cannot be multikey over
+            // the shard key fields.
             IndexDescriptor *idx =
                 collection->getIndexCatalog()->findIndexByPrefix( _shardKeyPattern ,
-                                                                  true );  /* require single key */
+                                                                  false );  /* allow multi key */
 
             if ( idx == NULL ) {
                 errmsg = (string)"can't find index in storeCurrentLocs" + causedBy( errmsg );
@@ -1639,10 +1642,7 @@ namespace mongo {
                                       << endl;
                     }
                     else {
-                        db->createCollection( ns,
-                                              false /* capped */,
-                                              NULL /* options */,
-                                              true /* allocateDefaultSpace */ );
+                        db->createCollection( ns );
                     }
                 }
             }
@@ -1676,7 +1676,6 @@ namespace mongo {
                         errmsg = str::stream() << "failed to create index before migrating data. "
                                                << " idx: " << idx
                                                << " error: " << status.toString();
-                        errmsg = str::stream() << "collection dropped during migration: " << ns;
                         warning() << errmsg;
                         state = FAIL;
                         return;

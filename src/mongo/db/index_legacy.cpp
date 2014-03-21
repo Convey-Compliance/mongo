@@ -30,8 +30,9 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/index/expression_keys_private.h"
+#include "mongo/db/index/s2_access_method.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/index/hash_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/structure/catalog/namespace_details.h"
 
@@ -43,6 +44,10 @@ namespace mongo {
 
         if (IndexNames::TEXT == pluginName) {
             return fts::FTSSpec::fixSpec(obj);
+        }
+
+        if (IndexNames::GEO_2DSPHERE == pluginName) {
+            return S2AccessMethod::fixSpec(obj);
         }
 
         return obj;
@@ -67,8 +72,7 @@ namespace mongo {
             // alter the data format).  Additionally, in certain places the hashed index code and
             // the index bound calculation code assume null and missing are indexed identically.
             BSONObj nullObj = BSON("" << BSONNULL);
-            return BSON("" << HashAccessMethod::makeSingleKey(nullObj.firstElement(), seed,
-                                                              hashVersion));
+            return BSON("" << ExpressionKeysPrivate::makeSingleHashKey(nullObj.firstElement(), seed, hashVersion));
         }
         else {
             BSONObjBuilder b;

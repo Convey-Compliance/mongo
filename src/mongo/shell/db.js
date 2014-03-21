@@ -288,6 +288,7 @@ DB.prototype.help = function() {
     print("\tdb.getProfilingStatus() - returns if profiling is on and slow threshold");
     print("\tdb.getReplicationInfo()");
     print("\tdb.getSiblingDB(name) get the db at the same server as this one");
+    print("\tdb.getWriteConcern() - returns the write concern used for any operations on this db, inherited from server object if set");
     print("\tdb.hostInfo() get details about the server's host"); 
     print("\tdb.isMaster() check replica primary status");
     print("\tdb.killOp(opid) kills the current operation in the db");
@@ -304,6 +305,8 @@ DB.prototype.help = function() {
     print("\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into { cmdObj : 1 }");
     print("\tdb.serverStatus()");
     print("\tdb.setProfilingLevel(level,<slowms>) 0=off 1=slow 2=all");
+    print("\tdb.setWriteConcern( <write concern doc> ) - sets the write concern for writes to the db");
+    print("\tdb.unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the db");
     print("\tdb.setVerboseShell(flag) display extra information in shell output");
     print("\tdb.shutdownServer()");
     print("\tdb.stats()");
@@ -862,11 +865,11 @@ function getUserObjString(userObj) {
  */
 DB.prototype._addUserWithInsert = function(userObj, replicatedTo, timeout) {
     var c = this.getCollection( "system.users" );
-    var oldPwd;
+    userObj = Object.extend({}, userObj); // Prevent modifications to userObj from getting to caller
     if (userObj.pwd != null) {
-        oldPwd = userObj.pwd;
         userObj.pwd = _hashPassword(userObj.user, userObj.pwd);
     }
+
     try {
         c.save(userObj);
     } catch (e) {
@@ -879,9 +882,6 @@ DB.prototype._addUserWithInsert = function(userObj, replicatedTo, timeout) {
         } else {
             throw "Could not insert into system.users: " + tojson(e);
         }
-    } finally {
-        if (userObj.pwd != null)
-            userObj.pwd = oldPwd;
     }
     print("Successfully added user: " + getUserObjString(userObj));
 
@@ -1175,6 +1175,7 @@ DB.prototype.__pwHash = function( nonce, username, pass ) {
 }
 
 DB.prototype._defaultAuthenticationMechanism = "MONGODB-CR";
+DB.prototype._defaultGssapiServiceName = null;
 
 DB.prototype._authOrThrow = function () {
     var params;
@@ -1196,6 +1197,13 @@ DB.prototype._authOrThrow = function () {
 
     if (params.db !== undefined) {
         throw Error("Do not override db field on db.auth(). Use getMongo().auth(), instead.");
+    }
+
+    if (params.mechanism == "GSSAPI" &&
+        params.serviceName == null &&
+        this._defaultGssapiServiceName != null) {
+
+        params.serviceName = this._defaultGssapiServiceName;
     }
 
     params.db = this.getName();
@@ -1260,6 +1268,13 @@ DB.prototype.getUsers = function(args) {
     Object.extend(cmdObj, args);
     var res = this.runCommand(cmdObj);
     if (!res.ok) {
+        var authSchemaIncompatibleCode = 69;
+        if (res.code == authSchemaIncompatibleCode ||
+                (res.code == null && res.errmsg == "no such cmd: usersInfo")) {
+            // Working with 2.4 schema user data
+            return this.system.users.find({}).toArray();
+        }
+
         throw Error(res.errmsg);
     }
 
@@ -1385,5 +1400,29 @@ DB.prototype.getRoles = function(args) {
 
     return res.roles;
 }
+
+DB.prototype.setWriteConcern = function( wc ) {
+    if ( wc instanceof WriteConcern ) {
+        this._writeConcern = wc;
+    }
+    else {
+        this._writeConcern = new WriteConcern( wc );
+    }
+};
+
+DB.prototype.getWriteConcern = function() {
+    if (this._writeConcern)
+        return this._writeConcern;
+    
+    if (this._mongo.getWriteConcern())
+        return this._mongo.getWriteConcern();
+
+    return null;
+};
+
+DB.prototype.unsetWriteConcern = function() {
+    delete this._writeConcern;
+};
+
 
 }());

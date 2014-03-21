@@ -28,6 +28,8 @@
 
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/filter.h"
+#include "mongo/db/exec/working_set_common.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -53,7 +55,7 @@ namespace mongo {
             _specificStats.matchTested = vector<size_t>(_children.size(), 0);
         }
 
-        WorkingSetID id;
+        WorkingSetID id = WorkingSet::INVALID_ID;
         StageState childStatus = _children[_currentChild]->work(&id);
 
         if (PlanStage::ADVANCED == childStatus) {
@@ -105,6 +107,19 @@ namespace mongo {
                 ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
             }
+        }
+        else if (PlanStage::FAILURE == childStatus) {
+            *out = id;
+            // If a stage fails, it may create a status WSM to indicate why it
+            // failed, in which case 'id' is valid.  If ID is invalid, we
+            // create our own error message.
+            if (WorkingSet::INVALID_ID == id) {
+                mongoutils::str::stream ss;
+                ss << "OR stage failed to read in results from child " << _currentChild;
+                Status status(ErrorCodes::InternalError, ss);
+                *out = WorkingSetCommon::allocateStatusMember( _ws, status);
+            }
+            return childStatus;
         }
         else {
             if (PlanStage::NEED_FETCH == childStatus) {

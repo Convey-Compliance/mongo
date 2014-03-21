@@ -194,6 +194,17 @@ namespace mongo {
             cc().writeHappened(); 
         }
 
+        bool NonDurableImpl::commitNow() {
+            cc().checkpointHappened();
+            return false;
+        }
+
+        bool NonDurableImpl::commitIfNeeded(bool) {
+            cc().checkpointHappened();
+            return false;
+        }
+
+
         void assertLockedForCommitting();
 
         static DurableImpl* durableImpl = new DurableImpl();
@@ -214,6 +225,7 @@ namespace mongo {
         bool DurableImpl::commitNow() {
             stats.curr->_earlyCommits++;
             groupCommit(0);
+            cc().checkpointHappened();
             return true;
         }
 
@@ -258,8 +270,9 @@ namespace mongo {
             return p;
         }
 
-        bool DurableImpl::aCommitIsNeeded() const {
+        bool DurableImpl::isCommitNeeded() const {
             DEV commitJob._nSinceCommitIfNeededCall = 0;
+            unspoolWriteIntents();
             return commitJob.bytes() > UncommittedBytesLimit;
         }
 
@@ -291,15 +304,11 @@ namespace mongo {
                 }
                 case 'w': {
                     if( Lock::atLeastReadLocked("local") ) {
-                        error() << "can't commitNow from commitIfNeeded, as we are in local db lock" << endl;
-                        printStackTrace();
-                        dassert(false); // this will make _DEBUG builds terminate. so we will notice in buildbot.
+                        LOG(2) << "can't commitNow from commitIfNeeded, as we are in local db lock";
                         return false;
                     }
                     if( Lock::atLeastReadLocked("admin") ) {
-                        error() << "can't commitNow from commitIfNeeded, as we are in admin db lock" << endl;
-                        printStackTrace();
-                        dassert(false);
+                        LOG(2) << "can't commitNow from commitIfNeeded, as we are in admin db lock";
                         return false;
                     }
 
@@ -337,6 +346,10 @@ namespace mongo {
             perf note: this function is called a lot, on every lock_w() ... and usually returns right away
         */
         bool DurableImpl::commitIfNeeded(bool force) {
+            // this is safe since since conceptually if you call commitIfNeeded, we're at a valid
+            // spot in an operation to be terminated.
+            cc().checkpointHappened();
+
             unspoolWriteIntents();
             DEV commitJob._nSinceCommitIfNeededCall = 0;
             if( likely( commitJob.bytes() < UncommittedBytesLimit && !force ) ) {

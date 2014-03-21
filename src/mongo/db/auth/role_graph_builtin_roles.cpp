@@ -534,6 +534,29 @@ namespace {
                 privileges,
                 Privilege(ResourcePattern::forCollectionName("system.js"), actions));
 
+        // Need to be able to query system.namespaces to check existing collection options.
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forCollectionName("system.namespaces"),
+                          ActionType::find));
+
+        // Privileges for user/role management
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forAnyNormalResource(), userAdminRoleActions));
+
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forExactNamespace(
+                                  AuthorizationManager::defaultTempUsersCollectionNamespace),
+                          ActionType::find));
+
+        Privilege::addPrivilegeToPrivilegeVector(
+                privileges,
+                Privilege(ResourcePattern::forExactNamespace(
+                                  AuthorizationManager::defaultTempRolesCollectionNamespace),
+                          ActionType::find));
+
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forExactNamespace(
@@ -546,12 +569,7 @@ namespace {
                                   AuthorizationManager::usersBackupCollectionNamespace),
                           actions));
 
-        Privilege::addPrivilegeToPrivilegeVector(
-                privileges,
-                Privilege(ResourcePattern::forExactNamespace(
-                                  AuthorizationManager::rolesCollectionNamespace),
-                          actions));
-
+        actions << ActionType::find;
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(
@@ -560,16 +578,10 @@ namespace {
                         actions));
 
         // Need additional actions on system.users.
-        actions << ActionType::find << ActionType::update << ActionType::remove;
+        actions << ActionType::update << ActionType::remove;
         Privilege::addPrivilegeToPrivilegeVector(
                 privileges,
                 Privilege(ResourcePattern::forCollectionName("system.users"), actions));
-
-        // Need to be able to query system.namespaces to check existing collection options.
-        Privilege::addPrivilegeToPrivilegeVector(
-                privileges,
-                Privilege(ResourcePattern::forCollectionName("system.namespaces"),
-                          ActionType::find));
 
         // Need to be able to run getParameter to check authSchemaVersion
         Privilege::addPrivilegeToPrivilegeVector(

@@ -1,6 +1,8 @@
 // Test that:
 // 1. Text indexes properly validate the index spec used to create them.
 // 2. Text indexes properly enforce a schema on the language_override field.
+// 3. Collections may have at most one text index.
+// 4. Text indexes properly handle large documents.
 
 var coll = db.fts_index;
 var indexName = "textIndex";
@@ -65,4 +67,72 @@ coll.ensureIndex({a: "text"});
 assert(!db.getLastError());
 coll.insert({a: "", language: "spanglish"});
 assert(db.getLastError());
+coll.drop();
+
+//
+// 3. Collections may have at most one text index.
+//
+
+coll.ensureIndex({a: 1, b: "text", c: 1});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+
+// ensureIndex() becomes a no-op on an equivalent index spec.
+coll.ensureIndex({a: 1, b: "text", c: 1});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+coll.ensureIndex({a: 1, _fts: "text", _ftsx: 1, c: 1}, {weights: {b: 1}});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+coll.ensureIndex({a: 1, b: "text", c: 1}, {default_language: "english"});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+coll.ensureIndex({a: 1, b: "text", c: 1}, {textIndexVersion: 2});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+coll.ensureIndex({a: 1, b: "text", c: 1}, {language_override: "language"});
+assert(!db.getLastError());
+assert.eq(2, coll.getIndexes().length);
+
+// ensureIndex() fails if a second text index would be built.
+coll.ensureIndex({a: 1, _fts: "text", _ftsx: 1, c: 1}, {weights: {d: 1}});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text", c: 1}, {default_language: "none"});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text", c: 1}, {textIndexVersion: 1});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text", c: 1}, {language_override: "idioma"});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text", c: 1}, {weights: {d: 1}});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text", d: 1});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, d: "text", c: 1});
+assert(db.getLastError());
+coll.ensureIndex({b: "text"});
+assert(db.getLastError());
+coll.ensureIndex({b: "text", c: 1});
+assert(db.getLastError());
+coll.ensureIndex({a: 1, b: "text"});
+assert(db.getLastError());
+
+coll.dropIndexes();
+
+//
+// 4. Text indexes properly handle large keys.
+//
+
+coll.ensureIndex({a: "text"});
+assert(!db.getLastError());
+
+var longstring = "";
+var longstring2 = "";
+for(var i = 0; i < 1024 * 1024; ++i) {
+    longstring = longstring + "a";
+    longstring2 = longstring2 + "b";
+}
+coll.insert({a: longstring});
+coll.insert({a: longstring2});
+assert.eq(1, coll.find({$text: {$search: longstring}}).itcount(), "long string not found in index");
+
 coll.drop();

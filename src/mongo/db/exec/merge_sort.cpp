@@ -30,6 +30,7 @@
 
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -63,7 +64,7 @@ namespace mongo {
             // We have some child that we don't have a result from.  Each child must have a result
             // in order to pick the minimum result among all our children.  Work a child.
             PlanStage* child = _noResultToMerge.front();
-            WorkingSetID id;
+            WorkingSetID id = WorkingSet::INVALID_ID;
             StageState code = child->work(&id);
 
             if (PlanStage::ADVANCED == code) {
@@ -119,6 +120,19 @@ namespace mongo {
                 _noResultToMerge.pop();
                 ++_commonStats.needTime;
                 return PlanStage::NEED_TIME;
+            }
+            else if (PlanStage::FAILURE == code) {
+                *out = id;
+                // If a stage fails, it may create a status WSM to indicate why it
+                // failed, in which case 'id' is valid.  If ID is invalid, we
+                // create our own error message.
+                if (WorkingSet::INVALID_ID == id) {
+                    mongoutils::str::stream ss;
+                    ss << "merge sort stage failed to read in results from child";
+                    Status status(ErrorCodes::InternalError, ss);
+                    *out = WorkingSetCommon::allocateStatusMember( _ws, status);
+                }
+                return code;
             }
             else {
                 if (PlanStage::NEED_FETCH == code) {

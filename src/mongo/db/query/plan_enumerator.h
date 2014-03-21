@@ -35,12 +35,18 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/index_entry.h"
 #include "mongo/db/query/index_tag.h"
+#include "mongo/db/query/query_knobs.h"
 
 namespace mongo {
 
     struct PlanEnumeratorParams {
-        PlanEnumeratorParams() : intersect(false) { }
 
+        PlanEnumeratorParams() : intersect(false),
+                                 maxSolutionsPerOr(internalQueryEnumerationMaxOrSolutions),
+                                 maxIntersectPerAnd(internalQueryEnumerationMaxIntersectPerAnd) { }
+
+        // Do we provide solutions that use more indices than the minimum required to provide
+        // an indexed solution?
         bool intersect;
 
         // Not owned here.
@@ -48,6 +54,16 @@ namespace mongo {
 
         // Not owned here.
         const vector<IndexEntry>* indices;
+
+        // How many plans are we willing to ouput from an OR? We currently consider
+        // all possibly OR plans, which means the product of the number of possibilities
+        // for each clause of the OR. This could grow disastrously large.
+        size_t maxSolutionsPerOr;
+
+        // How many intersect plans are we willing to output from an AND?  Given that we pursue an
+        // all-pairs approach, we could wind up creating a lot of enumeration possibilities for
+        // certain inputs.
+        size_t maxIntersectPerAnd;
     };
 
     /**
@@ -105,11 +121,16 @@ namespace mongo {
         // The position of a field in a possibly compound index.
         typedef size_t IndexPosition;
 
+        struct PrepMemoContext {
+            PrepMemoContext() : elemMatchExpr(NULL) { }
+            MatchExpression* elemMatchExpr;
+        };
+
         /**
          * Traverses the match expression and generates the memo structure from it.
          * Returns true if the provided node uses an index, false otherwise.
          */
-        bool prepMemo(MatchExpression* node);
+        bool prepMemo(MatchExpression* node, PrepMemoContext context);
 
         /**
          * Traverses the memo structure and annotates the tree with IndexTags for the chosen
@@ -166,12 +187,16 @@ namespace mongo {
         };
 
         struct OrAssignment {
+            OrAssignment() : counter(0) { }
+
+            // Each child of an OR must be indexed for the OR to be indexed. When an OR moves to a
+            // subsequent state it just asks all its children to move their states forward.
+
             // Must use all of subnodes.
             vector<MemoID> subnodes;
 
-            // No enumeration state.  Each child of an OR must be indexed for the OR to be indexed.
-            // When an OR moves to a subsequent state it just asks all its children to move their
-            // states forward.
+            // The number of OR states that we've enumerated so far.
+            size_t counter;
         };
 
         // This is used by AndAssignment and is not an actual assignment.
@@ -222,6 +247,124 @@ namespace mongo {
         void allocateAssignment(MatchExpression* expr, NodeAssignment** slot, MemoID* id);
 
         /**
+         * Predicates inside $elemMatch's that are semantically "$and of $and"
+         * predicates are not rewritten to the top-level during normalization.
+         * However, we would like to make predicates inside $elemMatch available
+         * for combining index bounds with the top-level $and predicates.
+         *
+         * This function deeply traverses $and and $elemMatch expressions of
+         * the tree rooted at 'node', adding all preds that can use an index
+         * to the output vector 'indexOut'. At the same time, $elemMatch
+         * context information is stashed in the tags so that we don't lose
+         * information due to flattening.
+         *
+         * Nodes that cannot be deeply traversed are returned via the output
+         * vectors 'subnodesOut' and 'mandatorySubnodes'. Subnodes are "mandatory"
+         * if they *must* use an index (TEXT and GEO).
+         *
+         * Does not take ownership of arguments.
+         *
+         * Returns false if the AND cannot be indexed. Otherwise returns true.
+         */
+        bool partitionPreds(MatchExpression* node,
+                            PrepMemoContext context,
+                            vector<MatchExpression*>* indexOut,
+                            vector<MemoID>* subnodesOut,
+                            vector<MemoID>* mandatorySubnodes);
+
+        /**
+         * Finds a set of predicates that can be safely compounded with 'assigned',
+         * under the assumption that we are assignining predicates to a compound,
+         * multikey index.
+         *
+         * The list of candidate predicates that we could compound is passed
+         * in 'couldCompound'. A subset of these predicates that is safe to
+         * combine by compounding is returned in the out-parameter 'out'.
+         *
+         * Does not take ownership of its arguments.
+         *
+         * The rules for when to compound for multikey indices are reasonably
+         * complex, and are dependent on the structure of $elemMatch's used
+         * in the query. Ignoring $elemMatch for the time being, the rule is this:
+         *
+         *   "Any set of predicates for which no two predicates share a path
+         *    prefix can be compounded."
+         *
+         * Suppose we have predicates over paths 'a.b' and 'a.c'. These cannot
+         * be compounded because they share the prefix 'a'. Similarly, the bounds
+         * for 'a' and 'a.b' cannot be compounded (in the case of multikey index
+         * {a: 1, 'a.b': 1}). You *can* compound predicates over the paths 'a.b.c',
+         * 'd', and 'e.b.c', because there is no shared prefix.
+         *
+         * The rules are different in the presence of $elemMatch. For $elemMatch
+         * {a: {$elemMatch: {<pred1>, ..., <predN>}}}, we are allowed to compound
+         * bounds for pred1 through predN, even though these predicates share the
+         * path prefix 'a'. However, we still cannot compound in the case of
+         * {a: {$elemMatch: {'b.c': {$gt: 1}, 'b.d': 5}}} because 'b.c' and 'b.d'
+         * share a prefix. In other words, what matters inside an $elemMatch is not
+         * the absolute prefix, but rather the "relative prefix" after the shared
+         * $elemMatch part of the path.
+         *
+         * A few more examples:
+         *    1) {'a.b': {$elemMatch: {c: {$gt: 1}, d: 5}}}. In this case, we can
+         *    compound, because the $elemMatch is applied to the shared part of
+         *    the path 'a.b'.
+         *
+         *    2) {'a.b': 1, a: {$elemMatch: {b: {$gt: 0}}}}. We cannot combine the
+         *    bounds here because the prefix 'a' is shared by two predicates which
+         *    are not joined together by an $elemMatch.
+         */
+        void getMultikeyCompoundablePreds(const MatchExpression* assigned,
+                                          const vector<MatchExpression*>& couldCompound,
+                                          vector<MatchExpression*>* out);
+
+        /**
+         * 'andAssignment' contains assignments that we've already committed to outputting,
+         * including both single index assignments and ixisect assignments.
+         *
+         * 'ixisectAssigned' is a set of predicates that we are about to add to 'andAssignment'
+         * as an index intersection assignment.
+         *
+         * Returns true if an single index assignment which is already in 'andAssignment'
+         * contains a superset of the predicates in 'ixisectAssigned'. This means that we
+         * can assign the same preds to a compound index rather than using index intersection.
+         *
+         * Ex.
+         *   Suppose we have indices {a: 1}, {b: 1}, and {a: 1, b: 1} with query
+         *   {a: 2, b: 2}. When we try to intersect {a: 1} and {b: 1} the predicates
+         *   a==2 and b==2 will get assigned to respective indices. But then we will
+         *   call this function with ixisectAssigned equal to the set {'a==2', 'b==2'},
+         *   and notice that we have already assigned this same set of predicates to
+         *   the single index {a: 1, b: 1} via compounding.
+         */
+        bool alreadyCompounded(const set<MatchExpression*>& ixisectAssigned,
+                               const AndAssignment* andAssignment);
+        /**
+         * Output index intersection assignments inside of an AND node.
+         */
+        typedef unordered_map<IndexID, vector<MatchExpression*> > IndexToPredMap;
+
+        /**
+         * Generate index intersection assignments given the predicate/index structure in idxToFirst
+         * and idxToNotFirst (and the sub-trees in 'subnodes').  Outputs the assignments in
+         * 'andAssignment'.
+         */
+        void enumerateAndIntersect(const IndexToPredMap& idxToFirst,
+                                   const IndexToPredMap& idxToNotFirst,
+                                   const vector<MemoID>& subnodes,
+                                   AndAssignment* andAssignment);
+
+        /**
+         * Generate one-index-at-once assignments given the predicate/index structure in idxToFirst
+         * and idxToNotFirst (and the sub-trees in 'subnodes').  Outputs the assignments into
+         * 'andAssignment'.
+         */
+        void enumerateOneIndex(const IndexToPredMap& idxToFirst,
+                               const IndexToPredMap& idxToNotFirst,
+                               const vector<MemoID>& subnodes,
+                               AndAssignment* andAssignment);
+
+        /**
          * Try to assign predicates in 'tryCompound' to 'thisIndex' as compound assignments.
          * Output the assignments in 'assign'.
          */
@@ -229,7 +372,7 @@ namespace mongo {
                       const IndexEntry& thisIndex,
                       OneIndexAssignment* assign);
 
-        void dumpMemo();
+        std::string dumpMemo();
 
         // Map from expression to its MemoID.
         unordered_map<MatchExpression*, MemoID> _nodeToId;
@@ -253,6 +396,12 @@ namespace mongo {
 
         // Do we output >1 index per AND (index intersection)?
         bool _ixisect;
+
+        // How many enumerations are we willing to produce from each OR?
+        size_t _orLimit;
+
+        // How many things do we want from each AND?
+        size_t _intersectLimit;
     };
 
 } // namespace mongo

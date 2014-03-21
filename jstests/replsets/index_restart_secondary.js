@@ -26,9 +26,11 @@ var secondDB = second.getDB('fgIndexSec');
 var size = 500000;
 
 jsTest.log("creating test data " + size + " documents");
+var bulk = masterDB.jstests_fgsec.initializeUnorderedBulkOp();
 for(var i = 0; i < size; ++i) {
-    masterDB.jstests_fgsec.save( {i:i} );
+    bulk.insert({ i: i });
 }
+assert.writeOK(bulk.execute());
 
 jsTest.log("Creating index");
 masterDB.jstests_fgsec.ensureIndex( {i:1} );
@@ -37,7 +39,7 @@ assert.eq(2, masterDB.system.indexes.count( {ns:"fgIndexSec.jstests_fgsec"} ) );
 // Wait for the secondary to get the index entry
 assert.soon( function() { 
     return 2 == secondDB.system.indexes.count( {ns:"fgIndexSec.jstests_fgsec"} ); },
-             "index not created on secondary (prior to restart)", 120000, 50 );
+             "index not created on secondary (prior to restart)", 800000, 50 );
 
 jsTest.log("Index created and system.indexes entry exists on secondary");
 

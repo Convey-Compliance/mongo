@@ -48,7 +48,7 @@ namespace mongo {
     public:
 
         // Maximum number of write ops supported per batch
-        static const int kMaxWriteBatchSize = 1000;
+        static const size_t kMaxWriteBatchSize;
 
         enum BatchType {
             BatchType_Insert, BatchType_Update, BatchType_Delete, BatchType_Unknown
@@ -107,6 +107,7 @@ namespace mongo {
         // Index creation is also an insert, but a weird one.
         bool isInsertIndexRequest() const;
         bool isUniqueIndexRequest() const;
+        bool isValidIndexRequest( std::string* errMsg ) const;
         std::string getTargetingNS() const;
         BSONObj getIndexKeyPattern() const;
 

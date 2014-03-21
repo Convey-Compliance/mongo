@@ -65,6 +65,7 @@
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/write_concern.h"
@@ -169,14 +170,27 @@ namespace mongo {
 
         virtual LockType locktype() const { return WRITE; }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname, 
+        virtual std::vector<BSONObj> stopIndexBuilds(Database* db, 
                                                      const BSONObj& cmdObj) {
-            std::string systemIndexes = dbname+".system.indexes";
-            std::string toDeleteRegex = "^"+dbname+"\\.";
-            BSONObj criteria = BSON("ns" << systemIndexes <<
-                                    "op" << "insert" <<
-                                    "insert.ns" << BSON("$regex" << toDeleteRegex));
-            return IndexBuilder::killMatchingIndexBuilds(criteria);
+            invariant(db);
+            std::list<std::string> collections;
+            db->namespaceIndex().getNamespaces(collections, true /* onlyCollections */);
+
+            std::vector<BSONObj> allKilledIndexes;
+            for (std::list<std::string>::iterator it = collections.begin(); 
+                 it != collections.end(); 
+                 ++it) {
+                std::string ns = *it;
+
+                IndexCatalog::IndexKillCriteria criteria;
+                criteria.ns = ns;
+                std::vector<BSONObj> killedIndexes = 
+                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
+                allKilledIndexes.insert(allKilledIndexes.end(), 
+                                        killedIndexes.begin(), 
+                                        killedIndexes.end());
+            }
+            return allKilledIndexes;
         }
 
         CmdDropDatabase() : Command("dropDatabase") {}
@@ -191,7 +205,7 @@ namespace mongo {
             int p = (int) e.number();
             if ( p != 1 )
                 return false;
-            stopIndexBuilds(dbname, cmdObj);
+            stopIndexBuilds(cc().database(), cmdObj);
             dropDatabase(dbname);
             result.append( "dropped" , dbname );
             log() << "dropDatabase " << dbname << " finished" << endl;
@@ -223,11 +237,27 @@ namespace mongo {
         }
         CmdRepairDatabase() : Command("repairDatabase") {}
 
-        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname, 
+        virtual std::vector<BSONObj> stopIndexBuilds(Database* db, 
                                                      const BSONObj& cmdObj) {
-            std::string systemIndexes = dbname + ".system.indexes";
-            BSONObj criteria = BSON("ns" << systemIndexes << "op" << "insert");
-            return IndexBuilder::killMatchingIndexBuilds(criteria);
+            invariant(db);
+            std::list<std::string> collections;
+            db->namespaceIndex().getNamespaces(collections, true /* onlyCollections */);
+
+            std::vector<BSONObj> allKilledIndexes;
+            for (std::list<std::string>::iterator it = collections.begin(); 
+                 it != collections.end(); 
+                 ++it) {
+                std::string ns = *it;
+
+                IndexCatalog::IndexKillCriteria criteria;
+                criteria.ns = ns;
+                std::vector<BSONObj> killedIndexes = 
+                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
+                allKilledIndexes.insert(allKilledIndexes.end(), 
+                                        killedIndexes.begin(), 
+                                        killedIndexes.end());
+            }
+            return allKilledIndexes;
         }
 
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
@@ -240,18 +270,18 @@ namespace mongo {
                 return false;
             }
 
-            std::vector<BSONObj> indexesInProg = stopIndexBuilds(dbname, cmdObj);
+            std::vector<BSONObj> indexesInProg = stopIndexBuilds(cc().database(), cmdObj);
 
             e = cmdObj.getField( "preserveClonedFilesOnFailure" );
             bool preserveClonedFilesOnFailure = e.isBoolean() && e.boolean();
             e = cmdObj.getField( "backupOriginalFiles" );
             bool backupOriginalFiles = e.isBoolean() && e.boolean();
-            bool ok =
-                repairDatabase( dbname, errmsg, preserveClonedFilesOnFailure, backupOriginalFiles );
+            Status status =
+                repairDatabase( dbname, preserveClonedFilesOnFailure, backupOriginalFiles );
 
             IndexBuilder::restoreIndexes(indexesInProg);
 
-            return ok;
+            return appendCommandStatus( result, status );
         }
     } cmdRepairDatabase;
 
@@ -389,14 +419,13 @@ namespace mongo {
         virtual void help( stringstream& help ) const { help << "drop a collection\n{drop : <collectionName>}"; }
         virtual LockType locktype() const { return WRITE; }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname, 
+        virtual std::vector<BSONObj> stopIndexBuilds(Database* db, 
                                                      const BSONObj& cmdObj) {
-            std::string nsToDrop = dbname + '.' + cmdObj.firstElement().valuestr();
-            std::string systemIndexes = dbname+".system.indexes";
-            BSONObj criteria = BSON("ns" << systemIndexes << "op" << "insert" <<
-                                    "insert.ns" << nsToDrop);
+            std::string nsToDrop = db->name() + '.' + cmdObj.firstElement().valuestr();
 
-            return IndexBuilder::killMatchingIndexBuilds(criteria);
+            IndexCatalog::IndexKillCriteria criteria;
+            criteria.ns = nsToDrop;
+            return IndexBuilder::killMatchingIndexBuilds(db->getCollection(nsToDrop), criteria);
         }
 
         virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
@@ -419,7 +448,7 @@ namespace mongo {
 
             int numIndexes = coll->getIndexCatalog()->numIndexesTotal();
 
-            stopIndexBuilds(dbname, cmdObj);
+            stopIndexBuilds(cc().database(), cmdObj);
 
             result.append( "ns", nsToDrop );
             result.append( "nIndexesWas", numIndexes );
@@ -598,12 +627,12 @@ namespace mongo {
             vector< BSONObj > dbInfos;
 
             set<string> seen;
-            boost::intmax_t totalSize = 0;
+            intmax_t totalSize = 0;
             for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
                 BSONObjBuilder b;
                 b.append( "name", *i );
 
-                boost::intmax_t size = dbSize( i->c_str() );
+                intmax_t size = dbSize( i->c_str() );
                 b.append( "sizeOnDisk", (double) size );
                 totalSize += size;
                 
@@ -1215,6 +1244,10 @@ namespace mongo {
 
             list<string> collections;
             Database* d = cc().database();
+
+            if ( d && ( d->isEmpty() || d->getExtentManager().numFiles() == 0 ) )
+                d = NULL;
+
             if ( d )
                 d->namespaceIndex().getNamespaces( collections );
 
@@ -1257,17 +1290,34 @@ namespace mongo {
             result.appendNumber( "numExtents" , numExtents );
             result.appendNumber( "indexes" , indexes );
             result.appendNumber( "indexSize" , indexSize / scale );
-            result.appendNumber( "fileSize" , d->fileSize() / scale );
-            if( d )
+            if ( d ) {
+                result.appendNumber( "fileSize" , d->fileSize() / scale );
                 result.appendNumber( "nsSizeMB", (int) d->namespaceIndex().fileLength() / 1024 / 1024 );
+            }
+            else {
+                result.appendNumber( "fileSize" , 0 );
+            }
 
             BSONObjBuilder dataFileVersion( result.subobjStart( "dataFileVersion" ) );
-            if ( d && !d->isEmpty() ) {
-                DataFileHeader* header = d->getFile( 0 )->getHeader();
-                dataFileVersion.append( "major", header->version );
-                dataFileVersion.append( "minor", header->versionMinor );
+            if ( d ) {
+                int major, minor;
+                d->getFileFormat( &major, &minor );
+                dataFileVersion.append( "major", major );
+                dataFileVersion.append( "minor", minor );
             }
             dataFileVersion.done();
+
+            if ( d ){
+                int freeListSize = 0;
+                int64_t freeListSpace = 0;
+                d->getExtentManager().freeListStats( &freeListSize, &freeListSpace );
+
+                BSONObjBuilder extentFreeList( result.subobjStart( "extentFreeList" ) );
+                extentFreeList.append( "num", freeListSize );
+                extentFreeList.appendNumber( "totalSize",
+                                             static_cast<long long>( freeListSpace / scale ) );
+                extentFreeList.done();
+            }
 
             return true;
         }

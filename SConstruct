@@ -46,6 +46,9 @@ def findSettingsSetup():
     sys.path.append( ".." )
     sys.path.append( "../../" )
 
+def versiontuple(v):
+    return tuple(map(int, (v.split("."))))
+
 # --- platform identification ---
 #
 # This needs to precede the options section so that we can only offer some options on certain
@@ -185,8 +188,8 @@ add_option( "extra-variant-dirs", "extra variant dir components, separated by co
 add_option( "add-branch-to-variant-dir", "add current git branch to the variant dir", 0, False )
 add_option( "variant-dir", "override variant subdirectory", 1, False )
 
-add_option( "sharedclient", "build a libmongoclient.so/.dll" , 0 , False )
-add_option( "full", "include client and headers when doing scons install", 0 , False )
+add_option( "sharedclient", "build a libmongoclient.so/.dll [DEPRECATED/IGNORED]" , 0 , False )
+add_option( "full", "include client and headers when doing scons install [DEPRECATED/IGNORED]", 0 , False )
 
 # linking options
 add_option( "release" , "release build" , 0 , True )
@@ -194,7 +197,7 @@ add_option( "static" , "fully static build" , 0 , False )
 add_option( "static-libstdc++" , "statically link libstdc++" , 0 , False )
 add_option( "lto", "enable link time optimizations (experimental, except with MSVC)" , 0 , True )
 add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
-add_option( "disable-declspec-thread", "don't use __declspec(thread) on Windows", 0, True)
+add_option( "disable-declspec-thread", "don't use __declspec(thread) on Windows [DEPRECATED/IGNORED]", 0, True)
 
 # base compile flags
 add_option( "64" , "whether to force 64 bit" , 0 , True , "force64" )
@@ -207,12 +210,12 @@ add_option( "cxx-use-shell-environment", "use $CXX from shell for C++ compiler" 
 add_option( "ld", "linker to use" , 1 , True )
 add_option( "c++11", "enable c++11 support (experimental)", 0, True )
 
-add_option( "cpppath", "Include path if you have headers in a nonstandard directory" , 1 , True )
-add_option( "libpath", "Library path if you have libraries in a nonstandard directory" , 1 , True )
+add_option( "cpppath", "Include path if you have headers in a nonstandard directory" , 1 , False )
+add_option( "libpath", "Library path if you have libraries in a nonstandard directory" , 1 , False )
 
-add_option( "extrapath", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) static linking" , 1 , True )
-add_option( "extrapathdyn", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) dynamic linking" , 1 , True )
-add_option( "extralib", "comma separated list of libraries  (--extralib js_static,readline" , 1 , True )
+add_option( "extrapath", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) static linking" , 1 , False )
+add_option( "extrapathdyn", "comma separated list of add'l paths  (--extrapath /opt/foo/,/foo) dynamic linking" , 1 , False )
+add_option( "extralib", "comma separated list of libraries  (--extralib js_static,readline" , 1 , False )
 
 add_option( "no-glibc-check" , "don't check for new versions of glibc" , 0 , False )
 
@@ -445,8 +448,6 @@ asio = has_option( "asio" )
 
 usePCH = has_option( "usePCH" )
 
-justClientLib = (COMMAND_LINE_TARGETS == ['mongoclient'])
-
 env = Environment( BUILD_DIR=variantDir,
                    DIST_ARCHIVE_SUFFIX='.tgz',
                    EXTRAPATH=get_option("extrapath"),
@@ -599,8 +600,7 @@ if has_option( "durableDefaultOn" ):
 if has_option( "durableDefaultOff" ):
     env.Append( CPPDEFINES=[ "_DURABLEDEFAULTOFF" ] )
 
-if ( not ( usev8 or justClientLib) ):
-    usev8 = True
+usev8 = True
 
 extraLibPlaces = []
 
@@ -623,25 +623,6 @@ if has_option( "extrapathdyn" ):
 if has_option( "extralib" ):
     for x in GetOption( "extralib" ).split( "," ):
         env.Append( LIBS=[ x ] )
-
-class InstallSetup:
-    binaries = False
-    libraries = False
-    headers = False
-
-    def __init__(self):
-        self.default()
-
-    def default(self):
-        self.binaries = True
-        self.libraries = False
-        self.headers = False
-
-installSetup = InstallSetup()
-
-if has_option( "full" ):
-    installSetup.headers = True
-    installSetup.libraries = True
 
 # ---- other build setup -----
 
@@ -747,7 +728,11 @@ elif windows:
     # c4244
     # 'conversion' conversion from 'type1' to 'type2', possible loss of data
     #  An integer type is converted to a smaller integer type.
-    env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244"] )
+    # c4290
+    #  C++ exception specification ignored except to indicate a function is not __declspec(nothrow
+    #  A function is declared using exception specification, which Visual C++ accepts but does not
+    #  implement
+    env.Append( CCFLAGS=["/wd4355", "/wd4800", "/wd4267", "/wd4244", "/wd4290"] )
 
     # some warnings we should treat as errors:
     # c4099
@@ -795,7 +780,10 @@ elif windows:
     if optBuild:
         # /O2:  optimize for speed (as opposed to size)
         # /Oy-: disable frame pointer optimization (overrides /O2, only affects 32-bit)
+        # /INCREMENTAL: NO - disable incremental link - avoid the level of indirection for function
+        # calls
         env.Append( CCFLAGS=["/O2", "/Oy-"] )
+        env.Append( LINKFLAGS=["/INCREMENTAL:NO"])
     else:
         env.Append( CCFLAGS=["/Od"] )
 
@@ -1076,6 +1064,7 @@ def doConfigure(myenv):
                     win_version_min = default_32_bit_min
                 conf.Finish();
 
+        env['WIN_VERSION_MIN'] = win_version_min
         win_version_min = win_version_min_choices[win_version_min]
         env.Append( CPPDEFINES=[("_WIN32_WINNT", "0x" + win_version_min[0])] )
         env.Append( CPPDEFINES=[("NTDDI_VERSION", "0x" + win_version_min[0] + win_version_min[1])] )
@@ -1213,6 +1202,8 @@ def doConfigure(myenv):
         if not using_clang():
             print( 'libc++ is currently only supported for clang')
             Exit(1)
+        if darwin and has_option('osx-version-min') and versiontuple(min_version) < versiontuple('10.7'):
+            print("Warning: You passed option 'libc++'. You probably want to also pass 'osx-version-min=10.7' or higher for libc++ support.")
         if AddToCXXFLAGSIfSupported(myenv, '-stdlib=libc++'):
             myenv.Append(LINKFLAGS=['-stdlib=libc++'])
         else:
@@ -1302,24 +1293,23 @@ def doConfigure(myenv):
     # explicitly not to use it. For other compilers, see if __thread works.
     if using_msvc():
         haveDeclSpecThread = False
-        if not has_option("disable-declspec-thread"):
-            def CheckDeclspecThread(context):
-                test_body = """
-                __declspec( thread ) int tsp_int;
-                int main(int argc, char* argv[]) {
-                    tsp_int = argc;
-                    return 0;
-                }
-                """
-                context.Message('Checking for __declspec(thread)... ')
-                ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
-                context.Result(ret)
-                return ret
-            conf = Configure(myenv, help=False, custom_tests = {
-                'CheckDeclspecThread' : CheckDeclspecThread,
-            })
-            haveDeclSpecThread = conf.CheckDeclspecThread()
-            conf.Finish()
+        def CheckDeclspecThread(context):
+            test_body = """
+            __declspec( thread ) int tsp_int;
+            int main(int argc, char* argv[]) {
+            tsp_int = argc;
+            return 0;
+            }
+            """
+            context.Message('Checking for __declspec(thread)... ')
+            ret = context.TryLink(textwrap.dedent(test_body), ".cpp")
+            context.Result(ret)
+            return ret
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckDeclspecThread' : CheckDeclspecThread,
+        })
+        haveDeclSpecThread = conf.CheckDeclspecThread()
+        conf.Finish()
         if haveDeclSpecThread:
             myenv.Append(CPPDEFINES=['MONGO_HAVE___DECLSPEC_THREAD'])
     else:
@@ -1669,7 +1659,7 @@ Export("shellEnv")
 Export("testEnv")
 Export("get_option")
 Export("has_option use_system_version_of_library")
-Export("installSetup mongoCodeVersion")
+Export("mongoCodeVersion")
 Export("usev8")
 Export("darwin windows solaris linux freebsd nix")
 Export('module_sconscripts')
@@ -1697,4 +1687,4 @@ def clean_old_dist_builds(env, target, source):
 env.Alias("dist_clean", [], [clean_old_dist_builds])
 env.AlwaysBuild("dist_clean")
 
-env.Alias('all', ['core', 'tools', 'clientTests', 'test', 'unittests', 'moduletests'])
+env.Alias('all', ['core', 'tools', 'test', 'unittests', 'moduletests'])

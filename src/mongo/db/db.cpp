@@ -37,9 +37,12 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
+#include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authz_manager_external_state_d.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status.h"
@@ -58,9 +61,9 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/mongod_options.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_deleter_service.h"
+#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/repl_start.h"
 #include "mongo/db/repl/replication_server_status.h"
 #include "mongo/db/repl/rs.h"
@@ -112,8 +115,8 @@ namespace mongo {
 #ifdef _WIN32
     ntservice::NtServiceDefaultStrings defaultServiceStrings = {
         L"MongoDB",
-        L"Mongo DB",
-        L"Mongo DB Server"
+        L"MongoDB",
+        L"MongoDB Server"
     };
 #endif
 
@@ -294,7 +297,7 @@ namespace mongo {
     }
 
 
-    bool doDBUpgrade( const string& dbName , string errmsg , DataFileHeader * h ) {
+    void doDBUpgrade( const string& dbName, DataFileHeader* h ) {
         static DBDirectClient db;
 
         if ( h->version == 4 && h->versionMinor == 4 ) {
@@ -308,18 +311,17 @@ namespace mongo {
                 BSONObj out;
                 bool ok = db.runCommand( dbName , BSON( "reIndex" << c.substr( dbName.size() + 1 ) ) , out );
                 if ( ! ok ) {
-                    errmsg = "reindex failed";
-                    log() << "\t\t reindex failed: " << out << endl;
-                    return false;
+                    log() << "\t\t reindex failed: " << out;
+                    fassertFailed( 17393 );
                 }
             }
 
             getDur().writingInt(h->versionMinor) = 5;
-            return true;
+            return;
         }
 
         // do this in the general case
-        return repairDatabase( dbName.c_str(), errmsg );
+        fassert( 17401, repairDatabase( dbName ) );
     }
 
     void checkForIdIndexes( Database* db ) {
@@ -369,7 +371,7 @@ namespace mongo {
             LOG(1) << "\t" << dbName << endl;
 
             Client::Context ctx( dbName );
-            DataFile *p = ctx.db()->getFile( 0 );
+            DataFile *p = ctx.db()->getExtentManager().getFile( 0 );
             DataFileHeader *h = p->getHeader();
 
             if ( replSettings.usingReplSets() ) {
@@ -400,8 +402,7 @@ namespace mongo {
 
                 if (mongodGlobalParams.upgrade) {
                     // QUESTION: Repair even if file format is higher version than code?
-                    string errmsg;
-                    verify( doDBUpgrade( dbName , errmsg , h ) );
+                    doDBUpgrade( dbName, h );
                 }
                 else {
                     log() << "\t Not upgrading, exiting" << endl;
@@ -413,14 +414,15 @@ namespace mongo {
                 }
             }
             else {
-                if (h->versionMinor == PDFILE_VERSION_MINOR_22_AND_OLDER) {
-                    const string systemIndexes = cc().database()->name() + ".system.indexes";
-                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes));
-                    BSONObj index;
-                    Runner::RunnerState state;
-                    while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
-                        const BSONObj key = index.getObjectField("key");
-                        const string plugin = IndexNames::findPluginName(key);
+                const string systemIndexes = cc().database()->name() + ".system.indexes";
+                auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes));
+                BSONObj index;
+                Runner::RunnerState state;
+                while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
+                    const BSONObj key = index.getObjectField("key");
+                    const string plugin = IndexNames::findPluginName(key);
+
+                    if (h->versionMinor == PDFILE_VERSION_MINOR_22_AND_OLDER) {
                         if (IndexNames::existedBefore24(plugin))
                             continue;
 
@@ -431,10 +433,20 @@ namespace mongo {
                               << startupWarningsLog;
                     }
 
-                    if (Runner::RUNNER_EOF != state) {
-                        warning() << "Internal error while reading collection " << systemIndexes;
+                    const Status keyStatus = validateKeyPattern(key);
+                    if (!keyStatus.isOK()) {
+                        log() << "Problem with index " << index << ": " << keyStatus.reason()
+                              << " This index can still be used however it cannot be rebuilt."
+                              << " For more info see"
+                              << " http://dochub.mongodb.org/core/index-validation"
+                              << startupWarningsLog;
                     }
                 }
+
+                if (Runner::RUNNER_EOF != state) {
+                    warning() << "Internal error while reading collection " << systemIndexes;
+                }
+
                 Database::closeDatabase(dbName.c_str(), storageGlobalParams.dbpath);
             }
         }
@@ -744,6 +756,8 @@ namespace mongo {
             // resolve this.
             Client::WriteContext c("admin", storageGlobalParams.dbpath);
         }
+
+        authindex::configureSystemIndexes("admin");
 
         getDeleter()->startWorkers();
 

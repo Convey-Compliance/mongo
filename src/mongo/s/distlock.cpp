@@ -138,19 +138,32 @@ namespace mongo {
                         continue;
                     }
 
-                    // remove really old entries from the lockpings collection if they're not holding a lock
-                    // (this may happen if an instance of a process was taken down and no new instance came up to
-                    // replace it for a quite a while)
-                    // if the lock is taken, the take-over mechanism should handle the situation
-                    auto_ptr<DBClientCursor> c = conn->query( LocksType::ConfigNS , BSONObj() );
-                    // TODO:  Would be good to make clear whether query throws or returns empty on errors
-                    uassert( 16060, str::stream() << "cannot query locks collection on config server " << conn.getHost(), c.get() );
+                    // Remove really old entries from the lockpings collection if they're not
+                    // holding a lock. This may happen if an instance of a process was taken down
+                    // and no new instance came up to replace it for a quite a while.
+                    // NOTE this is NOT the same as the standard take-over mechanism, which forces
+                    // the lock entry.
+                    BSONObj fieldsToReturn = BSON( LocksType::state() << 1 <<
+                                                   LocksType::process() << 1 );
+                    auto_ptr<DBClientCursor> activeLocks =
+                        conn->query( LocksType::ConfigNS,
+                                     BSON( LocksType::state() << GT << 0 ) );
+
+                    uassert( 16060,
+                             str::stream() << "cannot query locks collection on config server "
+                                           << conn.getHost(),
+                             activeLocks.get() );
 
                     set<string> pids;
-                    while ( c->more() ) {
-                        BSONObj lock = c->next();
-                        if ( ! lock[LocksType::process()].eoo() ) {
-                            pids.insert( lock[LocksType::process()].valuestrsafe() );
+                    while ( activeLocks->more() ) {
+                        BSONObj lock = activeLocks->nextSafe();
+
+                        if ( !lock[LocksType::process()].eoo() ) {
+                            pids.insert( lock[LocksType::process()].str() );
+                        }
+                        else {
+                            warning() << "found incorrect lock document during lock ping cleanup: "
+                                      << lock.toString() << endl;
                         }
                     }
 
@@ -167,11 +180,6 @@ namespace mongo {
                         // Sleep for normal ping time
                         sleepmillis(sleepTime);
                         continue;
-                    }
-
-                    // create index so remove is fast even with a lot of servers
-                    if ( loops++ == 0 ) {
-                        conn->ensureIndex( LockpingsType::ConfigNS, BSON( LockpingsType::ping() << 1 ) );
                     }
 
                     LOG( DistributedLock::logLvl - ( loops % 10 == 0 ? 1 : 0 ) ) << "cluster " << addr << " pinged successfully at " << pingTime
@@ -848,9 +856,10 @@ namespace mongo {
 
             // Main codepath to acquire lock
 
-            LOG( logLvl ) << "about to acquire distributed lock '" << lockName << ":\n"
-                          <<  lockDetails.jsonString(Strict, true) << "\n"
-                          << query.jsonString(Strict, true) << endl;
+            LOG( logLvl ) << "about to acquire distributed lock '" << lockName << "'";
+
+            LOG( logLvl + 1 ) << "trying to acquire lock " << query.toString( false, true )
+                              << " with details " << lockDetails.toString( false, true ) << endl;
 
             conn->update( LocksType::ConfigNS , query , whatIWant );
 

@@ -29,12 +29,13 @@
 #include "mongo/db/commands/write_commands/write_commands.h"
 
 #include "mongo/base/init.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/bson/mutable/element.h"
 #include "mongo/db/commands/write_commands/batch_executor.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/ops/insert.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/counters.h"
 
@@ -60,6 +61,22 @@ namespace mongo {
         Command( name ), _writeType( writeType ) {
     }
 
+    void WriteCmd::redactTooLongLog( mutablebson::Document* cmdObj, const StringData& fieldName ) {
+        namespace mmb = mutablebson;
+        mmb::Element root = cmdObj->root();
+        mmb::Element field = root.findFirstChildNamed( fieldName );
+
+        // If the cmdObj is too large, it will be a "too big" message given by CachedBSONObj.get()
+        if ( !field.ok() ) {
+            return;
+        }
+
+        // Redact the log if there are more than one documents or operations.
+        if ( field.countChildren() > 1 ) {
+            field.setValueInt( field.countChildren() );
+        }
+    }
+
     // Write commands are fanned out in oplog as single writes.
     bool WriteCmd::logTheOp() { return false; }
 
@@ -78,6 +95,7 @@ namespace mongo {
                 NamespaceString( parseNs( dbname, cmdObj ) ),
                 cmdObj ));
 
+        // TODO: Remove this when we standardize GLE reporting from commands
         if ( !status.isOK() ) {
             setLastError( status.code(), status.reason().c_str() );
         }
@@ -112,20 +130,11 @@ namespace mongo {
         NamespaceString nss(dbName, request.getNS());
         request.setNS(nss.ns());
 
-        Status status = userAllowedWriteNS( nss );
-        if ( !status.isOK() )
-            return appendCommandStatus( result, status );
-
         BSONObj defaultWriteConcern;
         // This is really bad - it's only safe because we leak the defaults by overriding them with
         // new defaults and because we never reset to an empty default.
         // TODO: fix this for sane behavior where we query repl set object
         if ( getLastErrorDefault ) defaultWriteConcern = *getLastErrorDefault;
-        if ( defaultWriteConcern.isEmpty() ) {
-            BSONObjBuilder b;
-            b.append( "w", 1 );
-            defaultWriteConcern = b.obj();
-        }
 
         WriteBatchExecutor writeBatchExecutor(defaultWriteConcern,
                                               &cc(),
@@ -142,6 +151,10 @@ namespace mongo {
         WriteCmd( "insert", BatchedCommandRequest::BatchType_Insert ) {
     }
 
+    void CmdInsert::redactForLogging( mutablebson::Document* cmdObj ) {
+        redactTooLongLog( cmdObj, StringData( "documents", StringData::LiteralTag() ) );
+    }
+
     void CmdInsert::help( stringstream& help ) const {
         help << "insert documents";
     }
@@ -150,12 +163,20 @@ namespace mongo {
         WriteCmd( "update", BatchedCommandRequest::BatchType_Update ) {
     }
 
+    void CmdUpdate::redactForLogging( mutablebson::Document* cmdObj ) {
+        redactTooLongLog( cmdObj, StringData( "updates", StringData::LiteralTag() ) );
+    }
+
     void CmdUpdate::help( stringstream& help ) const {
         help << "update documents";
     }
 
     CmdDelete::CmdDelete() :
         WriteCmd( "delete", BatchedCommandRequest::BatchType_Delete ) {
+    }
+
+    void CmdDelete::redactForLogging( mutablebson::Document* cmdObj ) {
+        redactTooLongLog( cmdObj, StringData( "deletes", StringData::LiteralTag() ) );
     }
 
     void CmdDelete::help( stringstream& help ) const {

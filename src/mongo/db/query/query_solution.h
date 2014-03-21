@@ -125,6 +125,23 @@ namespace mongo {
          */
         virtual const BSONObjSet& getSort() const = 0;
 
+        /**
+         * Make a deep copy.
+         */
+        virtual QuerySolutionNode* clone() const = 0;
+
+        /**
+         * Copy base query solution data from 'this' to 'other'.
+         */
+        void cloneBaseData(QuerySolutionNode* other) const {
+            for (size_t i = 0; i < this->children.size(); i++) {
+                other->children.push_back(this->children[i]->clone());
+            }
+            if (NULL != this->filter) {
+                other->filter.reset(this->filter->shallowClone());
+            }
+        }
+
         // These are owned here.
         vector<QuerySolutionNode*> children;
 
@@ -155,7 +172,7 @@ namespace mongo {
      * of stages.
      */
     struct QuerySolution {
-        QuerySolution() : hasSortStage(false) { }
+        QuerySolution() : hasBlockingStage(false), indexFilterApplied(false) { }
 
         // Owned here.
         scoped_ptr<QuerySolutionNode> root;
@@ -165,9 +182,20 @@ namespace mongo {
 
         string ns;
 
-        // XXX temporary: if it has a sort stage the sort wasn't provided by an index,
-        // so we use that index (if it exists) to provide a sort.
-        bool hasSortStage;
+        // There are two known scenarios in which a query solution might potentially block:
+        //
+        // Sort stage:
+        // If the solution has a sort stage, the sort wasn't provided by an index, so we might want
+        // to scan an index to provide that sort in a non-blocking fashion.
+        //
+        // Hashed AND stage:
+        // The hashed AND stage buffers data from multiple index scans and could block. In that case,
+        // we would want to fall back on an alternate non-blocking solution.
+        bool hasBlockingStage;
+
+        // Runner executing this solution might be interested in knowing
+        // if the planning process for this solution was based on filtered indices.
+        bool indexFilterApplied;
 
         // Owned here. Used by the plan cache.
         boost::scoped_ptr<SolutionCacheData> cacheData;
@@ -202,11 +230,18 @@ namespace mongo {
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sort; }
 
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sort;
 
-        BSONObj  _indexKeyPattern;
-        std::string _query;
-        std::string _language;
+        BSONObj  indexKeyPattern;
+        std::string query;
+        std::string language;
+
+        // "Prefix" fields of a text index can handle equality predicates.  We group them with the
+        // text node while creating the text leaf node and convert them into a BSONObj index prefix
+        // when we finish the text leaf node.
+        BSONObj indexPrefix;
     };
 
     struct CollectionScanNode : public QuerySolutionNode {
@@ -221,6 +256,8 @@ namespace mongo {
         bool hasField(const string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sort; }
+
+        QuerySolutionNode* clone() const;
 
         BSONObjSet _sort;
 
@@ -249,6 +286,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return children.back()->getSort(); }
 
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sort;
     };
 
@@ -264,6 +303,8 @@ namespace mongo {
         bool hasField(const string& field) const;
         bool sortedByDiskLoc() const { return true; }
         const BSONObjSet& getSort() const { return _sort; }
+
+        QuerySolutionNode* clone() const;
 
         BSONObjSet _sort;
     };
@@ -285,6 +326,8 @@ namespace mongo {
         }
         const BSONObjSet& getSort() const { return _sort; }
 
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sort;
 
         bool dedup;
@@ -303,6 +346,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return false; }
 
         const BSONObjSet& getSort() const { return _sorts; }
+
+        QuerySolutionNode* clone() const;
 
         virtual void computeProperties() {
             for (size_t i = 0; i < children.size(); ++i) {
@@ -331,6 +376,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sorts;
     };
 
@@ -348,6 +395,8 @@ namespace mongo {
         bool hasField(const string& field) const;
         bool sortedByDiskLoc() const;
         const BSONObjSet& getSort() const { return _sorts; }
+
+        QuerySolutionNode* clone() const;
 
         BSONObjSet _sorts;
 
@@ -370,7 +419,26 @@ namespace mongo {
     };
 
     struct ProjectionNode : public QuerySolutionNode {
-        ProjectionNode() { }
+        /**
+         * We have a few implementations of the projection functionality.  The most general
+         * implementation 'DEFAULT' is much slower than the fast-path implementations
+         * below.  We only really have all the information available to choose a projection
+         * implementation at planning time.
+         */
+        enum ProjectionType {
+            // This is the most general implementation of the projection functionality.  It handles
+            // every case.
+            DEFAULT,
+
+            // This is a fast-path for when the projection is fully covered by one index.
+            COVERED_ONE_INDEX,
+
+            // This is a fast-path for when the projection only has inclusions on non-dotted fields.
+            SIMPLE_DOC,
+        };
+
+        ProjectionNode() : fullExpression(NULL), projType(DEFAULT) { }
+
         virtual ~ProjectionNode() { }
 
         virtual StageType getType() const { return STAGE_PROJECTION; }
@@ -383,8 +451,11 @@ namespace mongo {
         bool fetched() const { return true; }
 
         bool hasField(const string& field) const {
-            // XXX XXX: perhaps have the QueryProjection pre-allocated and defer to it?  we don't
-            // know what we're dropping.  Until we push projection down this doesn't matter.
+            // TODO: Returning false isn't always the right answer -- we may either be including
+            // certain fields, or we may be dropping fields (in which case hasField returns true).
+            //
+            // Given that projection sits on top of everything else in .find() it doesn't matter
+            // what we do here.
             return false;
         }
 
@@ -403,6 +474,8 @@ namespace mongo {
             return _sorts;
         }
 
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sorts;
 
         // The full query tree.  Needed when we have positional operators.
@@ -412,6 +485,14 @@ namespace mongo {
         // Given that we don't yet have a MatchExpression analogue for the expression language, we
         // use a BSONObj.
         BSONObj projection;
+
+        // What implementation of the projection algorithm should we use?
+        ProjectionType projType;
+
+        // Only meaningful if projType == COVERED_ONE_INDEX.  This is the key pattern of the index
+        // supplying our covered data.  We can pre-compute which fields to include and cache that
+        // data for later if we know we only have one index.
+        BSONObj coveredKeyObj;
     };
 
     struct SortNode : public QuerySolutionNode {
@@ -427,6 +508,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return false; }
 
         const BSONObjSet& getSort() const { return _sorts; }
+
+        QuerySolutionNode* clone() const;
 
         virtual void computeProperties() {
             for (size_t i = 0; i < children.size(); ++i) {
@@ -459,6 +542,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
 
+        QuerySolutionNode* clone() const;
+
         int limit;
     };
 
@@ -473,6 +558,8 @@ namespace mongo {
         bool hasField(const string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
+
+        QuerySolutionNode* clone() const;
 
         int skip;
     };
@@ -496,6 +583,8 @@ namespace mongo {
         const BSONObjSet& getSort() const { return _sorts; }
         BSONObjSet _sorts;
 
+        QuerySolutionNode* clone() const;
+
         BSONObj indexKeyPattern;
         GeoQuery gq;
     };
@@ -512,6 +601,9 @@ namespace mongo {
         bool hasField(const string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sorts; }
+
+        QuerySolutionNode* clone() const;
+
         BSONObjSet _sorts;
 
         NearQuery nq;
@@ -533,6 +625,8 @@ namespace mongo {
         bool hasField(const string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return _sorts; }
+
+        QuerySolutionNode* clone() const;
 
         BSONObjSet _sorts;
 
@@ -565,6 +659,8 @@ namespace mongo {
         bool hasField(const string& field) const { return children[0]->hasField(field); }
         bool sortedByDiskLoc() const { return children[0]->sortedByDiskLoc(); }
         const BSONObjSet& getSort() const { return children[0]->getSort(); }
+
+        QuerySolutionNode* clone() const;
     };
 
     /**
@@ -588,6 +684,8 @@ namespace mongo {
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
 
+        QuerySolutionNode* clone() const;
+
         // Since we merge in flagged results we have no sort order.
         BSONObjSet sorts;
     };
@@ -605,10 +703,13 @@ namespace mongo {
 
         // This stage is created "on top" of normal planning and as such the properties
         // below don't really matter.
-        bool fetched() const { return true; }
+        bool fetched() const { return false; }
         bool hasField(const string& field) const { return !indexKeyPattern[field].eoo(); }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
+
+        QuerySolutionNode* clone() const;
+
         BSONObjSet sorts;
 
         BSONObj indexKeyPattern;
@@ -633,6 +734,9 @@ namespace mongo {
         bool hasField(const string& field) const { return true; }
         bool sortedByDiskLoc() const { return false; }
         const BSONObjSet& getSort() const { return sorts; }
+
+        QuerySolutionNode* clone() const;
+
         BSONObjSet sorts;
 
         BSONObj indexKeyPattern;

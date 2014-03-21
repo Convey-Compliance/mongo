@@ -34,8 +34,9 @@
 
 #include "mongo/db/db.h"
 #include "mongo/db/index/btree_key_generator.h"
-#include "mongo/db/index/hash_access_method.h"
+#include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index_legacy.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/queryutil.h"
@@ -66,7 +67,7 @@ namespace NamespaceTests {
 
                 BSONObj bobj = builder.done();
 
-                _index.reset( new IndexDescriptor( NULL, bobj ) );
+                _index.reset( new IndexDescriptor( NULL, IndexNames::BTREE, bobj ) );
 
                 _keyPattern = key().getOwned();
 
@@ -986,10 +987,10 @@ namespace NamespaceTests {
 
                 // Call getKeys on the nullObj.
                 BSONObjSet nullFieldKeySet;
-                HashAccessMethod::getKeysImpl(nullObj, "a", 0, 0, false, &nullFieldKeySet);
+                ExpressionKeysPrivate::getHashKeys(nullObj, "a", 0, 0, false, &nullFieldKeySet);
                 BSONElement nullFieldFromKey = nullFieldKeySet.begin()->firstElement();
 
-                ASSERT_EQUALS( HashAccessMethod::makeSingleKey( nullObj.firstElement(), 0, 0 ),
+                ASSERT_EQUALS( ExpressionKeysPrivate::makeSingleHashKey( nullObj.firstElement(), 0, 0 ),
                                nullFieldFromKey.Long() );
 
                 BSONObj missingField = IndexLegacy::getMissingField(NULL,spec);
@@ -1009,10 +1010,10 @@ namespace NamespaceTests {
                 BSONObj nullObj = BSON( "a" << BSONNULL );
 
                 BSONObjSet nullFieldKeySet;
-                HashAccessMethod::getKeysImpl(nullObj, "a", 0x5eed, 0, false, &nullFieldKeySet);
+                ExpressionKeysPrivate::getHashKeys(nullObj, "a", 0x5eed, 0, false, &nullFieldKeySet);
                 BSONElement nullFieldFromKey = nullFieldKeySet.begin()->firstElement();
 
-                ASSERT_EQUALS( HashAccessMethod::makeSingleKey( nullObj.firstElement(), 0x5eed, 0 ),
+                ASSERT_EQUALS( ExpressionKeysPrivate::makeSingleHashKey( nullObj.firstElement(), 0x5eed, 0 ),
                                nullFieldFromKey.Long() );
 
                 // Ensure that getMissingField recognizes that the seed is different (and returns
@@ -1429,6 +1430,7 @@ namespace NamespaceTests {
         public:
             void run() {
                 create();
+                ASSERT( nsd()->isCapped() );
                 ASSERT( !nsd()->isUserFlagSet( NamespaceDetails::Flag_UsePowerOf2Sizes ) );
                 DiskLoc loc = nsd()->alloc( collection(), ns(), 300 );
                 ASSERT_EQUALS( 300, loc.rec()->lengthWithHeaders() );

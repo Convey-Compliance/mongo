@@ -173,6 +173,13 @@ namespace mongo {
 
             virtual void aggregateResults(const vector<BSONObj>& results, BSONObjBuilder& output) {}
 
+            virtual BSONObj specialErrorHandler( const string& server,
+                                                 const string& dbName,
+                                                 const BSONObj& cmdObj,
+                                                 const BSONObj& originalResult ) const {
+                return originalResult;
+            }
+
             // don't override
             virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& output, bool) {
                 LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj << endl;
@@ -193,32 +200,51 @@ namespace mongo {
 
                 for ( list< shared_ptr<Future::CommandResult> >::iterator i=futures.begin(); i!=futures.end(); i++ ) {
                     shared_ptr<Future::CommandResult> res = *i;
-                    if ( ! res->join() ) {
 
+                    if ( res->join() ) {
+                        // success :)
                         BSONObj result = res->result();
+                        results.push_back( result );
+                        subobj.append( res->getServer(), result );
+                        continue;
+                    }
 
-                        // Handle "errmsg".
-                        if( ! result["errmsg"].eoo() ){
-                            errors.appendAs(res->result()["errmsg"], res->getServer());
-                        }
-                        else {
+                    BSONObj result = res->result();
 
-                            // Can happen if message is empty, for some reason
-                            errors.append( res->getServer(), str::stream()
-                                << "result without error message returned : " << result );
-                        }
+                    if ( result["errmsg"].type() ||
+                         result["code"].numberInt() != 0 ) {
+                        result = specialErrorHandler( res->getServer(), dbName, cmdObj, result );
 
-                        // Handle "code".
-                        int errCode = result["code"].numberInt();
-                        if ( commonErrCode == -1 ) {
-                            commonErrCode = errCode;
-                        }
-                        else if ( commonErrCode != errCode ) {
-                            commonErrCode = 0;
+                        BSONElement errmsg = result["errmsg"];
+                        if ( errmsg.eoo() || errmsg.String().empty() ) {
+                            // it was fixed!
+                            results.push_back( result );
+                            subobj.append( res->getServer(), result );
+                            continue;
                         }
                     }
-                    results.push_back( res->result() );
-                    subobj.append( res->getServer() , res->result() );
+
+                    // Handle "errmsg".
+                    if( ! result["errmsg"].eoo() ){
+                        errors.appendAs(result["errmsg"], res->getServer());
+                    }
+                    else {
+                        // Can happen if message is empty, for some reason
+                        errors.append( res->getServer(), str::stream() <<
+                                       "result without error message returned : " << result );
+                    }
+
+                    // Handle "code".
+                    int errCode = result["code"].numberInt();
+                    if ( commonErrCode == -1 ) {
+                        commonErrCode = errCode;
+                    }
+                    else if ( commonErrCode != errCode ) {
+                        commonErrCode = 0;
+                    }
+
+                    results.push_back( result );
+                    subobj.append( res->getServer(), result );
                 }
 
                 subobj.done();
@@ -298,6 +324,98 @@ namespace mongo {
         class CreateIndexesCmd : public AllShardsCollectionCommand {
         public:
             CreateIndexesCmd() :  AllShardsCollectionCommand("createIndexes") {}
+
+            /**
+             * the createIndexes command doesn't require the 'ns' field to be populated
+             * so we make sure its here as its needed for the system.indexes insert
+             */
+            BSONObj fixSpec( const NamespaceString& ns, const BSONObj& original ) const {
+                if ( original["ns"].type() == String )
+                    return original;
+                BSONObjBuilder bb;
+                bb.appendElements( original );
+                bb.append( "ns", ns.toString() );
+                return bb.obj();
+            }
+
+            /**
+             * @return equivalent of gle
+             */
+            BSONObj createIndexLegacy( const string& server,
+                                       const NamespaceString& nss,
+                                       const BSONObj& spec ) const {
+                try {
+                    ScopedDbConnection conn( server );
+                    conn->insert( nss.getSystemIndexesCollection(), spec );
+                    BSONObj gle = conn->getLastErrorDetailed( nss.db().toString() );
+                    conn.done();
+                    return gle;
+                }
+                catch ( DBException& e ) {
+                    BSONObjBuilder b;
+                    b.append( "errmsg", e.toString() );
+                    b.append( "code", e.getCode() );
+                    return b.obj();
+                }
+            }
+
+            virtual BSONObj specialErrorHandler( const string& server,
+                                                 const string& dbName,
+                                                 const BSONObj& cmdObj,
+                                                 const BSONObj& originalResult ) const {
+                string errmsg = originalResult["errmsg"];
+                if ( errmsg.find( "no such cmd" ) == string::npos ) {
+                    // cannot use codes as 2.4 didn't have a code for this
+                    return originalResult;
+                }
+
+                // we need to down convert
+
+                NamespaceString nss( dbName, cmdObj["createIndexes"].String() );
+
+                if ( cmdObj["indexes"].type() != Array )
+                    return originalResult;
+
+                BSONObjBuilder newResult;
+                newResult.append( "note", "downgraded" );
+                newResult.append( "sentTo", server );
+
+                BSONArrayBuilder individualResults;
+
+                bool ok = true;
+
+                BSONObjIterator indexIterator( cmdObj["indexes"].Obj() );
+                while ( indexIterator.more() ) {
+                    BSONObj spec = indexIterator.next().Obj();
+                    spec = fixSpec( nss, spec );
+
+                    BSONObj gle = createIndexLegacy( server, nss, spec );
+
+                    individualResults.append( BSON( "spec" << spec <<
+                                                    "gle" << gle ) );
+
+                    BSONElement e = gle["errmsg"];
+                    if ( e.type() == String && e.String().size() > 0 ) {
+                        ok = false;
+                        newResult.appendAs( e, "errmsg" );
+                        break;
+                    }
+
+                    e = gle["err"];
+                    if ( e.type() == String && e.String().size() > 0 ) {
+                        ok = false;
+                        newResult.appendAs( e, "errmsg" );
+                        break;
+                    }
+
+                }
+
+                newResult.append( "eachIndex", individualResults.arr() );
+
+                newResult.append( "ok", ok ? 1 : 0 );
+                return newResult.obj();
+            }
+
             virtual void addRequiredPrivileges(const std::string& dbname,
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {
@@ -305,6 +423,7 @@ namespace mongo {
                 actions.addAction(ActionType::createIndex);
                 out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
             }
+
         } createIndexesCmd;
 
         class ReIndexCmd : public AllShardsCollectionCommand {
@@ -415,6 +534,9 @@ namespace mongo {
                 long long indexSize = 0;
                 long long fileSize = 0;
 
+                long long freeListNum = 0;
+                long long freeListSize = 0;
+
                 for (vector<BSONObj>::const_iterator it(results.begin()), end(results.end()); it != end; ++it) {
                     const BSONObj& b = *it;
                     objects     += b["objects"].numberLong();
@@ -425,6 +547,11 @@ namespace mongo {
                     indexes     += b["indexes"].numberLong();
                     indexSize   += b["indexSize"].numberLong();
                     fileSize    += b["fileSize"].numberLong();
+
+                    if ( b["extentFreeList"].isABSONObj() ) {
+                        freeListNum += b["extentFreeList"].Obj()["num"].numberLong();
+                        freeListSize += b["extentFreeList"].Obj()["totalSize"].numberLong();
+                    }
                 }
 
                 //result.appendNumber( "collections" , ncollections ); //TODO: need to find a good way to get this
@@ -439,6 +566,13 @@ namespace mongo {
                 output.appendNumber( "indexes" , indexes );
                 output.appendNumber( "indexSize" , indexSize );
                 output.appendNumber( "fileSize" , fileSize );
+
+                {
+                    BSONObjBuilder extentFreeList( output.subobjStart( "extentFreeList" ) );
+                    extentFreeList.appendNumber( "num", freeListNum );
+                    extentFreeList.appendNumber( "totalSize", freeListSize );
+                    extentFreeList.done();
+                }
             }
         } DBStatsCmdObj;
 
@@ -1407,6 +1541,37 @@ namespace mongo {
             }
         } geo2dFindNearCmd;
 
+        /**
+         * Outline for sharded map reduce for sharded output, $out replace:
+         *
+         * ============= mongos =============
+         * 1. Send map reduce command to all relevant shards with some extra info like
+         *    the value for the chunkSize and the name of the temporary output collection.
+         *
+         * ============= shard =============
+         * 2. Does normal map reduce.
+         * 3. Calls splitVector on itself against the output collection and puts the results
+         *    to the response object.
+         *
+         * ============= mongos =============
+         * 4. If the output collection is *not* sharded, uses the information from splitVector
+         *    to create a pre-split sharded collection.
+         * 5. Grabs the distributed lock for the final output collection.
+         * 6. Sends mapReduce.shardedfinish.
+         *
+         * ============= shard =============
+         * 7. Extracts the list of shards from the mapReduce.shardedfinish and performs a
+         *    broadcast query against all of them to obtain all documents that this shard owns.
+         * 8. Performs the reduce operation against every document from step #7 and outputs them
+         *    to another temporary collection. Also keeps track of the BSONObject size of
+         *    the every "reduced" documents for each chunk range.
+         * 9. Atomically drops the old output collection and renames the temporary collection to
+         *    the output collection.
+         *
+         * ============= mongos =============
+         * 10. Releases the distributed lock acquired at step #5.
+         * 11. Inspects the BSONObject size from step #8 and determines if it needs to split.
+         */
         class MRCmd : public PublicGridCommand {
         public:
             AtomicUInt JOB_NUMBER;
@@ -1921,6 +2086,8 @@ namespace mongo {
             bool doAnyShardsNotSupportCursors(const vector<Strategy::CommandResult>& shardResults);
             bool wasMergeCursorsSupported(BSONObj cmdResult);
             void uassertCanMergeInMongos(intrusive_ptr<Pipeline> mergePipeline, BSONObj cmdObj);
+            void uassertAllShardsSupportExplain(
+                const vector<Strategy::CommandResult>& shardResults);
 
             void noCursorFallback(intrusive_ptr<Pipeline> shardPipeline,
                                   intrusive_ptr<Pipeline> mergePipeline,
@@ -1998,7 +2165,11 @@ namespace mongo {
                 commandBuilder.setField("$queryOptions", Value(cmdObj["$queryOptions"]));
             }
 
-            commandBuilder.setField("cursor", Value(DOC("batchSize" << 0)));
+            if (!pPipeline->isExplain()) {
+                // "cursor" is ignored by 2.6 shards when doing explain, but including it leads to a
+                // worse error message when talking to 2.4 shards.
+                commandBuilder.setField("cursor", Value(DOC("batchSize" << 0)));
+            }
 
             if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
                 commandBuilder.setField(LiteParsedQuery::cmdOptionMaxTimeMS,
@@ -2014,6 +2185,9 @@ namespace mongo {
             STRATEGY->commandOp(dbName, shardedCommand, options, fullns, shardQuery, &shardResults);
 
             if (pPipeline->isExplain()) {
+                // This must be checked before we start modifying result.
+                uassertAllShardsSupportExplain(shardResults);
+
                 result << "splitPipeline" << DOC("shardsPart" << pShardPipeline->writeExplainOps()
                                               << "mergerPart" << pPipeline->writeExplainOps());
 
@@ -2184,6 +2358,19 @@ namespace mongo {
             return false;
         }
 
+        void PipelineCommand::uassertAllShardsSupportExplain(
+                const vector<Strategy::CommandResult>& shardResults) {
+            for (size_t i = 0; i < shardResults.size(); i++) {
+                    uassert(17403, str::stream() << "Shard " << shardResults[i].target.toString()
+                                                 << " failed: " << shardResults[i].result,
+                            shardResults[i].result["ok"].trueValue());
+
+                    uassert(17404, str::stream() << "Shard " << shardResults[i].target.toString()
+                                                 << " does not support $explain",
+                            shardResults[i].result.hasField("stages"));
+            }
+        }
+
         bool PipelineCommand::wasMergeCursorsSupported(BSONObj cmdResult) {
             // Note: all other errors are returned directly
             // This is the result of using $mergeCursors on a mongod <2.6.
@@ -2247,7 +2434,7 @@ namespace mongo {
                                          << conn->toString(),
                     cursor && cursor->more());
 
-            BSONObj result = cursor->next().getOwned();
+            BSONObj result = cursor->nextSafe().getOwned();
             storePossibleCursor(cursor->originalHost(), result);
             return result;
         }

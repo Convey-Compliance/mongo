@@ -241,6 +241,7 @@ if ( typeof _threadInject != "undefined" ){
                                    "jstests/currentop.js", // SERVER-8673, plus rwlock yielding issues
                                    "jstests/set_param1.js", // changes global state
                                    "jstests/geo_update_btree2.js", // SERVER-11132 test disables table scans
+                                   "jstests/update_setOnInsert.js", // SERVER-9982
                                   ] );
         
         // some tests can't be run in parallel with each other
@@ -431,37 +432,7 @@ jsTest.randomize = function( seed ) {
     print( "Random seed for test : " + seed ) 
 }
 
-/**
-* Adds a user to the admin DB on the given connection. This is only used for running the test suite
-* with authentication enabled.
-*/
-jsTest.addAuth = function(conn) {
-    // Get a connection over localhost so that the first user can be added.
-    var localconn = conn;
-    if ( localconn.host.indexOf('localhost') != 0 ) {
-        print( 'Getting locahost connection instead of ' + conn + ' to add first admin user' );
-        var hosts = conn.host.split(',');
-        for ( var i = 0; i < hosts.length; i++ ) {
-            hosts[i] = 'localhost:' + hosts[i].split(':')[1];
-        }
-        localconn = new Mongo(hosts.join(','));
-    }
-    print ("Adding admin user on connection: " + localconn);
-    try {
-        localconn._skipAuth = true; // Make sure we don't try to authenticate the conn while adding the user
-        return localconn.getDB('admin').createUser({user: jsTestOptions().adminUser,
-                                                    pwd: jsTestOptions().adminPassword,
-                                                    roles: ["__system"]},
-                                                   {w: 'majority', wtimeout: 60000});
-    } finally {
-        localconn._skipAuth = false;
-    }
-}
-
 jsTest.authenticate = function(conn) {
-    if (conn._skipAuth) { // To prevent us from trying to authenticate while in the process of adding user.
-        return true;
-    }
     if (!jsTest.options().auth && !jsTest.options().keyFile && !jsTest.options().useX509) {
         conn.authenticated = true;
         return true;
@@ -472,13 +443,12 @@ jsTest.authenticate = function(conn) {
             // Set authenticated to stop an infinite recursion from getDB calling
             // back into authenticate.
             conn.authenticated = true;
-            print ("Authenticating to admin database as " +
-                   jsTestOptions().adminUser + " with mechanism " +
+            print ("Authenticating as internal " + jsTestOptions().authUser + " user with mechanism " +
                    DB.prototype._defaultAuthenticationMechanism +
                    " on connection: " + conn);
             conn.authenticated = conn.getDB('admin').auth({
-                user: jsTestOptions().adminUser,
-                pwd: jsTestOptions().adminPassword
+                user: jsTestOptions().authUser,
+                pwd: jsTestOptions().authPassword,
             });
             return conn.authenticated;
         }, "Authenticating connection: " + conn, 5000, 1000);
@@ -625,16 +595,21 @@ if (typeof(_useWriteCommandsDefault) == 'undefined') {
     _useWriteCommandsDefault = function() { return false; };
 };
 
+if (typeof(_writeMode) == 'undefined') {
+    // This is for cases when the v8 engine is used other than the mongo shell, like map reduce.
+    _writeMode = function() { return "commands"; };
+};
+
 shellPrintHelper = function (x) {
     if (typeof (x) == "undefined") {
         // Make sure that we have a db var before we use it
         // TODO: This implicit calling of GLE can cause subtle, hard to track issues - remove?
         if (__callLastError && typeof( db ) != "undefined" &&
                 db.getMongo &&
-                !db.getMongo().useWriteCommands) {
+                db.getMongo().writeMode() == "legacy") {
 
             __callLastError = false;
-            // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad.
+            // explicit w:1 so that replset getLastErrorDefaults aren't used here which would be bad
             var err = db.getLastError(1);
             if (err != null) {
                 print(err);
@@ -912,7 +887,7 @@ shellHelper.show = function (what) {
             });
         });
 
-        dbinfo.sort(function (a,b) { a.name - b.name });
+        dbinfo.sort(compareOn('name'))
         dbinfo.forEach(function (db) {
             var namePadding = maxNameLength - db.name_size;
             var sizePadding = maxGbDigits   - db.gb_digits;

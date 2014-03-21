@@ -29,6 +29,7 @@
 #include "mongo/s/write_ops/batch_write_exec.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/base/owned_pointer_map.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/dbclientinterface.h" // ConnectionString (header-only)
@@ -54,7 +55,9 @@ namespace mongo {
         //
 
         // TODO: Unordered map?
-        typedef map<ConnectionString, TargetedWriteBatch*, ConnectionStringComp> HostBatchMap;
+        typedef OwnedPointerMap<ConnectionString,
+                                TargetedWriteBatch,
+                                ConnectionStringComp> OwnedHostBatchMap;
     }
 
     static void buildErrorFrom( const Status& status, WriteErrorDetail* error ) {
@@ -121,7 +124,8 @@ namespace mongo {
             //    exactly when the metadata changed.
             //
 
-            vector<TargetedWriteBatch*> childBatches;
+            OwnedPointerVector<TargetedWriteBatch> childBatchesOwned;
+            vector<TargetedWriteBatch*>& childBatches = childBatchesOwned.mutableVector();
 
             // If we've already had a targeting error, we've refreshed the metadata once and can
             // record target errors definitively.
@@ -147,7 +151,8 @@ namespace mongo {
             while ( numSent != numToSend ) {
 
                 // Collect batches out on the network, mapped by endpoint
-                HostBatchMap pendingBatches;
+                OwnedHostBatchMap ownedPendingBatches;
+                OwnedHostBatchMap::MapType& pendingBatches = ownedPendingBatches.mutableMap();
 
                 //
                 // Send side
@@ -182,13 +187,15 @@ namespace mongo {
                         batchOp.noteBatchError( *nextBatch, error );
 
                         // We're done with this batch
+                        // Clean up when we can't resolve a host
+                        delete *it;
                         *it = NULL;
                         --numToSend;
                         continue;
                     }
 
                     // If we already have a batch for this host, wait until the next time
-                    HostBatchMap::iterator pendingIt = pendingBatches.find( shardHost );
+                    OwnedHostBatchMap::MapType::iterator pendingIt = pendingBatches.find( shardHost );
                     if ( pendingIt != pendingBatches.end() ) continue;
 
                     //
@@ -232,8 +239,7 @@ namespace mongo {
 
                     // Get the TargetedWriteBatch to find where to put the response
                     dassert( pendingBatches.find( shardHost ) != pendingBatches.end() );
-                    TargetedWriteBatch* batchRaw = pendingBatches.find( shardHost )->second;
-                    scoped_ptr<TargetedWriteBatch> batch( batchRaw );
+                    TargetedWriteBatch* batch = pendingBatches.find( shardHost )->second;
 
                     if ( dispatchStatus.isOK() ) {
 
@@ -269,8 +275,14 @@ namespace mongo {
                     else {
 
                         // Error occurred dispatching, note it
+
+                        stringstream msg;
+                        msg << "write results unavailable from " << shardHost.toString()
+                            << causedBy( dispatchStatus.toString() );
+
                         WriteErrorDetail error;
-                        buildErrorFrom( dispatchStatus, &error );
+                        buildErrorFrom( Status( ErrorCodes::RemoteResultsUnavailable, msg.str() ),
+                                        &error );
                         batchOp.noteBatchError( *batch, error );
                     }
                 }
@@ -323,7 +335,7 @@ namespace mongo {
 
                 WriteErrorDetail error;
                 buildErrorFrom( Status( ErrorCodes::NoProgressMade, msg.str() ), &error );
-                batchOp.setBatchError( error );
+                batchOp.abortBatch( error );
                 break;
             }
         }

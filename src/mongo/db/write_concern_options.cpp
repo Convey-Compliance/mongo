@@ -37,12 +37,27 @@ namespace mongo {
     const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
 
     Status WriteConcernOptions::parse( const BSONObj& obj ) {
+        if ( obj.isEmpty() ) {
+            return Status( ErrorCodes::FailedToParse, "write concern object cannot be empty" );
+        }
 
-        bool j = obj["j"].trueValue();
-        bool fsync = obj["fsync"].trueValue();
+        BSONElement jEl = obj["j"];
+        if ( !jEl.eoo() && !jEl.isNumber() && jEl.type() != Bool ) {
+            return Status( ErrorCodes::FailedToParse, "j must be numeric or a boolean value" );
+        }
 
-        if ( j & fsync )
-            return Status( ErrorCodes::BadValue, "fsync and j options cannot be used together" );
+        const bool j = jEl.trueValue();
+
+        BSONElement fsyncEl = obj["fsync"];
+        if ( !fsyncEl.eoo() && !fsyncEl.isNumber() && fsyncEl.type() != Bool ) {
+            return Status( ErrorCodes::FailedToParse, "fsync must be numeric or a boolean value" );
+        }
+
+        const bool fsync = fsyncEl.trueValue();
+
+        if ( j && fsync )
+            return Status( ErrorCodes::FailedToParse,
+                           "fsync and j options cannot be used together" );
 
         if ( j ) {
             syncMode = JOURNAL;
@@ -61,9 +76,10 @@ namespace mongo {
         else if ( e.eoo() ||
                   e.type() == jstNULL ||
                   e.type() == Undefined ) {
+            wNumNodes = 1;
         }
         else {
-            return Status( ErrorCodes::BadValue, "w has to be a number or a string" );
+            return Status( ErrorCodes::FailedToParse, "w has to be a number or a string" );
         }
 
         wTimeout = obj["wtimeout"].numberInt();

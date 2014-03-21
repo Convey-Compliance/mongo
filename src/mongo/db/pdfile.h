@@ -40,7 +40,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/diskloc.h"
-#include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/storage/data_file.h"
 #include "mongo/db/storage/durable_mapped_file.h"
 #include "mongo/db/storage/extent.h"
@@ -59,13 +58,11 @@ namespace mongo {
     class Record;
 
     void dropDatabase(const std::string& db);
-    bool repairDatabase(string db, string &errmsg, bool preserveClonedFilesOnFailure = false, bool backupOriginalFiles = false);
 
-    bool userCreateNS(const char *ns, BSONObj j, string& err, bool logForReplication, bool *deferIdIndex = 0);
+    bool userCreateNS(const char *ns, BSONObj j, string& err,
+                      bool logForReplication, bool createDefaultIndexes = true );
 
     /*---------------------------------------------------------------------*/
-
-    boost::intmax_t dbSize( const char *database );
 
     inline NamespaceIndex* nsindex(const StringData& ns) {
         Database *database = cc().database();

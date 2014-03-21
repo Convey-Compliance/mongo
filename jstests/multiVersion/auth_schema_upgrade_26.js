@@ -150,8 +150,8 @@ load('jstests/multiVersion/libs/multi_rs.js');
         upgrade : "",
         keyFile: keyfile
     });
-    assert.neq(null, mongos);
-    MongoRunner.stopMongos(mongos);
+    assert.eq(null, mongos);
+
     shardingTest.upgradeCluster(newVersion, { upgradeMetadata: true });
     asClusterAdmin(shardingTest.config.getMongo(), function restartBalancerAsAdmin() {
         shardingTest.startBalancer();
@@ -177,7 +177,7 @@ load('jstests/multiVersion/libs/multi_rs.js');
         "Expected RemoteValidationFailed error code");
     MongoRunner.stopMongos(oldMongoS);
 
-    s0AdminConn.getDB("config").mongos.remove();
+    s0AdminConn.getDB("config").mongos.remove({});
     assert.gleSuccess(s0AdminConn.getDB("config"), "Flushing ping time data failed.");
 
     print('\n--------------------\n' +

@@ -31,6 +31,7 @@
 #include "mongo/db/exec/and_common-inl.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -75,7 +76,7 @@ namespace mongo {
         verify(DiskLoc() == _targetLoc);
 
         // Pick one, and get a loc to work toward.
-        WorkingSetID id;
+        WorkingSetID id = WorkingSet::INVALID_ID;
         StageState state = _children[0]->work(&id);
 
         if (PlanStage::ADVANCED == state) {
@@ -103,7 +104,21 @@ namespace mongo {
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
-        else if (PlanStage::IS_EOF == state || PlanStage::FAILURE == state) {
+        else if (PlanStage::IS_EOF == state) {
+            _isEOF = true;
+            return state;
+        }
+        else if (PlanStage::FAILURE == state) {
+            *out = id;
+            // If a stage fails, it may create a status WSM to indicate why it
+            // failed, in which case 'id' is valid.  If ID is invalid, we
+            // create our own error message.
+            if (WorkingSet::INVALID_ID == id) {
+                mongoutils::str::stream ss;
+                ss << "sorted AND stage failed to read in results from first child";
+                Status status(ErrorCodes::InternalError, ss);
+                *out = WorkingSetCommon::allocateStatusMember( _ws, status);
+            }
             _isEOF = true;
             return state;
         }
@@ -128,7 +143,7 @@ namespace mongo {
         // We have nodes that haven't hit _targetLoc yet.
         size_t workingChildNumber = _workingTowardRep.front();
         PlanStage* next = _children[workingChildNumber];
-        WorkingSetID id;
+        WorkingSetID id = WorkingSet::INVALID_ID;
         StageState state = next->work(&id);
 
         if (PlanStage::ADVANCED == state) {
@@ -206,7 +221,22 @@ namespace mongo {
                 return PlanStage::NEED_TIME;
             }
         }
-        else if (PlanStage::IS_EOF == state || PlanStage::FAILURE == state) {
+        else if (PlanStage::IS_EOF == state) {
+            _isEOF = true;
+            _ws->free(_targetId);
+            return state;
+        }
+        else if (PlanStage::FAILURE == state) {
+            *out = id;
+            // If a stage fails, it may create a status WSM to indicate why it
+            // failed, in which case 'id' is valid.  If ID is invalid, we
+            // create our own error message.
+            if (WorkingSet::INVALID_ID == id) {
+                mongoutils::str::stream ss;
+                ss << "sorted AND stage failed to read in results from child " << workingChildNumber;
+                Status status(ErrorCodes::InternalError, ss);
+                *out = WorkingSetCommon::allocateStatusMember( _ws, status);
+            }
             _isEOF = true;
             _ws->free(_targetId);
             return state;

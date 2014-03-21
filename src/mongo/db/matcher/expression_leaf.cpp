@@ -118,12 +118,6 @@ namespace mongo {
             return false;
         }
 
-        if ( _rhs.type() == Array ) {
-            if ( matchType() != EQ ) {
-                return false;
-            }
-        }
-
         int x = compareElementValues( e, _rhs );
 
         //log() << "\t\t" << x << endl;
@@ -244,6 +238,10 @@ namespace mongo {
             td->debugString(&debug);
         }
         debug << "\n";
+    }
+
+    void RegexMatchExpression::shortDebugString( StringBuilder& debug ) const {
+        debug << "/" << _regex << "/" << _flags;
     }
 
     // ---------
@@ -439,6 +437,18 @@ namespace mongo {
             toFillIn._regexes.push_back( static_cast<RegexMatchExpression*>(_regexes[i]->shallowClone()) );
     }
 
+    void ArrayFilterEntries::debugString( StringBuilder& debug ) const {
+        debug << "[ ";
+        for (BSONElementSet::const_iterator it = _equalities.begin();
+                it != _equalities.end(); ++it) {
+            debug << it->toString( false ) << " ";
+        }
+        for (size_t i = 0; i < _regexes.size(); ++i) {
+            _regexes[i]->shortDebugString( debug );
+            debug << " ";
+        }
+        debug << "]";
+    }
 
     // -----------
 
@@ -481,7 +491,8 @@ namespace mongo {
 
     void InMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << ";$in: TODO ";
+        debug << path() << " $in ";
+        _arrayEntries.debugString(debug);
         MatchExpression::TagData* td = getTag();
         if (NULL != td) {
             debug << " ";

@@ -58,7 +58,6 @@ namespace mongo {
      */
     struct AuthInfo {
         User* user;
-        BSONObj authParams;
     };
     extern AuthInfo internalSecurity; // set at startup and not changed after initialization.
 
@@ -77,7 +76,7 @@ namespace mongo {
         static const std::string USER_NAME_FIELD_NAME;
         static const std::string USER_DB_FIELD_NAME;
         static const std::string ROLE_NAME_FIELD_NAME;
-        static const std::string ROLE_SOURCE_FIELD_NAME;
+        static const std::string ROLE_SOURCE_FIELD_NAME; // TODO: rename to ROLE_DB_FIELD_NAME
         static const std::string PASSWORD_FIELD_NAME;
         static const std::string V1_USER_NAME_FIELD_NAME;
         static const std::string V1_USER_SOURCE_FIELD_NAME;
@@ -88,6 +87,8 @@ namespace mongo {
         static const NamespaceString usersBackupCollectionNamespace;
         static const NamespaceString usersCollectionNamespace;
         static const NamespaceString versionCollectionNamespace;
+        static const NamespaceString defaultTempUsersCollectionNamespace; // for mongorestore
+        static const NamespaceString defaultTempRolesCollectionNamespace; // for mongorestore
 
         /**
          * Query to match the auth schema version document in the versionCollectionNamespace.
@@ -167,9 +168,13 @@ namespace mongo {
         bool isAuthEnabled() const;
 
         /**
-         * Returns the version number of the authorization system.
+         * Returns via the output parameter "version" the version number of the authorization
+         * system.  Returns Status::OK() if it was able to successfully fetch the current
+         * authorization version.  If it has problems fetching the most up to date version it
+         * returns a non-OK status.  When returning a non-OK status, *version will be set to
+         * schemaVersionInvalid (0).
          */
-        int getAuthorizationVersion();
+        Status getAuthorizationVersion(int* version);
 
         // Returns true if there exists at least one privilege document in the system.
         bool hasAnyPrivilegeDocuments() const;
@@ -237,7 +242,7 @@ namespace mongo {
                                     bool upsert,
                                     bool multi,
                                     const BSONObj& writeConcern,
-                                    int* numUpdated) const;
+                                    int* nMatched) const;
 
         /*
          * Removes roles matching the given query.

@@ -31,7 +31,6 @@
 #pragma once
 
 #include <string>
-#include <list>
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_cursor_cache.h"
@@ -42,8 +41,6 @@
 #include "mongo/db/structure/record_store.h"
 #include "mongo/db/catalog/collection_info_cache.h"
 #include "mongo/platform/cstdint.h"
-#include "boost/asio/detail/event.hpp"
-#include "mongo/util/concurrency/rwlock.h"
 #include "mongo/util/concurrency/synchronization.h"
 
 namespace mongo {
@@ -52,6 +49,7 @@ namespace mongo {
     class ExtentManager;
     class NamespaceDetails;
     class IndexCatalog;
+    class MultiIndexBlock;
 
     class CollectionIterator;
     class FlatIterator;
@@ -164,6 +162,8 @@ namespace mongo {
 
         StatusWith<DiskLoc> insertDocument( const DocWriter* doc, bool enforceQuota );
 
+        StatusWith<DiskLoc> insertDocument( const BSONObj& doc, MultiIndexBlock& indexBlock );
+
         /**
          * updates the document @ oldLocation with newDoc
          * if the document fits in the old space, it is put there
@@ -206,23 +206,26 @@ namespace mongo {
                 return 5;
             return static_cast<int>( dataSize() / n );
         }
-
-        void subscribeToChange(NotifyAll* sig);
-        void unsubcribeToChange(NotifyAll* sig);
+        
         /* For now triggerChangeSubscribersNotification() used only to awake waiters on capped collection
            cursor while waiting */
         void triggerChangeSubscribersNotification();
 
+        /* subscribers to event of new document inserted into capped collection should call this method 
+           and wait to be awakened */
+        bool waitForDocumentInsertedEvent( NotifyAll::When when, int timeout );
+        NotifyAll::When documentInsertedNotificationNow();
     private:
         /**
          * same semantics as insertDocument, but doesn't do:
          *  - some user error checks
          *  - adjust padding
          */
-        StatusWith<DiskLoc> _insertDocument( const BSONObj& doc, bool enforceQuota );
+        StatusWith<DiskLoc> _insertDocument( const BSONObj& doc,
+                                             bool enforceQuota );
 
         void _compactExtent(const DiskLoc diskloc, int extentNumber,
-                            vector<IndexAccessMethod*>& indexesToInsertTo,
+                            MultiIndexBlock& indexesToInsertTo,
                             const CompactOptions* compactOptions, CompactStats* stats );
 
         // @return 0 for inf., otherwise a number of files
@@ -230,7 +233,6 @@ namespace mongo {
 
         ExtentManager* getExtentManager();
         const ExtentManager* getExtentManager() const;
-        void checkInitChangeSubscribers();
 
         int _magic;
 
@@ -240,8 +242,7 @@ namespace mongo {
         scoped_ptr<RecordStore> _recordStore;
         CollectionInfoCache _infoCache;
         IndexCatalog _indexCatalog;
-        RWLock _changeSubscribersLock;
-        list<NotifyAll*>* _changeSubscribers;
+        NotifyAll _changeSubscribers;
 
         // this is mutable because read only users of the Collection class
         // use it keep state.  This seems valid as const correctness of Collection

@@ -32,10 +32,12 @@
 
 #include "mongo/base/counter.h"
 #include "mongo/base/owned_pointer_map.h"
+#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/structure/catalog/namespace_details.h"
@@ -75,7 +77,7 @@ namespace mongo {
     };
 
     void Collection::_compactExtent(const DiskLoc diskloc, int extentNumber,
-                                    vector<IndexAccessMethod*>& indexesToInsertTo,
+                                    MultiIndexBlock& indexesToInsertTo,
                                     const CompactOptions* compactOptions, CompactStats* stats ) {
 
         log() << "compact begin extent #" << extentNumber
@@ -99,7 +101,7 @@ namespace mongo {
             int ms = t.millis();
             if( ms > 1000 )
                 log() << "compact end paging in " << ms << "ms "
-                      << e->length/1000000.0/ms << "MB/sec" << endl;
+                      << e->length/1000000.0/t.seconds() << "MB/sec" << endl;
         }
 
         {
@@ -154,13 +156,7 @@ namespace mongo {
                         options.logIfError = false;
                         options.dupsAllowed = true; // in compact we should be doing no checking
 
-                        for ( size_t i = 0; i < indexesToInsertTo.size(); i++ ) {
-                            Status idxStatus = indexesToInsertTo[i]->insert( objOld,
-                                                                             status.getValue(),
-                                                                             options,
-                                                                             NULL );
-                            uassertStatusOK( idxStatus );
-                        }
+                        indexesToInsertTo.insert( objOld, status.getValue(), options );
                     }
 
                     if( L.isNull() ) {
@@ -172,12 +168,12 @@ namespace mongo {
                     // remove the old records (orphan them) periodically so our commit block doesn't get too large
                     bool stopping = false;
                     RARELY stopping = *killCurrentOp.checkForInterruptNoAssert() != 0;
-                    if( stopping || getDur().aCommitIsNeeded() ) {
+                    if( stopping || getDur().isCommitNeeded() ) {
                         e->firstRecord.writing() = L;
                         Record *r = L.rec();
                         getDur().writingInt(r->prevOfs()) = DiskLoc::NullOfs;
                         getDur().commitIfNeeded();
-                        killCurrentOp.checkForInterrupt(false);
+                        killCurrentOp.checkForInterrupt();
                     }
                 }
             } // if !L.isNull()
@@ -252,7 +248,19 @@ namespace mongo {
             IndexCatalog::IndexIterator ii( _indexCatalog.getIndexIterator( false ) );
             while ( ii.more() ) {
                 IndexDescriptor* descriptor = ii.next();
-                indexSpecs.push_back( _compactAdjustIndexSpec( descriptor->infoObj() ) );
+
+                const BSONObj spec = _compactAdjustIndexSpec(descriptor->infoObj());
+                const BSONObj key = spec.getObjectField("key");
+                const Status keyStatus = validateKeyPattern(key);
+                if (!keyStatus.isOK()) {
+                    return StatusWith<CompactStats>(
+                        ErrorCodes::CannotCreateIndex,
+                        str::stream() << "Cannot rebuild index " << spec << ": "
+                                      << keyStatus.reason()
+                                      << " For more info see"
+                                      << " http://dochub.mongodb.org/core/index-validation");
+                }
+                indexSpecs.push_back(spec);
             }
         }
 
@@ -276,38 +284,14 @@ namespace mongo {
         }
 
         getDur().commitIfNeeded();
+        killCurrentOp.checkForInterrupt();
 
         CompactStats stats;
 
-        OwnedPointerVector<IndexCatalog::IndexBuildBlock> indexBuildBlocks;
-        vector<IndexAccessMethod*> indexesToInsertTo;
-        vector< std::pair<IndexAccessMethod*,IndexAccessMethod*> > bulkToCommit;
-        for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
-            killCurrentOp.checkForInterrupt(false);
-            BSONObj info = indexSpecs[i];
-            info = _compactAdjustIndexSpec( info );
-            info = _indexCatalog.fixIndexSpec( info );
-            auto_ptr<IndexCatalog::IndexBuildBlock> block( new IndexCatalog::IndexBuildBlock( this,info ) );
-            Status status = block->init();
-            if ( !status.isOK() )
-                return StatusWith<CompactStats>(status);
-
-            IndexAccessMethod* accessMethod = block->getEntry()->accessMethod();
-            status = accessMethod->initializeAsEmpty();
-            if ( !status.isOK() )
-                return StatusWith<CompactStats>(status);
-
-            IndexAccessMethod* bulk = accessMethod->initiateBulk();
-            if ( bulk ) {
-                indexesToInsertTo.push_back( bulk );
-                bulkToCommit.push_back( std::pair<IndexAccessMethod*,IndexAccessMethod*>( accessMethod, bulk ) );
-            }
-            else {
-                indexesToInsertTo.push_back( accessMethod );
-            }
-
-            indexBuildBlocks.mutableVector().push_back( block.release() );
-        }
+        MultiIndexBlock multiIndexBlock( this );
+        status = multiIndexBlock.init( indexSpecs );
+        if ( !status.isOK() )
+            return StatusWith<CompactStats>( status );
 
         // reset data size and record counts to 0 for this namespace
         // as we're about to tally them up again for each new extent
@@ -319,7 +303,7 @@ namespace mongo {
 
         int extentNumber = 0;
         for( list<DiskLoc>::iterator i = extents.begin(); i != extents.end(); i++ ) {
-            _compactExtent(*i, extentNumber++, indexesToInsertTo, compactOptions, &stats );
+            _compactExtent(*i, extentNumber++, multiIndexBlock, compactOptions, &stats );
             pm.hit();
         }
 
@@ -330,14 +314,9 @@ namespace mongo {
 
         log() << "starting index commits";
 
-        for ( size_t i = 0; i < bulkToCommit.size(); i++ ) {
-            bulkToCommit[i].first->commitBulk( bulkToCommit[i].second, false, NULL );
-        }
-
-        for ( size_t i = 0; i < indexBuildBlocks.size(); i++ ) {
-            IndexCatalog::IndexBuildBlock* block = indexBuildBlocks.mutableVector()[i];
-            block->success();
-        }
+        status = multiIndexBlock.commit();
+        if ( !status.isOK() )
+            return StatusWith<CompactStats>( status );
 
         return StatusWith<CompactStats>( stats );
     }

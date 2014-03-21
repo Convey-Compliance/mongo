@@ -29,6 +29,7 @@
 */
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/rename_collection.h"
@@ -37,7 +38,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/structure/collection_iterator.h"
 
 namespace mongo {
@@ -65,15 +66,16 @@ namespace mongo {
             help << " example: { renameCollection: foo.a, to: bar.b }";
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname,
+        virtual std::vector<BSONObj> stopIndexBuilds(Database* db,
                                                      const BSONObj& cmdObj) {
             string source = cmdObj.getStringField( name.c_str() );
             string target = cmdObj.getStringField( "to" );
 
-            BSONObj criteria = BSON("op" << "insert" << "ns" << dbname+".system.indexes" <<
-                                    "insert.ns" << source);
+            IndexCatalog::IndexKillCriteria criteria;
+            criteria.ns = source;
+            std::vector<BSONObj> prelim = 
+                IndexBuilder::killMatchingIndexBuilds(db->getCollection(source), criteria);
 
-            std::vector<BSONObj> prelim = IndexBuilder::killMatchingIndexBuilds(criteria);
             std::vector<BSONObj> indexes;
 
             for (int i = 0; i < static_cast<int>(prelim.size()); i++) {
@@ -103,6 +105,20 @@ namespace mongo {
             if ( source.empty() || target.empty() ) {
                 errmsg = "invalid command syntax";
                 return false;
+            }
+
+            if (!fromRepl) { // If it got through on the master, need to allow it here too
+                Status sourceStatus = userAllowedWriteNS(source);
+                if (!sourceStatus.isOK()) {
+                    errmsg = "error with source namespace: " + sourceStatus.reason();
+                    return false;
+                }
+
+                Status targetStatus = userAllowedWriteNS(target);
+                if (!targetStatus.isOK()) {
+                    errmsg = "error with target namespace: " + targetStatus.reason();
+                    return false;
+                }
             }
 
             string sourceDB = nsToDatabase(source);
@@ -147,7 +163,7 @@ namespace mongo {
 
                 {
                     const NamespaceDetails *nsd = nsdetails( source );
-                    indexesInProg = stopIndexBuilds( dbname, cmdObj );
+                    indexesInProg = stopIndexBuilds( srcCtx.db(), cmdObj );
                     capped = nsd->isCapped();
                     if ( capped )
                         for( DiskLoc i = nsd->firstExtent(); !i.isNull(); i = i.ext()->xnext )
@@ -201,11 +217,10 @@ namespace mongo {
                     targetColl = ctx.db()->getCollection( target );
                 }
                 else {
-                    BSONObjBuilder spec;
-                    spec.appendBool( "autoIndexId", false );
-                    const BSONObj options = spec.obj();
+                    CollectionOptions options;
+                    options.setNoIdIndex();
                     // No logOp necessary because the entire renameCollection command is one logOp.
-                    targetColl = ctx.db()->createCollection( target, false, &options, true );
+                    targetColl = ctx.db()->createCollection( target, options );
                 }
                 if ( !targetColl ) {
                     errmsg = "Failed to create target collection.";

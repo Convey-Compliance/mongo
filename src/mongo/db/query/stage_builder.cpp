@@ -66,13 +66,7 @@ namespace mongo {
         }
         else if (STAGE_IXSCAN == root->getType()) {
             const IndexScanNode* ixn = static_cast<const IndexScanNode*>(root);
-            //
-            // XXX XXX
-            // Given that this grabs data from the catalog, we must do this inside of a lock.
-            // We should change this to take a (ns, index key pattern) pair so that the params
-            // don't involve any on-disk data, just descriptions thereof.
-            // XXX XXX
-            //
+
             Database* db = cc().database();
             Collection* collection = db ? db->getCollection(qsol.ns) : NULL;
             if (NULL == collection) {
@@ -115,7 +109,25 @@ namespace mongo {
             const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
             PlanStage* childStage = buildStages(qsol, pn->children[0], ws);
             if (NULL == childStage) { return NULL; }
-            return new ProjectionStage(pn->projection, pn->fullExpression, ws, childStage);
+            ProjectionStageParams params;
+            params.projObj = pn->projection;
+
+            // Stuff the right data into the params depending on what proj impl we use.
+            if (ProjectionNode::DEFAULT == pn->projType) {
+                params.fullExpression = pn->fullExpression;
+                params.projImpl = ProjectionStageParams::NO_FAST_PATH;
+            }
+            else if (ProjectionNode::COVERED_ONE_INDEX == pn->projType) {
+                params.projImpl = ProjectionStageParams::COVERED_ONE_INDEX;
+                params.coveredKeyObj = pn->coveredKeyObj;
+                invariant(!pn->coveredKeyObj.isEmpty());
+            }
+            else {
+                invariant(ProjectionNode::SIMPLE_DOC == pn->projType);
+                params.projImpl = ProjectionStageParams::SIMPLE_DOC;
+            }
+
+            return new ProjectionStage(params, ws, childStage);
         }
         else if (STAGE_LIMIT == root->getType()) {
             const LimitNode* ln = static_cast<const LimitNode*>(root);
@@ -217,7 +229,7 @@ namespace mongo {
             vector<IndexDescriptor*> idxMatches;
             collection->getIndexCatalog()->findIndexByType("text", idxMatches);
             if (1 != idxMatches.size()) {
-                warning() << "more than one text idx?";
+                warning() << "no text idx, or more than one text idx?";
                 return NULL;
             }
             IndexDescriptor* index = idxMatches[0];
@@ -228,24 +240,17 @@ namespace mongo {
             params.ns = qsol.ns;
             params.index = index;
             params.spec = fam->getSpec();
-            // XXX change getIndexPrefix to not look at BSONObj
-            Status s = fam->getSpec().getIndexPrefix(qsol.filterData, &params.indexPrefix);
-            if (!s.isOK()) {
-                warning() << "can't get text index prefix??";
-                return NULL;
-            }
+            params.indexPrefix = node->indexPrefix;
 
-            const std::string& language = ("" == node->_language
+            const std::string& language = ("" == node->language
                                            ? fam->getSpec().defaultLanguage().str()
-                                           : node->_language);
+                                           : node->language);
 
-            FTSQuery ftsq;
-            Status parseStatus = ftsq.parse(node->_query, language);
+            Status parseStatus = params.query.parse(node->query, language);
             if (!parseStatus.isOK()) {
                 warning() << "cant parse fts query";
                 return NULL;
             }
-            params.query = ftsq;
 
             return new TextStage(params, ws, node->filter.get());
         }

@@ -45,6 +45,77 @@ namespace mongo {
 
     class CurOp;
 
+    /**
+     * stores a copy of a bson obj in a fixed size buffer
+     * if its too big for the buffer, says "too big"
+     * useful for keeping a copy around indefinitely without wasting a lot of space or doing malloc
+     */
+    class CachedBSONObjBase {
+    public:
+        static BSONObj _tooBig; // { $msg : "query not recording (too large)" }
+    };
+
+    template <size_t BUFFER_SIZE>
+    class CachedBSONObj : public CachedBSONObjBase {
+    public:
+        enum { TOO_BIG_SENTINEL = 1 } ;
+
+        CachedBSONObj() {
+            _size = (int*)_buf;
+            reset();
+        }
+
+        void reset( int sz = 0 ) {
+            _lock.lock();
+            _reset( sz );
+            _lock.unlock();
+        }
+
+        void set( const BSONObj& o ) {
+            scoped_spinlock lk(_lock);
+            size_t sz = o.objsize();
+            if ( sz > sizeof(_buf) ) {
+                _reset(TOO_BIG_SENTINEL);
+            }
+            else {
+                memcpy(_buf, o.objdata(), sz );
+            }
+        }
+
+        int size() const { return *_size; }
+        bool have() const { return size() > 0; }
+        bool tooBig() const { return size() == TOO_BIG_SENTINEL; }
+
+        BSONObj get() const {
+            scoped_spinlock lk(_lock);
+            return _get();
+        }
+
+        void append( BSONObjBuilder& b , const StringData& name ) const {
+            scoped_spinlock lk(_lock);
+            BSONObj temp = _get();
+            b.append( name , temp );
+        }
+
+    private:
+        /** you have to be locked when you call this */
+        BSONObj _get() const {
+            int sz = size();
+            if ( sz == 0 )
+                return BSONObj();
+            if ( sz == TOO_BIG_SENTINEL )
+                return _tooBig;
+            return BSONObj( _buf ).copy();
+        }
+
+        /** you have to be locked when you call this */
+        void _reset( int sz ) { _size[0] = sz; }
+
+        mutable SpinLock _lock;
+        int * _size;
+        char _buf[BUFFER_SIZE];
+    };
+
     /* lifespan is different than CurOp because of recursives with DBDirectClient */
     class OpDebug {
     public:
@@ -90,9 +161,10 @@ namespace mongo {
 
         // debugging/profile info
         long long nscanned;
+        long long nscannedObjects;
         bool idhack;         // indicates short circuited code path on an update to make the update faster
         bool scanAndOrder;   // scanandorder query plan aspect was used
-        long long  nupdated; // number of records updated (including no-ops)
+        long long  nMatched; // number of records that match the query
         long long  nModified; // number of records written (no no-ops)
         long long  nmoved;   // updates resulted in a move (moves are expensive)
         long long  ninserted;
@@ -101,11 +173,11 @@ namespace mongo {
         bool fastmodinsert;  // upsert of an $operation. builds a default object
         bool upsert;         // true if the update actually did an insert
         int keyUpdates;
-        std::string planSummary; // a brief string describing the query solution
+        ThreadSafeString planSummary; // a brief string describing the query solution
 
         // New Query Framework debugging/profiling info
-        // XXX: should this really be an opaque BSONObj?  Not sure.
-        BSONObj execStats;
+        // TODO: should this really be an opaque BSONObj?  Not sure.
+        CachedBSONObj<4096> execStats;
 
         // error handling
         ExceptionInfo exceptionInfo;
@@ -114,71 +186,6 @@ namespace mongo {
         int executionTime;
         int nreturned;
         int responseLength;
-    };
-
-    /**
-     * stores a copy of a bson obj in a fixed size buffer
-     * if its too big for the buffer, says "too big"
-     * useful for keeping a copy around indefinitely without wasting a lot of space or doing malloc
-     */
-    class CachedBSONObj {
-    public:
-        enum { TOO_BIG_SENTINEL = 1 } ;
-        static BSONObj _tooBig; // { $msg : "query not recording (too large)" }
-
-        CachedBSONObj() {
-            _size = (int*)_buf;
-            reset();
-        }
-
-        void reset( int sz = 0 ) {
-            _lock.lock();
-            _reset( sz );
-            _lock.unlock();
-        }
-
-        void set( const BSONObj& o ) {
-            scoped_spinlock lk(_lock);
-            size_t sz = o.objsize();
-            if ( sz > sizeof(_buf) ) {
-                _reset(TOO_BIG_SENTINEL);
-            }
-            else {
-                memcpy(_buf, o.objdata(), sz );
-            }
-        }
-
-        int size() const { return *_size; }
-        bool have() const { return size() > 0; }
-
-        BSONObj get() const {
-            scoped_spinlock lk(_lock);
-            return _get();
-        }
-
-        void append( BSONObjBuilder& b , const StringData& name ) const {
-            scoped_spinlock lk(_lock);
-            BSONObj temp = _get();
-            b.append( name , temp );
-        }
-
-    private:
-        /** you have to be locked when you call this */
-        BSONObj _get() const {
-            int sz = size();
-            if ( sz == 0 )
-                return BSONObj();
-            if ( sz == TOO_BIG_SENTINEL )
-                return _tooBig;
-            return BSONObj( _buf ).copy();
-        }
-
-        /** you have to be locked when you call this */
-        void _reset( int sz ) { _size[0] = sz; }
-
-        mutable SpinLock _lock;
-        int * _size;
-        char _buf[512];
     };
 
     /* Current operation (for the current Client).
@@ -342,7 +349,7 @@ namespace mongo {
         AtomicUInt _opNum;               // todo: simple being "unsigned" may make more sense here
         char _ns[Namespace::MaxNsLen+2];
         HostAndPort _remote;             // CAREFUL here with thread safety
-        CachedBSONObj _query;            // CachedBSONObj is thread safe
+        CachedBSONObj<512> _query;       // CachedBSONObj is thread safe
         OpDebug _debug;
         ThreadSafeString _message;
         ProgressMeter _progressMeter;

@@ -86,12 +86,6 @@ namespace mongo {
             initThread(desc);
         }
 
-        /**
-         * Allows detaching a thread from a Client object.  Use for testing and for the creation
-         * of non-connection clients.
-         */
-        static void resetThread( const StringData& origThreadName );
-
         /** this has to be called as the client goes away, but before thread termination
          *  @return true if anything was done
          */
@@ -122,11 +116,22 @@ namespace mongo {
 
         bool inPageFaultRetryableSection() const { return _pageFaultRetryableSection != 0; }
         PageFaultRetryableSection* getPageFaultRetryableSection() const { return _pageFaultRetryableSection; }
-        
-        bool hasWrittenThisPass() const { return _hasWrittenThisPass; }
-        void writeHappened() { _hasWrittenThisPass = true; }
-        void newTopLevelRequest() { _hasWrittenThisPass = false; }
-        
+
+        void writeHappened() { _hasWrittenSinceCheckpoint = true; _hasWrittenThisOperation = true; }
+        bool hasWrittenSinceCheckpoint() const { return _hasWrittenSinceCheckpoint; }
+        void checkpointHappened() { _hasWrittenSinceCheckpoint = false; }
+        bool hasWrittenThisOperation() const { return _hasWrittenThisOperation; }
+        void newTopLevelRequest() {
+            _hasWrittenThisOperation = false;
+            _hasWrittenSinceCheckpoint = false;
+        }
+
+        /**
+         * Call this to allow PageFaultExceptions even if writes happened before this was called.
+         * Writes after this is called still prevent PFEs from being thrown.
+         */
+        void clearHasWrittenThisOperation() { _hasWrittenThisOperation = false; }
+
         bool allowedToThrowPageFaultException() const;
 
         LockState& lockState() { return _ls; }
@@ -145,7 +150,8 @@ namespace mongo {
         BSONObj _handshake;
         BSONObj _remoteId;
 
-        bool _hasWrittenThisPass;
+        bool _hasWrittenThisOperation;
+        bool _hasWrittenSinceCheckpoint;
         PageFaultRetryableSection *_pageFaultRetryableSection;
 
         LockState _ls;
