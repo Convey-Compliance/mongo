@@ -410,8 +410,7 @@ namespace mongo {
             return Status::OK();
         }
 
-        // The hint can be $natural: 1.  If this happens, output a collscan.  It's a weird way of
-        // saying "table scan for two, please."
+        // The hint can be $natural: 1.  If this happens, output a collscan.
         if (!query.getParsed().getHint().isEmpty()) {
             BSONElement natural = query.getParsed().getHint().getFieldDotted("$natural");
             if (!natural.eoo()) {
@@ -634,6 +633,7 @@ namespace mongo {
                     for (size_t i = 0; i < filterTree->numChildren(); ++i) {
                         if (MatchExpression::GEO_NEAR == filterTree->getChild(i)->matchType()) {
                             foundChild = true;
+                            scoped_ptr<MatchExpression> holder(filterTree->getChild(i));
                             filterTree->getChildVector()->erase(filterTree->getChildVector()->begin() + i);
                             break;
                         }

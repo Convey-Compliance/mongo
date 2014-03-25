@@ -43,12 +43,14 @@
 #include "mongo/db/query/multi_plan_runner.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/single_solution_runner.h"
 #include "mongo/db/query/stage_builder.h"
+#include "mongo/db/query/subplan_runner.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -198,6 +200,79 @@ namespace mongo {
         }
 
         plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
+        plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+    }
+
+    Status getRunnerFromCache(CanonicalQuery* canonicalQuery,
+                              Collection* collection,
+                              const QueryPlannerParams& plannerParams,
+                              Runner** out) {
+        // Skip cache look up for non-cacheable queries.
+        if (!PlanCache::shouldCacheQuery(*canonicalQuery)) {
+            return Status(ErrorCodes::BadValue, "query is not cacheable");
+        }
+
+        CachedSolution* rawCS;
+        Status cacheLookupStatus = collection->infoCache()->getPlanCache()->get(*canonicalQuery,
+                                                                                &rawCS);
+        if (!cacheLookupStatus.isOK()) {
+            return cacheLookupStatus;
+        }
+
+        // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
+        boost::scoped_ptr<CachedSolution> cs(rawCS);
+        QuerySolution *qs, *backupQs;
+        Status status = QueryPlanner::planFromCache(*canonicalQuery,
+                                                    plannerParams,
+                                                    *cs,
+                                                    &qs,
+                                                    &backupQs);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // If our cached solution is a hit for a count query, try to turn it into a fast count
+        // thing.
+        if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
+            if (turnIxscanIntoCount(qs)) {
+                LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
+                       << ", planSummary: " << getPlanSummary(*qs);
+
+                WorkingSet* ws;
+                PlanStage* root;
+                verify(StageBuilder::build(*qs, &root, &ws));
+                *out = new SingleSolutionRunner(collection,
+                                                canonicalQuery, qs, root, ws);
+                if (NULL != backupQs) {
+                    delete backupQs;
+                }
+                return Status::OK();
+            }
+        }
+
+        // If we're here, we're going to used the cached plan and things are normal.
+        LOG(2) << "Using cached query plan: " << canonicalQuery->toStringShort()
+               << ", planSummary: " << getPlanSummary(*qs);
+
+        WorkingSet* ws;
+        PlanStage* root;
+        verify(StageBuilder::build(*qs, &root, &ws));
+        CachedPlanRunner* cpr = new CachedPlanRunner(collection,
+                                                     canonicalQuery,
+                                                     qs,
+                                                     root,
+                                                     ws);
+
+        // If there's a backup solution, let the CachedPlanRunner know about it.
+        if (NULL != backupQs) {
+            WorkingSet* backupWs;
+            PlanStage* backupRoot;
+            verify(StageBuilder::build(*backupQs, &backupRoot, &backupWs));
+            cpr->setBackupPlan(backupQs, backupRoot, backupWs);
+        }
+
+        *out = cpr;
+        return Status::OK();
     }
 
     /**
@@ -253,80 +328,38 @@ namespace mongo {
         plannerParams.options = plannerOptions;
         fillOutPlannerParams(collection, rawCanonicalQuery, &plannerParams);
 
-        // Try to look up a cached solution for the query.
-        //
-        // Skip cache look up for non-cacheable queries.
-        // See PlanCache::shouldCacheQuery()
-        //
-        // TODO: Can the cache have negative data about a solution?
-        CachedSolution* rawCS;
-        if (PlanCache::shouldCacheQuery(*canonicalQuery) &&
-            collection->infoCache()->getPlanCache()->get(*canonicalQuery, &rawCS).isOK()) {
-            // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
-            boost::scoped_ptr<CachedSolution> cs(rawCS);
-            QuerySolution *qs, *backupQs;
-            Status status = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs,
-                                                        &qs, &backupQs);
+        // See if the cache has what we're looking for.
+        Status cacheStatus = getRunnerFromCache(canonicalQuery.get(),
+                                                collection,
+                                                plannerParams,
+                                                out);
 
-            // See SERVER-12438. Unfortunately we have to defer to the backup solution
-            // if both a batch size is set and a sort is requested.
-            //
-            // TODO: it would be really nice to delete this block in the future.
-            if (status.isOK() && NULL != backupQs &&
-                0 < canonicalQuery->getParsed().getNumToReturn() &&
-                !canonicalQuery->getParsed().getSort().isEmpty()) {
-                delete qs;
-
-                WorkingSet* ws;
-                PlanStage* root;
-                verify(StageBuilder::build(*backupQs, &root, &ws));
-
-                // And, run the plan.
-                *out = new SingleSolutionRunner(collection,
-                                                canonicalQuery.release(),
-                                                backupQs, root, ws);
-                return Status::OK();
-            }
-
-            if (status.isOK()) {
-                if (plannerParams.options & QueryPlannerParams::PRIVATE_IS_COUNT) {
-                    if (turnIxscanIntoCount(qs)) {
-                        LOG(2) << "Using fast count: " << canonicalQuery->toStringShort()
-                               << ", planSummary: " << getPlanSummary(*qs);
-
-                        WorkingSet* ws;
-                        PlanStage* root;
-                        verify(StageBuilder::build(*qs, &root, &ws));
-                        *out = new SingleSolutionRunner(collection,
-                                                        canonicalQuery.release(), qs, root, ws);
-                        if (NULL != backupQs) {
-                            delete backupQs;
-                        }
-                        return Status::OK();
-                    }
-                }
-
-                LOG(2) << "Using cached query plan: " << canonicalQuery->toStringShort()
-                       << ", planSummary: " << getPlanSummary(*qs);
-
-                WorkingSet* ws;
-                PlanStage* root;
-                verify(StageBuilder::build(*qs, &root, &ws));
-                CachedPlanRunner* cpr = new CachedPlanRunner(collection,
-                                                             canonicalQuery.release(), qs,
-                                                             root, ws);
-
-                if (NULL != backupQs) {
-                    WorkingSet* backupWs;
-                    PlanStage* backupRoot;
-                    verify(StageBuilder::build(*backupQs, &backupRoot, &backupWs));
-                    cpr->setBackupPlan(backupQs, backupRoot, backupWs);
-                }
-
-                *out = cpr;
-                return Status::OK();
-            }
+        // This can be not-OK and we can carry on.  It just means the query wasn't cached.
+        if (cacheStatus.isOK()) {
+            // We got a cached runner.
+            canonicalQuery.release();
+            return cacheStatus;
         }
+
+        if (internalQueryPlanOrChildrenIndependently
+            && SubplanRunner::canUseSubplanRunner(*canonicalQuery)) {
+
+            LOG(2) << "Running query as sub-queries: " << canonicalQuery->toStringShort();
+            *out = new SubplanRunner(collection, plannerParams, canonicalQuery.release());
+            return Status::OK();
+        }
+
+        return getRunnerAlwaysPlan(collection, canonicalQuery.release(), plannerParams, out);
+    }
+
+    Status getRunnerAlwaysPlan(Collection* collection,
+                               CanonicalQuery* rawCanonicalQuery,
+                               const QueryPlannerParams& plannerParams,
+                               Runner** out) {
+
+        invariant(collection);
+        invariant(rawCanonicalQuery);
+        auto_ptr<CanonicalQuery> canonicalQuery(rawCanonicalQuery);
 
         vector<QuerySolution*> solutions;
         Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions);
@@ -386,41 +419,13 @@ namespace mongo {
 
             // And, run the plan.
             *out = new SingleSolutionRunner(collection,
-                                            canonicalQuery.release(),solutions[0], root, ws);
+                                            canonicalQuery.release(),
+                                            solutions[0],
+                                            root,
+                                            ws);
             return Status::OK();
         }
         else {
-            // See SERVER-12438. In an ideal world we should not arbitrarily prefer certain
-            // solutions over others. But unfortunately for historical reasons we are forced
-            // to prefer a solution where the index provides the sort, if the batch size
-            // is set and a sort is requested. Read SERVER-12438 for details, if you dare.
-            //
-            // TODO: it would be really nice to delete this entire block in the future.
-            if (0 < canonicalQuery->getParsed().getNumToReturn()
-                && !canonicalQuery->getParsed().getSort().isEmpty()) {
-                // Look for a solution without a blocking sort stage.
-                for (size_t i = 0; i < solutions.size(); ++i) {
-                    if (!solutions[i]->hasBlockingStage) {
-                        WorkingSet* ws;
-                        PlanStage* root;
-                        verify(StageBuilder::build(*solutions[i], &root, &ws));
-
-                        // Free unused solutions.
-                        for (size_t j = 0; j < solutions.size(); ++j) {
-                            if (j != i) {
-                                delete solutions[j];
-                            }
-                        }
-
-                        // And, run the plan.
-                        *out = new SingleSolutionRunner(collection,
-                                                       canonicalQuery.release(),
-                                                       solutions[i], root, ws);
-                        return Status::OK();
-                    }
-                }
-            }
-
             // Many solutions.  Let the MultiPlanRunner pick the best, update the cache, and so on.
             auto_ptr<MultiPlanRunner> mpr(new MultiPlanRunner(collection,canonicalQuery.release()));
 
@@ -471,7 +476,9 @@ namespace mongo {
             IndexScanNode* isn = static_cast<IndexScanNode*>(root->children[0]);
 
             // No filters allowed and side-stepping isSimpleRange for now.  TODO: do we ever see
-            // isSimpleRange here?  because we could well use it.  I just don't think we ever do see it.
+            // isSimpleRange here?  because we could well use it.  I just don't think we ever do see
+            // it.
+
             if (NULL != isn->filter.get() || isn->bounds.isSimpleRange) {
                 return false;
             }
@@ -728,43 +735,42 @@ namespace mongo {
             }
         }
 
-        // If there are no suitable indices for the distinct hack and the _id index is the only
-        // index in the catalog, a collection scan is the only possible solution. Bail out now
-        // into regular planning with no projection. Projection is unnecessary because there
-        // is no possibility of a covered index scan.
-        if (plannerParams.indices.empty() &&
-            collection->getIndexCatalog()->numIndexesTotal() == 1 &&
-            collection->getIndexCatalog()->haveIdIndex()) {
+        // If there are no suitable indices for the distinct hack bail out now into regular planning
+        // with no projection.
+        if (plannerParams.indices.empty()) {
             CanonicalQuery* cq;
-            Status status = CanonicalQuery::canonicalize(collection->ns().ns(), query, BSONObj(),
-                                                         BSONObj(), &cq);
+            Status status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                                         query,
+                                                         BSONObj(),
+                                                         BSONObj(),
+                                                         &cq);
             if (!status.isOK()) {
                 return status;
             }
+
             // Takes ownership of cq.
             return getRunner(cq, out);
         }
 
-        // We only care about the field that we're projecting over.  Have to drop the _id field
-        // explicitly because those are .find() semantics.
         //
-        // Applying a projection allows the planner to try to give us covered plans.
+        // If we're here, we have an index prefixed by the field we're distinct-ing over.
+        //
+
+        // Applying a projection allows the planner to try to give us covered plans that we can turn
+        // into the projection hack.  getDistinctProjection deals with .find() projection semantics
+        // (ie _id:1 being implied by default).
         BSONObj projection = getDistinctProjection(field);
 
         // Apply a projection of the key.  Empty BSONObj() is for the sort.
         CanonicalQuery* cq;
-        Status status = CanonicalQuery::canonicalize(collection->ns().ns(), query, BSONObj(), projection, &cq);
+        Status status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                                     query,
+                                                     BSONObj(),
+                                                     projection,
+                                                     &cq);
         if (!status.isOK()) {
             return status;
         }
-
-        // No index has the field we're looking for.  Punt to normal planning.
-        if (plannerParams.indices.empty()) {
-            // Takes ownership of cq.
-            return getRunner(cq, out);
-        }
-
-        // If we're here, we have an index prefixed by the field we're distinct-ing over.
 
         // If there's no query, we can just distinct-scan one of the indices.
         // Not every index in plannerParams.indices may be suitable. Refer to
@@ -830,6 +836,18 @@ namespace mongo {
             delete solutions[i];
         }
 
+        // We drop the projection from the 'cq'.  Unfortunately this is not trivial.
+        delete cq;
+        status = CanonicalQuery::canonicalize(collection->ns().ns(),
+                                              query,
+                                              BSONObj(),
+                                              BSONObj(),
+                                              &cq);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // Takes ownership of cq.
         return getRunner(cq, out);
     }
 

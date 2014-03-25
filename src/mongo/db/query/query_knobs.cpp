@@ -38,7 +38,7 @@ namespace mongo {
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlanEvaluationMaxResults, int, 101);
 
-    MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheSize, int, 200);
+    MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheSize, int, 5000);
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheFeedbacksStored, int, 20);
 
@@ -46,12 +46,16 @@ namespace mongo {
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheWriteOpsBetweenFlush, int, 1000);
 
-    MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerMaxIndexedSolutions, int, 6);
+    MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerMaxIndexedSolutions, int, 64);
+
+    MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationMaxOrSolutions, int, 10);
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationMaxIntersectPerAnd, int, 3);
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryForceIntersectionPlans, bool, false);
 
     MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerEnableIndexIntersection, bool, true);
+
+    MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlanOrChildrenIndependently, bool, true);
 
 }  // namespace mongo

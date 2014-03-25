@@ -42,11 +42,26 @@ namespace mongo {
 
     class CanonicalQuery {
     public:
+        /**
+         * Caller owns the pointer in 'out' if any call to canonicalize returns Status::OK().
+         */
         static Status canonicalize(const QueryMessage& qm, CanonicalQuery** out);
 
         /**
          * For testing or for internal clients to use.
          */
+
+        /**
+         * Used for creating sub-queries from an existing CanonicalQuery.
+         *
+         * 'root' must be an expression in baseQuery.root().
+         *
+         * Does not take ownership of 'root'.
+         */
+        static Status canonicalize(const CanonicalQuery& baseQuery,
+                                   MatchExpression* root,
+                                   CanonicalQuery** out);
+
         static Status canonicalize(const string& ns, const BSONObj& query, CanonicalQuery** out);
 
         static Status canonicalize(const string& ns, const BSONObj& query, long long skip,
@@ -130,6 +145,16 @@ namespace mongo {
          */
         static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
 
+        /**
+         * Takes ownership of 'tree'.  Performs some rewriting of the query to a logically
+         * equivalent but more digestible form.
+         *
+         * TODO: This doesn't entirely belong here.  Really we'd do this while exploring
+         * solutions in an enumeration setting but given the current lack of pruning
+         * while exploring the enumeration space we do it here.
+         */
+        static MatchExpression* logicalRewrite(MatchExpression* tree);
+
     private:
         // You must go through canonicalize to create a CanonicalQuery.
         CanonicalQuery() { }
@@ -140,8 +165,10 @@ namespace mongo {
          */
         void generateCacheKey(void);
 
-        // Takes ownership of lpq
-        Status init(LiteParsedQuery* lpq);
+        /**
+         * Takes ownership of 'root' and 'lpq'.
+         */
+        Status init(LiteParsedQuery* lpq, MatchExpression* root);
 
         scoped_ptr<LiteParsedQuery> _pq;
 

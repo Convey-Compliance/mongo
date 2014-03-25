@@ -28,6 +28,7 @@
 
 #include "mongo/s/write_ops/batch_downconvert.h"
 
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/assert_util.h"
 
@@ -179,6 +180,9 @@ namespace mongo {
         // N starts at zero, and we add to it for each item
         response->setN( 0 );
 
+        // GLE path always sets nModified to -1 (sentinel) to indicate we should omit it later.
+        response->setNModified(-1);
+
         for ( size_t i = 0; i < request.sizeWriteOps(); ++i ) {
 
             // Break on first error if we're ordered
@@ -201,8 +205,12 @@ namespace mongo {
             if ( !status.isOK() ) {
                 response->clear();
                 response->setOk( false );
-                response->setErrCode( status.code() );
-                response->setErrMessage( status.reason() );
+                response->setErrCode( ErrorCodes::RemoteResultsUnavailable );
+                
+                StringBuilder builder;
+                builder << "could not get write error from safe write";
+                builder << causedBy( status.toString() );
+                response->setErrMessage( builder.str() );
                 return;
             }
 
@@ -289,34 +297,26 @@ namespace mongo {
                 }
             }
 
-            if ( !status.isOK() ) {
-                response->clear();
-                response->setOk( false );
-                response->setErrCode( status.code() );
-                response->setErrMessage( status.reason() );
-                return;
-            }
-
             BSONObj gleResult;
-            status = _safeWriter->enforceWriteConcern( conn,
-                                                       dbName,
-                                                       writeConcern,
-                                                       &gleResult );
+            if ( status.isOK() ) {
+                status = _safeWriter->enforceWriteConcern( conn,
+                                                           dbName,
+                                                           writeConcern,
+                                                           &gleResult );
+            }
 
             GLEErrors errors;
             if ( status.isOK() ) {
                 status = extractGLEErrors( gleResult, &errors );
             }
-
+            
             if ( !status.isOK() ) {
-                response->clear();
-                response->setOk( false );
-                response->setErrCode( status.code() );
-                response->setErrMessage( status.reason() );
-                return;
+                auto_ptr<WCErrorDetail> wcError( new WCErrorDetail );
+                wcError->setErrCode( status.code() );
+                wcError->setErrMessage( status.reason() );
+                response->setWriteConcernError( wcError.release() ); 
             }
-
-            if ( errors.wcError.get() ) {
+            else if ( errors.wcError.get() ) {
                 response->setWriteConcernError( errors.wcError.release() );
             }
         }

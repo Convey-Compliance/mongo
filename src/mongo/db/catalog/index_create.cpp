@@ -148,7 +148,8 @@ namespace mongo {
                             // TODO: Why is this normal?
                         }
                         else {
-                            uasserted(12585, "cursor gone during bg index; dropDups");
+                            uasserted(ErrorCodes::CursorNotFound, 
+                                      "cursor gone during bg index; dropDups");
                         }
                         break;
                     }
@@ -167,10 +168,18 @@ namespace mongo {
 
             getDur().commitIfNeeded();
             if (shouldYield && yieldPolicy.shouldYield()) {
+                // Note: yieldAndCheckIfOK checks for interrupt and thus can throw
                 if (!yieldPolicy.yieldAndCheckIfOK(runner.get())) {
-                    uasserted(12584, "cursor gone during bg index");
+                    uasserted(ErrorCodes::CursorNotFound, "cursor gone during bg index");
                     break;
                 }
+
+                // Checking for interrupt here is necessary because the bg index 
+                // interruptors can only interrupt this index build while they hold 
+                // a write lock, and yieldAndCheckIfOK only checks for
+                // interrupt prior to yielding our write lock. We need to check the kill flag
+                // here before another iteration of the loop.
+                killCurrentOp.checkForInterrupt();
 
                 progress.setTotalWhileRunning( collection->numRecords() );
                 // Recalculate idxNo if we yielded
@@ -237,6 +246,7 @@ namespace mongo {
                  status.isOK() );
 
         IndexAccessMethod* bulk = doInBackground ? NULL : btreeState->accessMethod()->initiateBulk();
+        scoped_ptr<IndexAccessMethod> bulkHolder(bulk);
         IndexAccessMethod* iam = bulk ? bulk : btreeState->accessMethod();
 
         if ( bulk )
@@ -293,7 +303,14 @@ namespace mongo {
         : _collection( collection ) {
     }
 
-    Status MultiIndexBlock::init( std::vector<BSONObj>& indexSpecs ) {
+    MultiIndexBlock::~MultiIndexBlock() {
+        for ( size_t i = 0; i < _states.size(); i++ ) {
+            delete _states[i].bulk;
+            delete _states[i].block;
+        }
+    }
+
+    Status MultiIndexBlock::init(std::vector<BSONObj>& indexSpecs) {
 
         for ( size_t i = 0; i < indexSpecs.size(); i++ ) {
             BSONObj info = indexSpecs[i];
@@ -318,7 +335,7 @@ namespace mongo {
             info = statusWithInfo.getValue();
 
             IndexState state;
-            state.block.reset( new IndexCatalog::IndexBuildBlock( _collection, info ) );
+            state.block = new IndexCatalog::IndexBuildBlock( _collection, info );
             status = state.block->init();
             if ( !status.isOK() )
                 return status;

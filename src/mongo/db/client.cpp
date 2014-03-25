@@ -238,7 +238,7 @@ namespace mongo {
         return false;
     }
 
-    BSONObj CachedBSONObj::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
+    BSONObj CachedBSONObjBase::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
     Client::Context::Context(const std::string& ns , Database * db) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
@@ -566,6 +566,7 @@ namespace mongo {
         upsert = false;
         keyUpdates = 0;  // unsigned, so -1 not possible
         planSummary = "";
+        execStats.reset();
         
         exceptionInfo.reset();
         

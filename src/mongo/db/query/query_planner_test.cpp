@@ -37,6 +37,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/unittest/unittest.h"
@@ -667,8 +668,17 @@ namespace {
 
         ASSERT_EQUALS(getNumSolutions(), 2U);
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {filter: {$or: [{b: 1}, {c: 7}]}, node: "
-                                "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+
+        // Logical rewrite means we could get one of these two outcomes:
+        size_t matches = 0;
+        matches += numSolutionMatches("{fetch: {filter: {$or: [{b: 1}, {c: 7}]}, node: "
+                                      "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+        matches += numSolutionMatches("{or: {filter: null, nodes: ["
+                                            "{fetch: {filter: {b:1}, node: {"
+                                                "ixscan: {filter: null, pattern: {a:1}}}}},"
+                                            "{fetch: {filter: {c:7}, node: {"
+                                                "ixscan: {filter: null, pattern: {a:1}}}}}]}}");
+        ASSERT_GREATER_THAN_OR_EQUALS(matches, 1U);
     }
 
 
@@ -677,10 +687,17 @@ namespace {
         addIndex(BSON("a" << 1));
         runQuery(fromjson("{$or: [{b:1}, {c:7}], a:20}"));
 
-        ASSERT_EQUALS(getNumSolutions(), 2U);
+        // Logical rewrite gives us at least one of these:
         assertSolutionExists("{cscan: {dir: 1}}");
-        assertSolutionExists("{fetch: {filter: {$or: [{b: 1}, {c: 7}]}, "
-                                "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+        size_t matches = 0;
+        matches += numSolutionMatches("{fetch: {filter: {$or: [{b: 1}, {c: 7}]}, "
+                                        "node: {ixscan: {filter: null, pattern: {a: 1}}}}}");
+        matches += numSolutionMatches("{or: {filter: null, nodes: ["
+                                            "{fetch: {filter: {b:1}, node: {"
+                                                "ixscan: {filter: null, pattern: {a:1}}}}},"
+                                            "{fetch: {filter: {c:7}, node: {"
+                                                "ixscan: {filter: null, pattern: {a:1}}}}}]}}");
+        ASSERT_GREATER_THAN_OR_EQUALS(matches, 1U);
     }
 
     //
@@ -1199,6 +1216,26 @@ namespace {
                                 "{ixscan: {filter: null, pattern: {foo: 1}}}}}");
         assertSolutionExists("{fetch: {filter: {foo: {$elemMatch: {$gt: 5, $lt: 10}}}, node: "
                                 "{ixscan: {filter: null, pattern: {foo: 1, bar: 1}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, ElemMatchValueIndexability) {
+        addIndex(BSON("foo" << 1));
+
+        // An ELEM_MATCH_VALUE can be indexed if all of its child predicates
+        // are "index bounds generating".
+        runQuery(fromjson("{foo: {$elemMatch: {$gt: 5, $lt: 10}}}"));
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{cscan: {dir: 1, filter: {foo:{$elemMatch:{$gt:5,$lt:10}}}}}");
+        assertSolutionExists("{fetch: {filter: {foo: {$elemMatch: {$gt: 5, $lt: 10}}}, node: "
+                                "{ixscan: {filter: null, pattern: {foo: 1}}}}}");
+
+        // We cannot build index bounds for the $size predicate. This means that the
+        // ELEM_MATCH_VALUE is not indexable, and we get no indexed solutions.
+        runQuery(fromjson("{foo: {$elemMatch: {$gt: 5, $size: 10}}}"));
+
+        ASSERT_EQUALS(getNumSolutions(), 1U);
+        assertSolutionExists("{cscan: {dir: 1, filter: {foo:{$elemMatch:{$gt:5,$size:10}}}}}");
     }
 
     TEST_F(QueryPlannerTest, ElemMatchNested) {
@@ -2264,14 +2301,17 @@ namespace {
         addIndex(BSON("a" << 1));
         runQuery(fromjson("{$and: [{a: 1, $or: [{a: 2}, {a: 3}]}]}"));
 
-        assertNumSolutions(3U);
-        assertSolutionExists("{cscan: {dir: 1, filter: "
+        // Given that the index over 'a' isn't multikey, we ideally won't generate any solutions
+        // since we know the query describes an empty set if 'a' isn't multikey.  Any solutions
+        // below are "this is how it currently works" instead of "this is how it should work."
+
+        // It's kind of iffy to look for indexed solutions so we don't...
+        size_t matches = 0;
+        matches += numSolutionMatches("{cscan: {dir: 1, filter: "
+                                "{$or: [{a: 2, a:1}, {a: 3, a:1}]}}}");
+        matches += numSolutionMatches("{cscan: {dir: 1, filter: "
                                 "{$and: [{$or: [{a: 2}, {a: 3}]}, {a: 1}]}}}");
-        assertSolutionExists("{fetch: {filter: {a: 1}, node: {ixscan: "
-                                "{pattern: {a: 1}, filter: null,"
-                                " bounds: {a: [[2,2,true,true], [3,3,true,true]]}}}}}");
-        assertSolutionExists("{fetch: {filter: {$or: [{a: 2}, {a: 3}]}, node: {ixscan: "
-                                "{pattern: {a: 1}, filter: null, bounds: {a: [[1,1,true,true]]}}}}}");
+        ASSERT_GREATER_THAN_OR_EQUALS(matches, 1U);
     }
 
     TEST_F(QueryPlannerTest, IndexBoundsIndexedSort) {
@@ -2925,10 +2965,23 @@ namespace {
         addIndex(BSON("b" << 1));
         addIndex(BSON("c" << 1));
         runQuery(fromjson("{a: 1, $or: [{b:1}, {c:1}]}"));
-        assertSolutionExists("{fetch: {filter: null, node: {andHash: {nodes:["
+
+        // This (can be) rewritten to $or:[ {a:1, b:1}, {c:1, d:1}].  We don't look for the various
+        // single $or solutions as that's tested elsewhere.  We look for the intersect solution,
+        // where each AND inside of the root OR is an and_sorted.
+        size_t matches = 0;
+        matches += numSolutionMatches("{fetch: {filter: null, node: {or: {nodes: ["
+                                  "{andSorted: {nodes: ["
+                                         "{ixscan: {filter: null, pattern: {'a':1}}},"
+                                         "{ixscan: {filter: null, pattern: {'b':1}}}]}},"
+                                  "{andSorted: {nodes: ["
+                                         "{ixscan: {filter: null, pattern: {'a':1}}},"
+                                         "{ixscan: {filter: null, pattern: {'c':1}}}]}}]}}}}");
+        matches += numSolutionMatches("{fetch: {filter: null, node: {andHash: {nodes:["
                                     "{or: {nodes: [{ixscan:{filter:null, pattern:{b:1}}},"
                                           "{ixscan:{filter:null, pattern:{c:1}}}]}},"
                                     "{ixscan:{filter: null, pattern:{a:1}}}]}}}}");
+        ASSERT_GREATER_THAN_OR_EQUALS(matches, 1U);
     }
 
     TEST_F(QueryPlannerTest, IntersectElemMatch) {
@@ -2974,7 +3027,7 @@ namespace {
                                  "{ 'a' : null, 'b' : 9, 'c' : null, 'd' : null },"
                                  "{ 'a' : null, 'b' : 16, 'c' : null, 'd' : null }]}"));
 
-        ASSERT_LESS_THAN(getNumSolutions(), 10U);
+        assertNumSolutions(internalQueryEnumerationMaxOrSolutions);
     }
 
     //
@@ -3180,6 +3233,67 @@ namespace {
         assertNumSolutions(1);
         assertSolutionExists("{fetch: {node: {mergeSort: {nodes: "
                                 "[{ixscan: {pattern: {a: 1, b: 1}}}, {ixscan: {pattern: {a: 1, b: 1}}}]}}}}");
+    }
+
+    // Make sure a top-level $or hits the limiting number
+    // of solutions that we are willing to consider.
+    TEST_F(QueryPlannerTest, OrEnumerationLimit) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN;
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+
+        // 6 $or clauses, each with 2 indexed predicates
+        // means 2^6 = 64 possibilities. We should hit the limit.
+        runQuery(fromjson("{$or: [{a: 1, b: 1},"
+                                 "{a: 2, b: 2},"
+                                 "{a: 3, b: 3},"
+                                 "{a: 4, b: 4},"
+                                 "{a: 5, b: 5},"
+                                 "{a: 6, b: 6}]}"));
+
+        assertNumSolutions(internalQueryEnumerationMaxOrSolutions);
+    }
+
+    TEST_F(QueryPlannerTest, OrEnumerationLimit2) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN;
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+        addIndex(BSON("c" << 1));
+        addIndex(BSON("d" << 1));
+
+        // 3 $or clauses, and a few other preds. Each $or clause can
+        // generate up to the max number of allowed $or enumerations.
+        runQuery(fromjson("{$or: [{a: 1, b: 1, c: 1, d: 1},"
+                                 "{a: 2, b: 2, c: 2, d: 2},"
+                                 "{a: 3, b: 3, c: 3, d: 3}]}"));
+
+        assertNumSolutions(internalQueryEnumerationMaxOrSolutions);
+    }
+
+    //
+    // Test the "split limited sort stages" hack.
+    //
+
+    TEST_F(QueryPlannerTest, SplitLimitedSort) {
+        params.options = QueryPlannerParams::NO_TABLE_SCAN;
+        params.options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+        addIndex(BSON("a" << 1));
+        addIndex(BSON("b" << 1));
+
+        runQuerySortProjSkipLimit(fromjson("{a: 1}"), fromjson("{b: 1}"),
+                                  BSONObj(), 0, 3);
+
+        assertNumSolutions(2U);
+        // First solution has no blocking stage; no need to split.
+        assertSolutionExists("{fetch: {filter: {a:1}, node: "
+                                "{ixscan: {filter: null, pattern: {b: 1}}}}}");
+        // Second solution has a blocking sort with a limit: it gets split and
+        // joined with an OR stage.
+        assertSolutionExists("{or: {nodes: ["
+                                "{sort: {pattern: {b: 1}, limit: 3, node: "
+                                    "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}, "
+                                "{sort: {pattern: {b: 1}, limit: 0, node: "
+                                    "{fetch: {node: {ixscan: {pattern: {a: 1}}}}}}}]}}");
     }
 
     //

@@ -81,6 +81,7 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
+#include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/gcov.h"
@@ -835,6 +836,7 @@ namespace mongo {
             // operation might not support interrupts.
             bool mayInterrupt = cc().curop()->parent() == NULL;
 
+            cc().curop()->setQuery(js);
             Status status = collection->getIndexCatalog()->createIndex( js, mayInterrupt );
 
             if ( status.code() == ErrorCodes::IndexAlreadyExists )
@@ -1052,6 +1054,14 @@ namespace {
 
     DBClientBase * createDirectClient() {
         return new DBDirectClient();
+    }
+
+    MONGO_INITIALIZER(CreateJSDirectClient)
+        (InitializerContext* context) {
+
+        directDBClient = createDirectClient();
+
+        return Status::OK();
     }
 
     mongo::mutex exitMutex("exit");

@@ -90,6 +90,26 @@ try {
     t.find().sort( {a:1} ).itcount();
     checkLastOp( [ [ "scanAndOrder", true ] ] );
     
+    t.ensureIndex( {a:1} );
+    t.find( {a:1} ).itcount();
+    o = lastOp();
+    assert.eq( "FETCH", o.execStats.type, tojson( o.execStats ) );
+    assert.eq( "IXSCAN", o.execStats.children[0].type, tojson( o.execStats ) );
+
+    // For queries with a lot of stats data, the execution stats in the profile
+    // is replaced by the plan summary.
+    var orClauses = 32;
+    var bigOrQuery = { $or: [] };
+    for ( var i = 0; i < orClauses; ++i ) {
+        var indexSpec = {};
+        indexSpec[ "a" + i ] = 1;
+        t.ensureIndex( indexSpec );
+        bigOrQuery[ "$or" ].push( indexSpec );
+    }
+    t.find( bigOrQuery ).itcount();
+    o = lastOp();
+    assert.neq( undefined, o.execStats.summary, tojson( o.execStats ) );
+
     db.setProfilingLevel(0);
     db.system.profile.drop();    
 }

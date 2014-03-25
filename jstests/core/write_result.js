@@ -111,7 +111,7 @@ printjson( result = coll.update({ foo : "bar" }, { $invalid : "expr" }) );
 assert.eq(result.nUpserted, 0);
 assert.eq(result.nMatched, 0);
 if (coll.getMongo().writeMode() == "commands")
-    assert.eq(undefined, result.nModified, result);
+    assert.eq(0, result.nModified, result);
 assert(result.getWriteError());
 assert(result.getWriteError().errmsg);
 assert(!result.getUpsertedId());
@@ -131,7 +131,7 @@ printjson( result = coll.update({},
 assert.eq(result.nUpserted, 0);
 assert.eq(result.nMatched, 0);
 if (coll.getMongo().writeMode() == "commands")
-    assert.eq(undefined, result.nModified, result);
+    assert.eq(0, result.nModified, result);
 assert(result.getWriteError());
 assert(result.getWriteError().errmsg);
 assert(!result.getUpsertedId());
@@ -143,7 +143,7 @@ coll.remove({});
 printjson( result = coll.insert([{ foo : "bar" }, { foo : "baz" }]) );
 assert.eq(result.nInserted, 2);
 assert(!result.hasWriteErrors());
-assert(!result.getWriteConcernError());
+assert(!result.hasWriteConcernError());
 assert.eq(coll.count(), 2);
 
 //
@@ -155,7 +155,7 @@ printjson( result = coll.insert([{ _id : id, foo : "bar" },
                                  { _id : id, foo : "baz" }]) );
 assert.eq(result.nInserted, 1);
 assert(result.hasWriteErrors());
-assert(!result.getWriteConcernError());
+assert(!result.hasWriteConcernError());
 assert.eq(coll.count(), 1);
 
 //
@@ -174,16 +174,11 @@ coll.unsetWriteConcern();
 // Write concern error
 // NOTE: Non-throwing write concern failures require replication to trigger
 coll.remove({});
-coll.setWriteConcern({ w : "invalid" });
-assert.throws( function() {
-    printjson( coll.insert({ foo : "bar" }) );
-});
+assert.writeError( coll.insert({ foo : "bar" }, { writeConcern : { w : "invalid" } }) );
 if (coll.getMongo().writeMode() == "commands")
     assert.eq(coll.count(), 0);
 else 
     assert.eq(coll.count(), 1);
-
-coll.unsetWriteConcern();
 
 
 
