@@ -331,10 +331,11 @@ namespace mongo {
         return ok;
     }
 
+    // Mongod on win32 defines a value for this function. In all other executables it is NULL.
     void (*reportEventToSystem)(const char *msg) = 0;
 
-    void mongoAbort(const char *msg) { 
-        if( reportEventToSystem ) 
+    void mongoAbort(const char *msg) {
+        if( reportEventToSystem )
             reportEventToSystem(msg);
         severe() << msg;
         ::abort();
@@ -818,7 +819,8 @@ namespace mongo {
         return ok;
     }
 
-    void checkAndInsert(Client::Context& ctx, const char *ns, /*modifies*/BSONObj& js) {
+    void checkAndInsert(Client::Context& ctx, const char *ns, /*modifies*/BSONObj& js,
+                        PregeneratedKeys* preGen ) {
         if ( nsToCollectionSubstring( ns ) == "system.indexes" ) {
             string targetNS = js["ns"].String();
             uassertStatusOK( userAllowedWriteNS( targetNS ) );
@@ -858,7 +860,7 @@ namespace mongo {
             verify( collection );
         }
 
-        StatusWith<DiskLoc> status = collection->insertDocument( js, true );
+        StatusWith<DiskLoc> status = collection->insertDocument( js, true, preGen );
         uassertStatusOK( status.getStatus() );
         logOp("i", ns, js);
     }
@@ -867,7 +869,7 @@ namespace mongo {
         size_t i;
         for (i=0; i<objs.size(); i++){
             try {
-                checkAndInsert(ctx, ns, objs[i]);
+                checkAndInsert(ctx, ns, objs[i], NULL);
                 getDur().commitIfNeeded();
             } catch (const UserException&) {
                 if (!keepGoing || i == objs.size()-1){
@@ -907,25 +909,36 @@ namespace mongo {
             uassertStatusOK(status);
         }
 
+        PregeneratedKeys tempHack;
+        if ( multi.size() == 1 ) {
+            StatusWith<BSONObj> fixed = fixDocumentForInsert( multi[0] );
+            uassertStatusOK( fixed.getStatus() );
+            if ( !fixed.getValue().isEmpty() )
+                multi[0] = fixed.getValue();
+
+            GeneratorHolder::getInstance()->prepare( ns, multi[0], &tempHack );
+        }
+
         PageFaultRetryableSection s;
         while ( true ) {
             try {
                 Lock::DBWrite lk(ns);
-                
+
                 // CONCURRENCY TODO: is being read locked in big log sufficient here?
                 // writelock is used to synchronize stepdowns w/ writes
                 uassert( 10058 , "not master", isMasterNs(ns) );
-                
+
                 if ( handlePossibleShardedMessage( m , 0 ) )
                     return;
-                
+
                 Client::Context ctx(ns);
-                
+
                 if (multi.size() > 1) {
                     const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
                     insertMulti(ctx, keepGoing, ns, multi, op);
-                } else {
-                    checkAndInsert(ctx, ns, multi[0]);
+                }
+                else {
+                    checkAndInsert(ctx, ns, multi[0], &tempHack);
                     globalOpCounters.incInsertInWriteLock(1);
                     op.debug().ninserted = 1;
                 }
@@ -1071,22 +1084,6 @@ namespace {
         return numExitCalls > 0;
     }
 
-    void tryToOutputFatal( const string& s ) {
-        try {
-            rawOut( s );
-            return;
-        }
-        catch ( ... ) {}
-
-        try {
-            cerr << s << endl;
-            return;
-        }
-        catch ( ... ) {}
-
-        // uh - oh, not sure there is anything else we can do...
-    }
-
     static void shutdownServer() {
 
         log() << "shutdown: going to close listening sockets..." << endl;
@@ -1183,25 +1180,19 @@ namespace {
                     // this means something horrible has happened
                     ::_exit( rc );
                 }
-                stringstream ss;
-                ss << "dbexit: " << why << "; exiting immediately";
-                tryToOutputFatal( ss.str() );
+                log() << "dbexit: " << why << "; exiting immediately";
                 if ( c ) c->shutdown();
                 ::_exit( rc );
             }
         }
 
-        {
-            stringstream ss;
-            ss << "dbexit: " << why;
-            tryToOutputFatal( ss.str() );
-        }
+        log() << "dbexit: " << why;
 
         try {
             shutdownServer(); // gracefully shutdown instance
         }
         catch ( ... ) {
-            tryToOutputFatal( "shutdown failed with exception" );
+            severe() << "shutdown failed with exception";
         }
 
 #if defined(_DEBUG)
@@ -1224,7 +1215,7 @@ namespace {
             return;
         }
 #endif
-        tryToOutputFatal( "dbexit: really exiting now\n" );
+        log() << "dbexit: really exiting now";
         if ( c ) c->shutdown();
         ::_exit(rc);
     }

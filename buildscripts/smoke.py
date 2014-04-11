@@ -398,7 +398,7 @@ def skipTest(path):
     parentPath = os.path.dirname(path)
     parentDir = os.path.basename(parentPath)
     if small_oplog: # For tests running in parallel
-        if basename in ["cursor8.js", "indexh.js", "dropdb.js", 
+        if basename in ["cursor8.js", "indexh.js", "dropdb.js", "dropdb_race.js", 
                         "connections_opened.js", "opcounters.js", "dbadmin.js"]:
             return True
     if use_ssl:
@@ -442,11 +442,13 @@ def skipTest(path):
 
     return False
 
+forceCommandsForDirs = ["aggregation", "auth", "core", "parallel", "replsets"]
+# look for jstests and one of the above suites separated by either posix or windows slashes
+forceCommandsRE = re.compile(r"jstests[/\\](%s)" % ('|'.join(forceCommandsForDirs)))
 def setShellWriteModeForTest(path, argv):
-    forceCommandsForSuite = ["aggregation", "replsets", "parallel"]
-    swm = shell_write_mode;
+    swm = shell_write_mode
     if swm == "legacy": # change when the default changes to "commands"
-        if use_write_commands or [s for s in forceCommandsForSuite if s in path]:
+        if use_write_commands or forceCommandsRE.search(path):
             swm = "commands"
     argv += ["--writeMode", swm]
 
@@ -814,12 +816,12 @@ def report():
 
 # Keys are the suite names (passed on the command line to smoke.py)
 # Values are pairs: (filenames, <start mongod before running tests>)
-suiteGlobalConfig = {"js": ("[!_]*.js", True),
+suiteGlobalConfig = {"js": ("core/*.js", True),
                      "quota": ("quota/*.js", True),
                      "jsPerf": ("perf/*.js", True),
                      "disk": ("disk/*.js", True),
-                     "jsSlowNightly": ("slowNightly/*.js", True),
-                     "jsSlowWeekly": ("slowWeekly/*.js", False),
+                     "noPassthroughWithMongod": ("noPassthroughWithMongod/*.js", True),
+                     "noPassthrough": ("noPassthrough/*.js", False),
                      "parallel": ("parallel/*.js", True),
                      "clone": ("clone/*.js", False),
                      "repl": ("repl/*.js", False),
@@ -833,8 +835,10 @@ suiteGlobalConfig = {"js": ("[!_]*.js", True),
                      "failPoint": ("fail_point/*.js", False),
                      "ssl": ("ssl/*.js", True),
                      "sslSpecial": ("sslSpecial/*.js", True),
-                     "jsCore": ("core/[!_]*.js", True),
+                     "jsCore": ("core/*.js", True),
                      "gle": ("gle/*.js", True),
+                     "slow1": ("slow1/*.js", True),
+                     "slow2": ("slow2/*.js", True),
                      }
 
 def get_module_suites():
@@ -898,15 +902,17 @@ def expand_suites(suites,expandUseDB=True):
         if suite == 'all':
             return expand_suites(['test', 
                                   'perf', 
-                                  'js', 
+                                  'jsCore', 
                                   'jsPerf', 
-                                  'jsSlowNightly', 
-                                  'jsSlowWeekly', 
+                                  'noPassthroughWithMongod', 
+                                  'noPassthrough', 
                                   'clone', 
                                   'parallel', 
                                   'repl', 
                                   'auth', 
                                   'sharding', 
+                                  'slow1',
+                                  'slow2',
                                   'tool'],
                                  expandUseDB=expandUseDB)
         if suite == 'test':

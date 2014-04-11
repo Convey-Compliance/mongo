@@ -46,7 +46,6 @@ env.Library('foundation',
               'util/file.cpp',
               'util/log.cpp',
               'util/platform_init.cpp',
-              'util/signal_handlers.cpp',
               'util/text.cpp',
               'util/time_support.cpp',
               'util/timer.cpp',
@@ -484,6 +483,7 @@ coreServerFiles = [ "db/client_basic.cpp",
                     "db/stats/counters.cpp",
                     "db/stats/service_stats.cpp",
                     "db/log_process_details.cpp",
+                    "db/conn_pool_options.cpp"
                     ]
 
 env.Library('ntservice', ['util/ntservice.cpp'],
@@ -605,6 +605,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/catalog/index_catalog.cpp",
                     "db/catalog/index_catalog_entry.cpp",
                     "db/catalog/index_create.cpp",
+                    "db/catalog/index_pregen.cpp",
                     "db/catalog/collection.cpp",
                     "db/structure/collection_compact.cpp",
                     "db/catalog/collection_cursor_cache.cpp",
@@ -899,6 +900,7 @@ mongodAndMongosFiles = [
     "db/initialize_server_global_state.cpp",
     "db/server_extra_log_context.cpp",
     "db/dbwebserver.cpp",
+    "util/signal_handlers.cpp",
     ]
 env.Library("mongodandmongos", mongodAndMongosFiles,
             LIBDEPS=["message_server_port"])

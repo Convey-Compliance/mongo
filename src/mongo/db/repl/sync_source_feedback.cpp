@@ -79,6 +79,8 @@ namespace mongo {
                 _me = b.obj();
                 Helpers::putSingleton("local.me", _me);
             }
+            // _me is used outside of a read lock, so we must copy it out of the mmap
+            _me = _me.getOwned();
         }
     }
 
@@ -150,6 +152,7 @@ namespace mongo {
         if (hasConnection()) {
             return true;
         }
+        log() << "replset setting syncSourceFeedback to " << hostName << rsLog;
         _connection.reset(new DBClientConnection(false, 0, OplogReader::tcp_timeout));
         string errmsg;
         if (!_connection->connect(hostName.c_str(), errmsg) ||
