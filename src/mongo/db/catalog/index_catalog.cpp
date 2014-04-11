@@ -32,6 +32,7 @@
 
 #include <vector>
 
+#include "mongo/base/owned_pointer_map.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
@@ -40,6 +41,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/db.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/index/2d_access_method.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -57,6 +59,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/pagefault.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/rs.h" // this is ugly
 #include "mongo/db/storage/data_file.h"
@@ -118,6 +121,9 @@ namespace mongo {
         }
 
         _magic = INDEX_CATALOG_INIT;
+
+        GeneratorHolder::getInstance()->reset( _collection );
+
         return Status::OK();
     }
 
@@ -778,7 +784,7 @@ namespace mongo {
         }
         else {
             if ( numIndexesTotal() || numSystemIndexesEntries || _entries.size() ) {
-                error() << "about to fassert - "
+                error() << "About to fassert - "
                         << " numIndexesTotal(): " << numIndexesTotal()
                         << " numSystemIndexesEntries: " << numSystemIndexesEntries
                         << " _entries.size(): " << _entries.size()
@@ -1006,6 +1012,11 @@ namespace mongo {
         return _prev->accessMethod();
     }
 
+    IndexCatalogEntry* IndexCatalog::IndexIterator::entry( IndexDescriptor* desc ) {
+        invariant( desc == _prev->descriptor() );
+        return _prev;
+    }
+
     void IndexCatalog::IndexIterator::_advance() {
         _next = NULL;
 
@@ -1066,8 +1077,14 @@ namespace mongo {
             if ( !keyPattern.isPrefixOf( desc->keyPattern() ) )
                 continue;
 
-            if( !desc->isMultikey() )
+            if( !desc->isMultikey() ) {
                 return desc;
+            }
+            else if ( desc->isIdIndex() ) {
+                 warning() << "_id index is marked as multi-key"
+                           << " ns: " << _collection->ns()
+                           << " key: " << desc->keyPattern();
+            }
 
             if ( !requireSingleKey )
                 best = desc;
@@ -1121,7 +1138,7 @@ namespace mongo {
         if (IndexNames::GEO_2D == type)
             return new TwoDAccessMethod( entry );
 
-        log() << "Can't find index for keypattern " << desc->keyPattern();
+        log() << "Can't find index for keyPattern " << desc->keyPattern();
         invariant(0);
         return NULL;
     }
@@ -1136,18 +1153,19 @@ namespace mongo {
 
     Status IndexCatalog::_indexRecord( IndexCatalogEntry* index,
                                        const BSONObj& obj,
-                                       const DiskLoc &loc ) {
+                                       const DiskLoc &loc,
+                                       const PregeneratedKeysOnIndex* prep ) {
         InsertDeleteOptions options;
         options.logIfError = false;
 
         bool isUnique =
-            KeyPattern::isIdKeyPattern(index->descriptor()->keyPattern()) ||
+            index->descriptor()->isIdIndex() ||
             index->descriptor()->unique();
 
         options.dupsAllowed = ignoreUniqueIndex( index->descriptor() ) || !isUnique;
 
         int64_t inserted;
-        return index->accessMethod()->insert(obj, loc, options, &inserted);
+        return index->accessMethod()->insert(obj, loc, options, &inserted, prep );
     }
 
     Status IndexCatalog::_unindexRecord( IndexCatalogEntry* index,
@@ -1168,8 +1186,31 @@ namespace mongo {
         return Status::OK();
     }
 
+    void IndexCatalog::touch( const PregeneratedKeys* preGen ) const {
+        if ( !cc().allowedToThrowPageFaultException() ) {
+            // no point touching if we can't throw
+            return;
+        }
 
-    void IndexCatalog::indexRecord( const BSONObj& obj, const DiskLoc &loc ) {
+        // touch what we can
+        for ( IndexCatalogEntryContainer::const_iterator i = _entries.begin();
+              i != _entries.end();
+              ++i ) {
+
+            IndexCatalogEntry* entry = *i;
+            shared_ptr<KeyGenerator> gen = entry->accessMethod()->getKeyGenerator();
+            const PregeneratedKeysOnIndex* perIndex = preGen->get( entry );
+            if ( perIndex &&
+                 perIndex->generator->getId() == gen->getId() ) {
+                entry->accessMethod()->touch( perIndex->keys );
+            }
+        }
+
+    }
+
+    void IndexCatalog::indexRecord( const BSONObj& obj,
+                                    const DiskLoc &loc,
+                                    const PregeneratedKeys* preGen ) {
 
         for ( IndexCatalogEntryContainer::const_iterator i = _entries.begin();
               i != _entries.end();
@@ -1177,8 +1218,12 @@ namespace mongo {
 
             IndexCatalogEntry* entry = *i;
 
+            const PregeneratedKeysOnIndex* perIndex = NULL;
+            if ( preGen )
+                perIndex = preGen->get( entry );
+
             try {
-                Status s = _indexRecord( entry, obj, loc );
+                Status s = _indexRecord( entry, obj, loc, perIndex );
                 uassert(s.location(), s.reason(), s.isOK() );
             }
             catch ( AssertionException& ae ) {
@@ -1222,7 +1267,9 @@ namespace mongo {
 
     }
 
-    Status IndexCatalog::checkNoIndexConflicts( const BSONObj &obj ) {
+    Status IndexCatalog::checkNoIndexConflicts( const BSONObj &obj,
+                                                const PregeneratedKeys* preGen ) {
+        // TODO: preGen
         IndexIterator ii = getIndexIterator( true );
         while ( ii.more() ) {
             IndexDescriptor* descriptor = ii.next();

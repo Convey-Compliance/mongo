@@ -66,8 +66,8 @@ namespace mongo {
             }
             checkNS(collNames);
         }
-        catch (const DBException&) {
-            warning() << "index rebuilding did not complete" << endl;
+        catch (const DBException& e) {
+            warning() << "Index rebuilding did not complete: " << e.what() << endl;
         }
         boost::unique_lock<boost::mutex> lk(ReplSet::rss.mtx);
         ReplSet::rss.indexRebuildDone = true;
@@ -95,7 +95,7 @@ namespace mongo {
             IndexCatalog* indexCatalog = collection->getIndexCatalog();
 
             if ( collection->ns().isOplog() && indexCatalog->numIndexesTotal() > 0 ) {
-                warning() << ns << " had ilegal indexes, removing";
+                warning() << ns << " had illegal indexes, removing";
                 indexCatalog->dropAllIndexes( true );
                 continue;
             }
