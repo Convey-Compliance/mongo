@@ -38,6 +38,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/background.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/dbhash.h"
@@ -520,9 +521,9 @@ namespace mongo {
                     if ( status.isOK() ) {
                         // yay
                     }
-                    else if ( status.code() == ErrorCodes::CannotCreateIndex &&
-                              status.location() == IndexOptionsDiffer ) {
-                        // SERVER-13206
+                    else if ( status.code() == ErrorCodes::IndexOptionsConflict ||
+                              status.code() == ErrorCodes::IndexKeySpecsConflict ) {
+                        // SERVER-13206, SERVER-13496
                         // 2.4 (and earlier) will add an ensureIndex to an oplog if its ok or not
                         // so in 2.6+ where we do stricter validation, it will fail
                         // but we shouldn't care as the primary is responsible
@@ -654,10 +655,36 @@ namespace mongo {
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
         else if ( *opType == 'c' ) {
-            BufBuilder bb;
-            BSONObjBuilder ob;
-            _runCommands(ns, o, bb, ob, true, 0);
-            // _runCommands takes care of adjusting opcounters for command counting.
+            bool done = false;
+            while (!done) {
+                BufBuilder bb;
+                BSONObjBuilder ob;
+                _runCommands(ns, o, bb, ob, true, 0);
+                // _runCommands takes care of adjusting opcounters for command counting.
+                Status status = Command::getStatusFromCommandResult(ob.done());
+                switch (status.code()) {
+                case ErrorCodes::BackgroundOperationInProgressForDatabase: {
+                    dbtemprelease release;
+                    BackgroundOperation::awaitNoBgOpInProgForDb(nsToDatabaseSubstring(ns));
+                    break;
+                }
+                case ErrorCodes::BackgroundOperationInProgressForNamespace: {
+                    dbtemprelease release;
+                    BackgroundOperation::awaitNoBgOpInProgForNs(
+                            Command::findCommand(o.firstElement().fieldName())->parseNs(
+                                    nsToDatabase(ns), o));
+                    break;
+                }
+                default:
+                    warning() << "repl Failed command " << o << " on " <<
+                        nsToDatabaseSubstring(ns) << " with status " << status <<
+                        " during oplog application";
+                    // fallthrough
+                case ErrorCodes::OK:
+                    done = true;
+                    break;
+                }
+            }
         }
         else if ( *opType == 'n' ) {
             // no op

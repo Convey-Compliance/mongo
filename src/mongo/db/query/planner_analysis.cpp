@@ -300,7 +300,17 @@ namespace mongo {
             // See if it's the order we're looking for.
             BSONObj possibleSort = resultingSortBob.obj();
             if (!desiredSort.isPrefixOf(possibleSort)) {
-                return false;
+                // We can't get the sort order from the index scan. See if we can
+                // get the sort by reversing the scan.
+                BSONObj reversePossibleSort = QueryPlannerCommon::reverseSortObj(possibleSort);
+                if (!desiredSort.isPrefixOf(reversePossibleSort)) {
+                    // Can't get the sort order from the reversed index scan either. Give up.
+                    return false;
+                }
+                else {
+                    // We can get the sort order we need if we reverse the scan.
+                    QueryPlannerCommon::reverseScans(isn);
+                }
             }
 
             // Do some bookkeeping to see how many ixscans we'll create total.
@@ -406,8 +416,11 @@ namespace mongo {
         // the limit N and skip count M. The sort should return an ordered list
         // N + M items so that the skip stage can discard the first M results.
         if (0 != query.getParsed().getNumToReturn()) {
-            sort->limit = query.getParsed().getNumToReturn() +
-                          query.getParsed().getSkip();
+            // Overflow here would be bad and could cause a nonsense limit. Cast
+            // skip and limit values to unsigned ints to make sure that the
+            // sum is never stored as signed. (See SERVER-13537).
+            sort->limit = size_t(query.getParsed().getNumToReturn()) +
+                          size_t(query.getParsed().getSkip());
 
             // This is a SORT with a limit. The wire protocol has a single quantity
             // called "numToReturn" which could mean either limit or batchSize.

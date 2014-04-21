@@ -1086,7 +1086,7 @@ namespace {
     }
 
     //
-    // Basic sort elimination
+    // Sort elimination
     //
 
     TEST_F(QueryPlannerTest, BasicSortElim) {
@@ -1109,6 +1109,31 @@ namespace {
                                 "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
         assertSolutionExists("{fetch: {filter: null, node: {ixscan: "
                                 "{filter: null, pattern: {a: 1, b: 1}}}}}");
+    }
+
+    // SERVER-13611: test that sort elimination still works if there are
+    // trailing fields in the index.
+    TEST_F(QueryPlannerTest, SortElimTrailingFields) {
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1));
+        runQuerySortProj(fromjson("{a: 5}"), BSON("b" << 1), BSONObj());
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{sort: {pattern: {b: 1}, limit: 0, "
+                                "node: {cscan: {dir: 1, filter: {a: 5}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: {ixscan: "
+                                "{filter: null, pattern: {a: 1, b: 1, c: 1}}}}}");
+    }
+
+    // Sort elimination with trailing fields where the sort direction is descending.
+    TEST_F(QueryPlannerTest, SortElimTrailingFieldsReverse) {
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1 << "d" << 1));
+        runQuerySortProj(fromjson("{a: 5, b: 6}"), BSON("c" << -1), BSONObj());
+
+        ASSERT_EQUALS(getNumSolutions(), 2U);
+        assertSolutionExists("{sort: {pattern: {c: -1}, limit: 0, "
+                                "node: {cscan: {dir: 1, filter: {a: 5, b: 6}}}}}");
+        assertSolutionExists("{fetch: {filter: null, node: {ixscan: "
+                                "{filter: null, dir: -1, pattern: {a: 1, b: 1, c: 1, d: 1}}}}}");
     }
 
     //
@@ -1276,6 +1301,47 @@ namespace {
         assertSolutionExists("{cscan: {dir: 1, filter: {a:[1,2,3]}}}");
         assertSolutionExists("{fetch: {filter: {a:[1,2,3]}, node: "
                                 "{ixscan: {filter: null, pattern: {a: 1}}}}}");
+    }
+
+    // SERVER-13664
+    TEST_F(QueryPlannerTest, ElemMatchEmbeddedAnd) {
+        // true means multikey
+        addIndex(BSON("a.b" << 1 << "a.c" << 1), true);
+        runQuery(fromjson("{a: {$elemMatch: {b: {$gte: 2, $lt: 4}, c: 25}}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$elemMatch:{b:{$gte:2,$lt: 4},c:25}}}, node: "
+                                "{ixscan: {filter: null, pattern: {'a.b': 1, 'a.c': 1}, "
+                                "bounds: {'a.b': [[-Infinity,4,true,false]], "
+                                         "'a.c': [[25,25,true,true]]}}}}}");
+    }
+
+    // SERVER-13664
+    TEST_F(QueryPlannerTest, ElemMatchEmbeddedOr) {
+        // true means multikey
+        addIndex(BSON("a.b" << 1), true);
+        // true means multikey
+        addIndex(BSON("a.c" << 1), true);
+        runQuery(fromjson("{a: {$elemMatch: {$or: [{b: 3}, {c: 4}]}}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$elemMatch:{$or:[{b:3},{c:4}]}}}, "
+                                "node: {or: {nodes: ["
+                                    "{ixscan: {filter: null, pattern: {'a.b': 1}}}, "
+                                    "{ixscan: {filter: null, pattern: {'a.c': 1}}}]}}}}");
+    }
+
+    // SERVER-13664
+    TEST_F(QueryPlannerTest, ElemMatchEmbeddedRegex) {
+        addIndex(BSON("a.b" << 1));
+        runQuery(fromjson("{a: {$elemMatch: {b: /foo/}}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$elemMatch:{b:/foo/}}}, node: "
+                                "{ixscan: {filter: null, pattern: {'a.b': 1}}}}}");
     }
 
     // $not can appear as a value operator inside of an elemMatch (value).  We shouldn't crash if we
@@ -1623,6 +1689,37 @@ namespace {
                              "node: {cscan: {dir: 1}}}}");
         assertSolutionExists("{sort: {pattern: {d: 1}, limit: 1, node: "
                              "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1, c:1, d:1}}}}}}}");
+    }
+
+    // SERVER-13618: test that exploding scans for sort works even
+    // if we must reverse the scan direction.
+    TEST_F(QueryPlannerTest, ExplodeMustReverseScans) {
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << 1 << "d" << 1));
+        runQuerySortProj(fromjson("{a: {$in: [1, 2]}, b: {$in: [3, 4]}}"),
+                         BSON("c" << -1), BSONObj());
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{sort: {pattern: {c: -1}, limit: 0, node: {cscan: {dir: 1}}}}");
+        assertSolutionExists("{fetch: {node: {mergeSort: {nodes: "
+                                "[{ixscan: {pattern: {a:1, b:1, c:1, d:1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:1, d:1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:1, d:1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:1, d:1}}}]}}}}");
+    }
+
+    // SERVER-13618
+    TEST_F(QueryPlannerTest, ExplodeMustReverseScans2) {
+        addIndex(BSON("a" << 1 << "b" << 1 << "c" << -1));
+        runQuerySortProj(fromjson("{a: {$in: [1, 2]}, b: {$in: [3, 4]}}"),
+                         BSON("c" << 1), BSONObj());
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{sort: {pattern: {c: 1}, limit: 0, node: {cscan: {dir: 1}}}}");
+        assertSolutionExists("{fetch: {node: {mergeSort: {nodes: "
+                                "[{ixscan: {pattern: {a:1, b:1, c:-1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:-1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:-1}}},"
+                                 "{ixscan: {pattern: {a:1, b:1, c:-1}}}]}}}}");
     }
 
     TEST_F(QueryPlannerTest, InWithSortAndLimitTrailingField) {
@@ -2113,6 +2210,15 @@ namespace {
         assertSolutionExists("{cscan: {dir: 1}}");
     }
 
+    // Negated $elemMatch value won't use the index
+    TEST_F(QueryPlannerTest, NegationElemMatchValue) {
+        addIndex(BSON("i" << 1));
+        runQuery(fromjson("{i: {$not: {$elemMatch: {$gt: 3, $lt: 10}}}}"));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+    }
+
     // Negated $elemMatch object won't use the index
     TEST_F(QueryPlannerTest, NegationElemMatchObject) {
         addIndex(BSON("i.j" << 1));
@@ -2241,6 +2347,43 @@ namespace {
         assertSolutionExists("{fetch: {node: {ixscan: {pattern: {x:1,a:1}, bounds: "
                                 "{x: [[1,1,true,true]], "
                                  "a: [['MinKey',1,true,false], [1,'MaxKey',false,true]]}}}}}");
+    }
+
+    TEST_F(QueryPlannerTest, NEOnMultikeyIndex) {
+        // true means multikey
+        addIndex(BSON("a" << 1), true);
+        runQuery(fromjson("{a: {$ne: 3}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$ne:3}}, node: {ixscan: {pattern: {a:1}, "
+                                 "bounds: {a: [['MinKey',3,true,false],"
+                                              "[3,'MaxKey',false,true]]}}}}}");
+    }
+
+    // In general, a negated $nin can make use of an index.
+    TEST_F(QueryPlannerTest, NinUsesMultikeyIndex) {
+        // true means multikey
+        addIndex(BSON("a" << 1), true);
+        runQuery(fromjson("{a: {$nin: [4, 10]}}"));
+
+        assertNumSolutions(2U);
+        assertSolutionExists("{cscan: {dir: 1}}");
+        assertSolutionExists("{fetch: {filter: {a:{$nin:[4,10]}}, node: {ixscan: {pattern: {a:1}, "
+                                "bounds: {a: [['MinKey',4,true,false],"
+                                             "[4,10,false,false],"
+                                             "[10,'MaxKey',false,true]]}}}}}");
+    }
+
+    // But it can't if the $nin contains a regex because regex bounds can't
+    // be complemented.
+    TEST_F(QueryPlannerTest, NinCantUseMultikeyIndex) {
+        // true means multikey
+        addIndex(BSON("a" << 1), true);
+        runQuery(fromjson("{a: {$nin: [4, /foobar/]}}"));
+
+        assertNumSolutions(1U);
+        assertSolutionExists("{cscan: {dir: 1}}");
     }
 
     //
