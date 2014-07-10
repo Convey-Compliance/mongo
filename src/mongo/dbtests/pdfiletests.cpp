@@ -101,6 +101,37 @@ namespace PdfileTests {
             }
         };
 
+        class UpdateDate2 : public Base {
+        public:
+            void run() {
+                BSONObj o;
+                {
+                    BSONObjBuilder b;
+                    b.appendTimestamp( "a" );
+                    b.appendTimestamp( "b" );
+                    b.append( "_id", 1 );
+                    o = b.obj();
+                }
+
+                BSONObj fixed = fixDocumentForInsert( o ).getValue();
+                ASSERT_EQUALS( 3, fixed.nFields() );
+                ASSERT( fixed.firstElement().fieldNameStringData() == "_id" );
+                ASSERT( fixed.firstElement().number() == 1 );
+
+                BSONElement a = fixed["a"];
+                ASSERT( o["a"].type() == Timestamp );
+                ASSERT( o["a"].timestampValue() == 0 );
+                ASSERT( a.type() == Timestamp );
+                ASSERT( a.timestampValue() > 0 );
+
+                BSONElement b = fixed["b"];
+                ASSERT( o["b"].type() == Timestamp );
+                ASSERT( o["b"].timestampValue() == 0 );
+                ASSERT( b.type() == Timestamp );
+                ASSERT( b.timestampValue() > 0 );
+            }
+        };
+
         class ValidId : public Base {
         public:
             void run() {
@@ -192,6 +223,51 @@ namespace PdfileTests {
         }
     };
 
+    class CollectionOptionsErrorBadSize {
+    public:
+        void run() {
+            ASSERT_NOT_OK( CollectionOptions().parse( fromjson( "{capped: true, size: -1}" ) ) );
+            ASSERT_NOT_OK( CollectionOptions().parse( fromjson( "{capped: false, size: -1}" ) ) );
+        }
+    };
+
+    class CollectionOptionsErrorBadMax {
+    public:
+        void run() {
+            ASSERT_NOT_OK( CollectionOptions().parse( BSON( "capped" << true << "max"
+                                                                     << ( 1LL << 31 ) ) ) );
+        }
+    };
+
+    class CollectionOptionsIgnoreSizeWrongType {
+    public:
+        void run() {
+            CollectionOptions options;
+            ASSERT_OK( options.parse( fromjson( "{size: undefined, capped: undefined}" ) ) );
+            ASSERT_EQUALS( options.capped, false );
+            ASSERT_EQUALS( options.cappedSize, 0 );
+        }
+    };
+
+    class CollectionOptionsIgnoreMaxWrongType {
+    public:
+        void run() {
+            CollectionOptions options;
+            ASSERT_OK( options.parse( fromjson( "{capped: true, size: 4096, max: ''}" ) ) );
+            ASSERT_EQUALS( options.capped, true );
+            ASSERT_EQUALS( options.cappedSize, 4096 );
+            ASSERT_EQUALS( options.cappedMaxDocs, 0 );
+        }
+    };
+
+    class CollectionOptionsIgnoreUnregisteredFields {
+    public:
+        void run() {
+            ASSERT_OK( CollectionOptions().parse( BSON( "create" << "c" ) ) );
+            ASSERT_OK( CollectionOptions().parse( BSON( "foo" << "bar" ) ) );
+        }
+    };
+
     class All : public Suite {
     public:
         All() : Suite( "pdfile" ) {}
@@ -199,9 +275,15 @@ namespace PdfileTests {
         void setupTests() {
             add< Insert::InsertNoId >();
             add< Insert::UpdateDate >();
+            add< Insert::UpdateDate2 >();
             add< Insert::ValidId >();
             add< ExtentSizing >();
             add< CollectionOptionsRoundTrip >();
+            add< CollectionOptionsErrorBadSize >();
+            add< CollectionOptionsErrorBadMax >();
+            add< CollectionOptionsIgnoreSizeWrongType >();
+            add< CollectionOptionsIgnoreMaxWrongType >();
+            add< CollectionOptionsIgnoreUnregisteredFields >();
         }
     } myall;
 

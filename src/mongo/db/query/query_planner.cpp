@@ -410,10 +410,18 @@ namespace mongo {
             return Status::OK();
         }
 
-        // The hint can be $natural: 1.  If this happens, output a collscan.
-        if (!query.getParsed().getHint().isEmpty()) {
-            BSONElement natural = query.getParsed().getHint().getFieldDotted("$natural");
-            if (!natural.eoo()) {
+        // The hint or sort can be $natural: 1.  If this happens, output a collscan. If both
+        // a $natural hint and a $natural sort are specified, then the direction of the collscan
+        // is determined by the sign of the sort (not the sign of the hint).
+        if (!query.getParsed().getHint().isEmpty() || !query.getParsed().getSort().isEmpty()) {
+            BSONObj hintObj = query.getParsed().getHint();
+            BSONObj sortObj = query.getParsed().getSort();
+            BSONElement naturalHint = hintObj.getFieldDotted("$natural");
+            BSONElement naturalSort = sortObj.getFieldDotted("$natural");
+
+            // A hint overrides a $natural sort. This means that we don't force a table
+            // scan if there is a $natural sort with a non-$natural hint.
+            if (!naturalHint.eoo() || (!naturalSort.eoo() && hintObj.isEmpty())) {
                 QLOG() << "Forcing a table scan due to hinted $natural\n";
                 // min/max are incompatible with $natural.
                 if (canTableScan && query.getParsed().getMin().isEmpty()
@@ -598,6 +606,8 @@ namespace mongo {
             RelevantTag* tag = static_cast<RelevantTag*>(gnNode->getTag());
             if (0 == tag->first.size() && 0 == tag->notFirst.size()) {
                 QLOG() << "Unable to find index for $geoNear query." << endl;
+                // Don't leave tags on query tree.
+                query.root()->resetTag();
                 return Status(ErrorCodes::BadValue, "unable to find index for $geoNear query");
             }
 
@@ -809,9 +819,27 @@ namespace mongo {
             if (!usingIndexToSort) {
                 for (size_t i = 0; i < params.indices.size(); ++i) {
                     const IndexEntry& index = params.indices[i];
+                    // Only regular (non-plugin) indexes can be used to provide a sort.
+                    if (index.type != INDEX_BTREE) {
+                        continue;
+                    }
+                    // Only non-sparse indexes can be used to provide a sort.
                     if (index.sparse) {
                         continue;
                     }
+
+                    // TODO: Sparse indexes can't normally provide a sort, because non-indexed
+                    // documents could potentially be missing from the result set.  However, if the
+                    // query predicate can be used to guarantee that all documents to be returned
+                    // are indexed, then the index should be able to provide the sort.
+                    //
+                    // For example:
+                    // - Sparse index {a: 1, b: 1} should be able to provide a sort for
+                    //   find({b: 1}).sort({a: 1}).  SERVER-13908.
+                    // - Index {a: 1, b: "2dsphere"} (which is "geo-sparse", if
+                    //   2dsphereIndexVersion=2) should be able to provide a sort for
+                    //   find({b: GEO}).sort({a:1}).  SERVER-10801.
+
                     const BSONObj kp = LiteParsedQuery::normalizeSortOrder(index.keyPattern);
                     if (providesSort(query, kp)) {
                         QLOG() << "Planner: outputting soln that uses index to provide sort."

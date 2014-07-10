@@ -32,6 +32,7 @@
 #include "mongo/db/structure/btree/btree.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/diskloc.h"
+#include "mongo/db/exec/projection.h"
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
@@ -41,30 +42,6 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/s/d_logic.h"
-
-namespace {
-
-    using namespace mongo;
-
-    /**
-     * Does the query contain a projection on {_id: 1}?
-     */
-    bool hasIDProjection(const CanonicalQuery* query) {
-        // We don't know the answer if the query is NULL.
-        if (!query) {
-            return false;
-        }
-        // No projection means not covered.
-        if (!query->getProj()) {
-            return false;
-        }
-        // Since the only supported projection is {_id: 1},
-        // a valid ParsedProjection is enough to indicate that
-        // we have a covered query.
-        return true;
-     }
-
-} // namespace
 
 namespace mongo {
 
@@ -119,55 +96,73 @@ namespace mongo {
         if (NULL == objOut) {
             // No object requested - nothing to do.
         }
-        else if (hasIDProjection(_query.get())) {
-            // Covered query on _id field only.
-            // Set object to search key.
-            // Search key is retrieved from the canonical query at
-            // construction and always contains the _id field name.
-            // It is possible to construct the ID hack runner with just the collection
-            // and the key object (which could be {"": my_obj_id}) but _query would be null
-            // in that case and the query would never be seen as covered.
-            *objOut = _key.getOwned();
-        }
         else {
-            invariant(!hasIDProjection(_query.get()));
-
-            // Fetch object from storage.
-            Record* record = loc.rec();
-
-            _nscannedObjects++;
-
-            // If the record isn't in memory...
-            if (!Record::likelyInPhysicalMemory(record->dataNoThrowing())) {
-                // And we're allowed to yield ourselves...
-                if (Runner::YIELD_AUTO == _policy) {
-                    // Note what we're yielding to fetch so that we don't crash if the loc is
-                    // deleted during a yield.
-                    _locFetching = loc;
-                    // Yield.  TODO: Do we want to bother yielding if micros < 0?
-                    int micros = ClientCursor::suggestYieldMicros();
-                    ClientCursor::staticYield(micros, "", record);
-                    // This can happen when we're yielded for various reasons (e.g. db/idx dropped).
-                    if (_killed) {
-                        _done = true;
-                        return Runner::RUNNER_DEAD;
-                    }
-                }
+            // If we're sharded, get the config metadata for this collection.  This will be used
+            // later to see if we own the document to be returned.
+            //
+            // Query execution machinery should generally delegate to ShardFilterStage in order to
+            // accomplish this task.  It is only safe to rely on the state of the config metadata
+            // here because it is not possible for the config metadata to change during the lifetime
+            // of the IDHackRunner (since the IDHackRunner returns only a single document, the
+            // config metadata must be the same as it was when the query started).  The one
+            // exception to this is if the query yields when fetching the document, but that case is
+            // currently handled by newRunQuery() (which contains logic to detect this and to throw
+            // SendStaleConfigException if it occurs).
+            CollectionMetadataPtr collectionMetadata;
+            if (shardingState.needCollectionMetadata(_collection->ns().ns())) {
+                collectionMetadata = shardingState.getCollectionMetadata(_collection->ns().ns());
             }
 
-            // Either the data was in memory or we paged it in.
-            *objOut = loc.obj();
+            // If we're not sharded, consider a covered projection (we can't if we're sharded, since
+            // we require a fetch in order to apply the sharding filter).
+            if (!collectionMetadata && hasCoveredProjection()) {
+                // Covered query on _id field only.  Set object to search key.  Search key is
+                // retrieved from the canonical query at construction and always contains the _id
+                // field name.  It is possible to construct the ID hack runner with just the
+                // collection and the key object (which could be {"": my_obj_id}) but _query would
+                // be null in that case and the query would never be seen as covered.
+                *objOut = _key.getOwned();
+            }
+            // Otherwise, fetch the document.
+            else {
+                Record* record = loc.rec();
 
-            // If we're sharded make sure the key belongs to us.  We need the object to do this.
-            if (shardingState.needCollectionMetadata(_collection->ns().ns())) {
-                CollectionMetadataPtr m = shardingState.getCollectionMetadata(_collection->ns().ns());
-                if (m) {
-                    KeyPattern kp(m->getKeyPattern());
-                    if (!m->keyBelongsToMe( kp.extractSingleKey(*objOut))) {
+                _nscannedObjects++;
+
+                // If the record isn't in memory...
+                if (!Record::likelyInPhysicalMemory(record->dataNoThrowing())) {
+                    // And we're allowed to yield ourselves...
+                    if (Runner::YIELD_AUTO == _policy) {
+                        // Note what we're yielding to fetch so that we don't crash if the loc is
+                        // deleted during a yield.
+                        _locFetching = loc;
+                        // Yield.  TODO: Do we want to bother yielding if micros < 0?
+                        int micros = ClientCursor::suggestYieldMicros();
+                        ClientCursor::staticYield(micros, "", record);
+                        // This can happen when we're yielded for various reasons (e.g. db/idx dropped).
+                        if (_killed) {
+                            _done = true;
+                            return Runner::RUNNER_DEAD;
+                        }
+                    }
+                }
+
+                // If we're here, either the data was in memory or we paged it in.
+                *objOut = loc.obj();
+
+                // If we're sharded, make sure the key belongs to us.
+                if (collectionMetadata) {
+                    KeyPattern kp(collectionMetadata->getKeyPattern());
+                    if (!collectionMetadata->keyBelongsToMe(kp.extractSingleKey(*objOut))) {
                         // We have something with a matching _id but it doesn't belong to me.
                         _done = true;
                         return Runner::RUNNER_EOF;
                     }
+                }
+
+                // Apply the projection if one was requested.
+                if (_query && _query->getProj()) {
+                    *objOut = applyProjection(*objOut);
                 }
             }
         }
@@ -179,6 +174,43 @@ namespace mongo {
 
         _done = true;
         return Runner::RUNNER_ADVANCED;
+    }
+
+    BSONObj IDHackRunner::applyProjection(const BSONObj& docObj) const {
+        invariant(_query && _query->getProj());
+
+        // We have a non-covered projection (covered projections should be handled earlier,
+        // in getNext(..). For simple inclusion projections we use a fast path similar to that
+        // implemented in the ProjectionStage. For non-simple inclusion projections we fallback
+        // to ProjectionExec.
+        const BSONObj& projObj = _query->getParsed().getProj();
+
+        if (_query->getProj()->wantIndexKey()) {
+            // $returnKey is specified. This overrides everything else.
+            BSONObjBuilder bob;
+            const BSONObj& queryObj = _query->getParsed().getFilter();
+            bob.append(queryObj["_id"]);
+            return bob.obj();
+        }
+        else if (_query->getProj()->requiresDocument() || _query->getProj()->wantIndexKey()) {
+            // Not a simple projection, so fallback on the regular projection path.
+            BSONObj projectedObj;
+            ProjectionExec projExec(projObj, _query->root());
+            projExec.transform(docObj, &projectedObj);
+            return projectedObj;
+        }
+        else {
+            // This is a simple inclusion projection. Start by getting the set
+            // of fields to include.
+            unordered_set<StringData, StringData::Hasher> includedFields;
+            ProjectionStage::getSimpleInclusionFields(projObj, &includedFields);
+
+            // Apply the simple inclusion projection.
+            BSONObjBuilder bob;
+            ProjectionStage::transformSimpleInclusion(docObj, includedFields, bob);
+
+            return bob.obj();
+        }
     }
 
     bool IDHackRunner::isEOF() {
@@ -227,8 +259,8 @@ namespace mongo {
             BSONElement keyElt = _key.firstElement();
             BSONObj indexBounds = BSON("_id" << BSON_ARRAY( BSON_ARRAY( keyElt << keyElt ) ) );
             (*explain)->setIndexBounds(indexBounds);
-            // Covered projection is only one supported.
-            (*explain)->setIndexOnly(hasIDProjection(_query.get()));
+            // ID hack queries are only considered covered if they have the projection {_id: 1}.
+            (*explain)->setIndexOnly(hasCoveredProjection());
         }
         else if (NULL != planInfo) {
             *planInfo = new PlanInfo();
@@ -243,18 +275,22 @@ namespace mongo {
         return !query.getParsed().showDiskLoc()
             && query.getParsed().getHint().isEmpty()
             && 0 == query.getParsed().getSkip()
-            && canUseProjection(query)
             && CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter())
             && !query.getParsed().hasOption(QueryOption_CursorTailable);
     }
 
     // static
-    bool IDHackRunner::canUseProjection(const CanonicalQuery& query) {
-        const ParsedProjection* proj = query.getProj();
+    bool IDHackRunner::hasCoveredProjection() const {
+        // Some update operations use the IDHackRunner without creating a
+        // canonical query. In this case, _query will be NULL. Just return
+        // false, as we won't have to do any projection handling for updates.
+        if (NULL == _query.get()) {
+            return false;
+        }
 
-        // No projection is OK - ID Hack will fetch entire document.
+        const ParsedProjection* proj = _query->getProj();
         if (!proj) {
-            return true;
+            return false;
         }
 
         // If there is a projection, it has to be a covered projection on

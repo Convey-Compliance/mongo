@@ -412,6 +412,16 @@ namespace mongo {
 
                 LOG(2) << "\t cloner got " << collection << endl;
 
+                BSONElement collectionOptions = collection["options"];
+                if ( collectionOptions.isABSONObj() ) {
+                    Status parseOptionsStatus = CollectionOptions().parse(collectionOptions.Obj());
+                    if ( !parseOptionsStatus.isOK() ) {
+                        errmsg = str::stream() << "invalid collection options: " << collection
+                                               << ", reason: " << parseOptionsStatus.reason();
+                        return false;
+                    }
+                }
+
                 BSONElement e = collection.getField("name");
                 if ( e.eoo() ) {
                     string s = "bad system.namespaces object " + collection.toString();
@@ -466,8 +476,14 @@ namespace mongo {
                 string err;
                 const char *toname = to_name.c_str();
                 /* we defer building id index for performance - building it in batch is much faster */
-                userCreateNS(toname, options, err, opts.logForRepl, false);
+                bool createStatus = userCreateNS(toname, options, err, opts.logForRepl, false);
+                if ( !createStatus ) {
+                    errmsg = str::stream() << "failed to create collection \"" << to_name << "\": "
+                                           << err;
+                    return false;
+                }
             }
+
             LOG(1) << "\t\t cloning " << from_name << " -> " << to_name << endl;
             Query q;
             if( opts.snapshot )

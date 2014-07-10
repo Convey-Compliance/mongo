@@ -85,9 +85,15 @@ namespace mongo {
 
     private:
         /**
-         * ID Hack will work with only one projection: {_id: 1}.
+         * ID Hack queries are only covered with the projection {_id: 1}.
          */
-        static bool canUseProjection(const CanonicalQuery& query);
+        bool hasCoveredProjection() const;
+
+        /**
+         * Apply the projection from '_query' to the given object and return the result.
+         * '_query->getProj()' must be non-NULL.
+         */
+        BSONObj applyProjection(const BSONObj& docObj) const;
 
         // Not owned here.
         const Collection* _collection;

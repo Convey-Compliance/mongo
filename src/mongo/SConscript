@@ -58,7 +58,8 @@ env.Library('foundation',
                      '$BUILD_DIR/mongo/platform/platform',
                      '$BUILD_DIR/mongo/util/concurrency/thread_name',
                      '$BUILD_DIR/third_party/shim_allocator',
-                     '$BUILD_DIR/third_party/shim_boost'])
+                     '$BUILD_DIR/third_party/shim_boost',
+                     '$BUILD_DIR/third_party/shim_tz'])
 
 env.CppUnitTest('text_test', 'util/text_test.cpp', LIBDEPS=['foundation'])
 env.CppUnitTest('util/time_support_test', 'util/time_support_test.cpp', LIBDEPS=['foundation'])
@@ -714,7 +715,7 @@ env.Library('coreshard', ['s/distlock.cpp',
                           's/shard.cpp',
                           's/shardkey.cpp'],
             LIBDEPS=['s/base',
-                     's/cluster_op_impl']);
+                     's/cluster_ops_impl']);
     
 mongosLibraryFiles = [
     "s/interrupt_status_mongos.cpp",
@@ -743,7 +744,7 @@ env.Library( "mongoscore",
              LIBDEPS=['db/auth/authmongos',
                       'db/fts/ftsmongos',
                       'db/query/lite_parsed_query',
-                      's/cluster_write_ops',
+                      's/cluster_ops',
                       's/cluster_write_op_conversion',
                       's/upgrade',
                      ] )
@@ -1053,8 +1054,8 @@ test = testEnv.Install(
                        "testframework",
                        "gridfs",
                        "s/upgrade",
-                       "s/cluster_write_ops",
-                       "s/cluster_op_impl",
+                       "s/cluster_ops",
+                       "s/cluster_ops_impl",
                        "mocklib",
                        "db/exec/mock_stage",
                        "$BUILD_DIR/mongo/db/auth/authmocks",
