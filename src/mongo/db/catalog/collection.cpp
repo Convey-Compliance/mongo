@@ -86,7 +86,8 @@ namespace mongo {
           _database( database ),
           _infoCache( this ),
           _indexCatalog( this ),
-          _cursorCache( fullNS ) {
+          _cursorCache( fullNS ),
+          _changeSubscribers() {
         _magic = 1357924;
         _indexCatalog.init(txn);
         if ( isCapped() )
@@ -96,6 +97,18 @@ namespace mongo {
     Collection::~Collection() {
         verify( ok() );
         _magic = 0;
+    }
+
+    void Collection::triggerChangeSubscribersNotification(){
+        _changeSubscribers.notifyAll( _changeSubscribers.now() );
+    }
+
+    bool Collection::waitForDocumentInsertedEvent(  NotifyAll::When when, int timeout ) {
+        return _changeSubscribers.timedWaitFor( when, timeout );
+    }
+
+    NotifyAll::When Collection::documentInsertedNotificationNow() {
+        return _changeSubscribers.now();
     }
 
     bool Collection::requiresIdIndex() const {
@@ -256,6 +269,11 @@ namespace mongo {
             // so we just have to delete the main storage
             _recordStore->deleteRecord( txn, loc.getValue() );
             return StatusWith<DiskLoc>( e.toStatus( "insertDocument" ) );
+        }
+
+        /* Let's trigger event notifier only for capped collections */
+        if( isCapped() ) {
+            triggerChangeSubscribersNotification();
         }
 
         return loc;

@@ -751,6 +751,8 @@ namespace mongo {
         bool exhaust = false;
         QueryResult::View msgdata = 0;
         OpTime last;
+        Collection* collection = 0;
+        NotifyAll::When lastWaitTime = 0;
         while( 1 ) {
             bool isCursorAuthorized = false;
             try {
@@ -816,10 +818,25 @@ namespace mongo {
                 pass++;
                 if (debug)
                     sleepmillis(20);
-                else
-                    sleepmillis(2);
-                
-                // note: the 1100 is beacuse of the waitForDifferent above
+                else if( lastWaitTime == 0 ) {
+                    scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(txn, ns));
+                    collection = ctx->ctx().db()->getCollection( txn, ns );
+                    /* TODO: Replace this number when changes (if ever) changes are merged into upstream */
+                    uassert( 77383, "collection dropped between newGetMore calls", collection );
+                    lastWaitTime = collection->documentInsertedNotificationNow();
+                    /* After creating the notification and acquiring lastWaitTime we will do one more loop,
+                       a new item *may* have been inserted in the collection while we were
+                       acquiring lastWaitTime */
+                } else {
+                    /* TODO: Review this wait.
+                       Bellow we could wait even for the full 4 seconds, but there's something I don't understand
+                       with the call to setExpectedLatencyMs(), so I figure I better break the wait every so often to call
+                       that notification method */
+                    collection->waitForDocumentInsertedEvent( lastWaitTime, 200 );
+                    lastWaitTime = collection->documentInsertedNotificationNow();
+                }
+
+                // note: the 1100 is because of the waitForDifferent above
                 // should eventually clean this up a bit
                 curop.setExpectedLatencyMs( 1100 + timer->millis() );
                 
