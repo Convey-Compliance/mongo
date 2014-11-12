@@ -767,12 +767,13 @@ elif windows:
     # If tools configuration fails to set up 'cl' in the path, fall back to importing the whole
     # shell environment and hope for the best. This will work, for instance, if you have loaded
     # an SDK shell.
-    for pathdir in env['ENV']['PATH'].split(os.pathsep):
-        if os.path.exists(os.path.join(pathdir, 'cl.exe')):
-            break
-    else:
-        print("NOTE: Tool configuration did not find 'cl' compiler, falling back to os environment")
-        env['ENV'] = dict(os.environ)
+    # Kmoon, commenting code to force os environment paths
+    #for pathdir in env['ENV']['PATH'].split(os.pathsep):
+    #    if os.path.exists(os.path.join(pathdir, 'cl.exe')):
+    #        break
+    #else:
+    print("NOTE: Tool configuration did not find 'cl' compiler, falling back to os environment")
+    env['ENV'] = dict(os.environ)
 
     env.Append( CPPDEFINES=[ "_UNICODE" ] )
     env.Append( CPPDEFINES=[ "UNICODE" ] )
