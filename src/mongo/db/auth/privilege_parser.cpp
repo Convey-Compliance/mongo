@@ -37,6 +37,9 @@
 
 namespace mongo {
 
+    using std::string;
+    using std::vector;
+
     using mongoutils::str::stream;
 
     const BSONField<bool> ParsedResource::anyResource("anyResource");
@@ -204,7 +207,7 @@ namespace mongo {
         return _cluster;
     }
 
-    void ParsedResource::setDb(const StringData& db) {
+    void ParsedResource::setDb(StringData db) {
         _db = db.toString();
         _isDbSet = true;
     }
@@ -222,7 +225,7 @@ namespace mongo {
         return _db;
     }
 
-    void ParsedResource::setCollection(const StringData& collection) {
+    void ParsedResource::setCollection(StringData collection) {
         _collection = collection.toString();
         _isCollectionSet = true;
     }

@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 
 namespace mongo {
@@ -66,7 +68,7 @@ namespace mongo {
      * Stage used by the count command. This stage sits at the root of a plan tree
      * and counts the number of results returned by its child stage.
      *
-     * This should not be confused with the CountStan stage. CountScan is a special
+     * This should not be confused with the CountScan stage. CountScan is a special
      * index access stage which can optimize index access for count operations in
      * some cases. On the other hand, *every* count op has a CountStage at its root.
      *
@@ -88,7 +90,7 @@ namespace mongo {
 
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -124,7 +126,7 @@ namespace mongo {
         // by us.
         WorkingSet* _ws;
 
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         CommonStats _commonStats;
         CountStats _specificStats;

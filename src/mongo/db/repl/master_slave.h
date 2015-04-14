@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/repl/oplogreader.h"
 
 /* replication data overview
@@ -50,7 +52,7 @@ namespace mongo {
 namespace repl {
 
     // Main entry point for master/slave at startup time.
-    void startMasterSlave();
+    void startMasterSlave(OperationContext* txn);
 
     // externed for use with resync.cpp
     extern volatile int relinquishSyncingSome;
@@ -75,7 +77,7 @@ namespace repl {
        not done (always use main for now).
     */
     class ReplSource {
-        shared_ptr<threadpool::ThreadPool> tp;
+        boost::shared_ptr<threadpool::ThreadPool> tp;
 
         void resync(OperationContext* txn, const std::string& dbName);
 
@@ -133,11 +135,11 @@ namespace repl {
         std::string only; // only a certain db. note that in the sources collection, this may not be changed once you start replicating.
 
         /* the last time point we have already synced up to (in the remote/master's oplog). */
-        OpTime syncedTo;
+        Timestamp syncedTo;
 
         int nClonedThisPass;
 
-        typedef std::vector< shared_ptr< ReplSource > > SourceVector;
+        typedef std::vector< boost::shared_ptr< ReplSource > > SourceVector;
         static void loadAll(OperationContext* txn, SourceVector&);
 
         explicit ReplSource(OperationContext* txn, BSONObj);
@@ -174,19 +176,19 @@ namespace repl {
 
     /**
      * Helper class used to set and query an ignore state for a named database.
-     * The ignore state will expire after a specified OpTime.
+     * The ignore state will expire after a specified Timestamp.
      */
     class DatabaseIgnorer {
     public:
         /** Indicate that operations for 'db' should be ignored until after 'futureOplogTime' */
-        void doIgnoreUntilAfter( const std::string &db, const OpTime &futureOplogTime );
+        void doIgnoreUntilAfter( const std::string &db, const Timestamp &futureOplogTime );
         /**
          * Query ignore state of 'db'; if 'currentOplogTime' is after the ignore
          * limit, the ignore state will be cleared.
          */
-        bool ignoreAt( const std::string &db, const OpTime &currentOplogTime );
+        bool ignoreAt( const std::string &db, const Timestamp &currentOplogTime );
     private:
-        std::map< std::string, OpTime > _ignores;
+        std::map< std::string, Timestamp > _ignores;
     };
 
 } // namespace repl

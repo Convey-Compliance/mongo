@@ -33,6 +33,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     using mongoutils::str::stream;
         const BSONField<int> WriteErrorDetail::index("index");
         const BSONField<int> WriteErrorDetail::errCode("code");
@@ -195,7 +197,7 @@ namespace mongo {
         return _errInfo;
     }
 
-    void WriteErrorDetail::setErrMessage(const StringData& errMessage) {
+    void WriteErrorDetail::setErrMessage(StringData errMessage) {
         _errMessage = errMessage.toString();
         _isErrMessageSet = true;
     }

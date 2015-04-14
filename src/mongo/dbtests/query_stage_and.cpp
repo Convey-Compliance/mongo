@@ -27,14 +27,17 @@
  */
 
 /**
- * This file tests db/exec/and_*.cpp and DiskLoc invalidation.  DiskLoc invalidation forces a fetch
+ * This file tests db/exec/and_*.cpp and RecordId invalidation.  RecordId invalidation forces a fetch
  * so we cannot test it outside of a dbtest.
  */
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/and_hash.h"
 #include "mongo/db/exec/and_sorted.h"
@@ -44,11 +47,15 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace QueryStageAnd {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::set;
 
     class QueryStageAndBase {
     public:
@@ -61,7 +68,7 @@ namespace QueryStageAnd {
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
@@ -72,11 +79,11 @@ namespace QueryStageAnd {
             return descriptor;
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
-            RecordIterator* it = coll->getIterator(&_txn, DiskLoc(),
+        void getLocs(set<RecordId>* out, Collection* coll) {
+            RecordIterator* it = coll->getIterator(&_txn, RecordId(),
                                                    CollectionScanParams::FORWARD);
             while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
+                RecordId nextLoc = it->getNext();
                 out->insert(nextLoc);
             }
             delete it;
@@ -128,7 +135,7 @@ namespace QueryStageAnd {
 
                 WorkingSetMember* member = ws->get(id);
                 ASSERT(member->hasObj());
-                return member->obj;
+                return member->obj.value();
             }
 
             // We failed to produce a result.
@@ -150,13 +157,13 @@ namespace QueryStageAnd {
     //
 
     /**
-     * Invalidate a DiskLoc held by a hashed AND before the AND finishes evaluating.  The AND should
-     * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
+     * Invalidate a RecordId held by a hashed AND before the AND finishes evaluating.  The AND should
+     * process all other data just fine and flag the invalidated RecordId in the WorkingSet.
      */
     class QueryStageAndHashInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -173,7 +180,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -205,13 +212,13 @@ namespace QueryStageAnd {
             // ...yield
             ah->saveState();
             // ...invalidate one of the read objects
-            set<DiskLoc> data;
+            set<RecordId> data;
             getLocs(&data, coll);
             size_t memUsageBefore = ah->getMemUsage();
-            for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (coll->docFor(&_txn, *it)["foo"].numberInt() == 15) {
-                    ah->invalidate(*it, INVALIDATION_DELETION);
-                    remove(coll->docFor(&_txn, *it));
+            for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+                if (coll->docFor(&_txn, *it).value()["foo"].numberInt() == 15) {
+                    ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
+                    remove(coll->docFor(&_txn, *it).value());
                     break;
                 }
             }
@@ -259,7 +266,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashInvalidateLookahead : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -277,7 +284,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20 (descending)
             IndexScanParams params;
@@ -304,16 +311,16 @@ namespace QueryStageAnd {
             const unordered_set<WorkingSetID>& flagged = ws.getFlagged();
             ASSERT_EQUALS(size_t(0), flagged.size());
 
-            // "delete" deletedObj (by invalidating the DiskLoc of the obj that matches it).
+            // "delete" deletedObj (by invalidating the RecordId of the obj that matches it).
             BSONObj deletedObj = BSON("_id" << 20 << "foo" << 20 << "bar" << 20 << "baz" << 20);
             ah->saveState();
-            set<DiskLoc> data;
+            set<RecordId> data;
             getLocs(&data, coll);
 
             size_t memUsageBefore = ah->getMemUsage();
-            for (set<DiskLoc>::const_iterator it = data.begin(); it != data.end(); ++it) {
-                if (0 == deletedObj.woCompare(coll->docFor(&_txn, *it))) {
-                    ah->invalidate(*it, INVALIDATION_DELETION);
+            for (set<RecordId>::const_iterator it = data.begin(); it != data.end(); ++it) {
+                if (0 == deletedObj.woCompare(coll->docFor(&_txn, *it).value())) {
+                    ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
                     break;
                 }
             }
@@ -334,7 +341,8 @@ namespace QueryStageAnd {
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
                 WorkingSetMember* wsm = ws.get(id);
-                ASSERT_NOT_EQUALS(0, deletedObj.woCompare(coll->docFor(&_txn, wsm->loc)));
+                ASSERT_NOT_EQUALS(0,
+                                  deletedObj.woCompare(coll->docFor(&_txn, wsm->loc).value()));
                 ++count;
             }
 
@@ -346,7 +354,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -363,7 +371,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -396,7 +404,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafFirstChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -418,7 +426,7 @@ namespace QueryStageAnd {
             // before hashed AND is done reading the first child (stage has to
             // hold 21 keys in buffer for Foo <= 20).
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll, 20 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 20 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -449,7 +457,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashTwoLeafLastChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -471,7 +479,7 @@ namespace QueryStageAnd {
             // keys in last child's index are not buffered. There are 6 keys
             // that satisfy the criteria Foo <= 20 and Bar >= 10 and 5 <= baz <= 15.
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll, 5 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 5 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -501,7 +509,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -519,7 +527,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -563,7 +571,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashThreeLeafMiddleChildLargeKeys : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -586,7 +594,7 @@ namespace QueryStageAnd {
             // before hashed AND is done reading the second child (stage has to
             // hold 11 keys in buffer for Foo <= 20 and Bar >= 10).
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll, 10 * big.size()));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll, 10 * big.size()));
 
             // Foo <= 20
             IndexScanParams params;
@@ -623,7 +631,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -640,7 +648,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -683,7 +691,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -701,7 +709,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo >= 100
             IndexScanParams params;
@@ -732,7 +740,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -753,7 +761,7 @@ namespace QueryStageAnd {
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filter);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, filterExpr.get(), coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, filterExpr.get(), coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -785,7 +793,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashFirstChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -802,7 +810,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -844,7 +852,7 @@ namespace QueryStageAnd {
     class QueryStageAndHashSecondChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -861,7 +869,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Foo <= 20
             IndexScanParams params;
@@ -902,13 +910,13 @@ namespace QueryStageAnd {
     //
 
     /**
-     * Invalidate a DiskLoc held by a sorted AND before the AND finishes evaluating.  The AND should
-     * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
+     * Invalidate a RecordId held by a sorted AND before the AND finishes evaluating.  The AND should
+     * process all other data just fine and flag the invalidated RecordId in the WorkingSet.
      */
     class QueryStageAndSortedInvalidation : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -925,7 +933,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -942,23 +950,23 @@ namespace QueryStageAnd {
             ah->addChild(new IndexScan(&_txn, params, &ws, NULL));
 
             // Get the set of disklocs in our collection to use later.
-            set<DiskLoc> data;
+            set<RecordId> data;
             getLocs(&data, coll);
 
             // We're making an assumption here that happens to be true because we clear out the
-            // collection before running this: increasing inserts have increasing DiskLocs.
+            // collection before running this: increasing inserts have increasing RecordIds.
             // This isn't true in general if the collection is not dropped beforehand.
             WorkingSetID id = WorkingSet::INVALID_ID;
 
             // Sorted AND looks at the first child, which is an index scan over foo==1.
             ah->work(&id);
 
-            // The first thing that the index scan returns (due to increasing DiskLoc trick) is the
+            // The first thing that the index scan returns (due to increasing RecordId trick) is the
             // very first insert, which should be the very first thing in data.  Let's invalidate it
             // and make sure it shows up in the flagged results.
             ah->saveState();
-            ah->invalidate(*data.begin(), INVALIDATION_DELETION);
-            remove(coll->docFor(&_txn, *data.begin()));
+            ah->invalidate(&_txn, *data.begin(), INVALIDATION_DELETION);
+            remove(coll->docFor(&_txn, *data.begin()).value());
             ah->restoreState(&_txn);
 
             // Make sure the nuked obj is actually in the flagged data.
@@ -971,7 +979,7 @@ namespace QueryStageAnd {
             ASSERT_TRUE(member->getFieldDotted("bar", &elt));
             ASSERT_EQUALS(1, elt.numberInt());
 
-            set<DiskLoc>::iterator it = data.begin();
+            set<RecordId>::iterator it = data.begin();
 
             // Proceed along, AND-ing results.
             int count = 0;
@@ -996,8 +1004,8 @@ namespace QueryStageAnd {
             // Remove a result that's coming up.  It's not the 'target' result of the AND so it's
             // not flagged.
             ah->saveState();
-            ah->invalidate(*it, INVALIDATION_DELETION);
-            remove(coll->docFor(&_txn, *it));
+            ah->invalidate(&_txn, *it, INVALIDATION_DELETION);
+            remove(coll->docFor(&_txn, *it).value());
             ah->restoreState(&_txn);
 
             // Get all results aside from the two we killed.
@@ -1026,7 +1034,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1052,7 +1060,7 @@ namespace QueryStageAnd {
             addIndex(BSON("baz" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1080,7 +1088,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1097,7 +1105,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // Foo == 7.  Should be EOF.
             IndexScanParams params;
@@ -1125,7 +1133,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1146,7 +1154,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, NULL, coll));
 
             // foo == 7.
             IndexScanParams params;
@@ -1174,7 +1182,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedWithMatcher : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1195,7 +1203,7 @@ namespace QueryStageAnd {
             StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
             verify(swme.isOK());
             auto_ptr<MatchExpression> filterExpr(swme.getValue());
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&_txn, &ws, filterExpr.get(), coll));
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, filterExpr.get(), coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1220,7 +1228,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedByLastChild : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1237,7 +1245,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1262,11 +1270,11 @@ namespace QueryStageAnd {
                 WorkingSetID id = WorkingSet::INVALID_ID;
                 PlanStage::StageState status = ah->work(&id);
                 if (PlanStage::ADVANCED != status) { continue; }
-                BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc);
+                BSONObj thisObj = coll->docFor(&_txn, ws.get(id)->loc).value();
                 ASSERT_EQUALS(7 + count, thisObj["bar"].numberInt());
                 ++count;
                 if (WorkingSet::INVALID_ID != lastId) {
-                    BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc);
+                    BSONObj lastObj = coll->docFor(&_txn, ws.get(lastId)->loc).value();
                     ASSERT_LESS_THAN(lastObj["bar"].woCompare(thisObj["bar"]), 0);
                 }
                 lastId = id;
@@ -1283,7 +1291,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedFirstChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1301,7 +1309,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> as(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> as(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1337,7 +1345,7 @@ namespace QueryStageAnd {
     class QueryStageAndSortedSecondChildFetched : public QueryStageAndBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             Database* db = ctx.db();
             Collection* coll = ctx.getCollection();
             if (!coll) {
@@ -1355,7 +1363,7 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            scoped_ptr<AndSortedStage> as(new AndSortedStage(&_txn, &ws, NULL, coll));
+            scoped_ptr<AndSortedStage> as(new AndSortedStage(&ws, NULL, coll));
 
             // Scan over foo == 1
             IndexScanParams params;
@@ -1411,6 +1419,8 @@ namespace QueryStageAnd {
             add<QueryStageAndSortedFirstChildFetched>();
             add<QueryStageAndSortedSecondChildFetched>();
         }
-    }  queryStageAndAll;
+    };
+
+    SuiteInstance<All> queryStageAndAll;
 
 }  // namespace QueryStageAnd

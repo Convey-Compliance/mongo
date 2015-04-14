@@ -33,11 +33,14 @@
 #include "mongo/util/mongoutils/str.h"
 
 #include <algorithm> // for max()
+#include <iostream>
 
 // So we can get at the str namespace.
 using namespace mongoutils;
 
 namespace mongo {
+
+    using std::stringstream;
 
     std::ostream& operator<<(std::ostream &s, const GeoHash &h) {
         return s << h.toString();
@@ -241,7 +244,7 @@ namespace mongo {
 
     string GeoHash::toStringHex1() const {
         stringstream ss;
-        ss << hex << _hash;
+        ss << std::hex << _hash;
         return ss.str();
     }
 
@@ -494,6 +497,69 @@ namespace mongo {
     GeoHash GeoHash::parent() const {
         verify(_bits > 0);
         return GeoHash(_hash, _bits - 1);
+    }
+
+
+    void GeoHash::appendVertexNeighbors(unsigned level, vector<GeoHash>* output) const {
+        invariant(level >= 0 && level < _bits);
+
+        // Parent at the given level.
+        GeoHash parentHash = parent(level);
+        output->push_back(parentHash);
+
+        // Generate the neighbors of parent that are closest to me.
+        unsigned px, py, parentBits;
+        parentHash.unhash(&px, &py);
+        parentBits = parentHash.getBits();
+
+        // No Neighbors for the top level.
+        if (parentBits == 0U) return;
+
+        // Position in parent
+        // Y
+        // ^
+        // |  01, 11
+        // |  00, 10
+        // +----------> X
+        // We can guarantee _bits > 0.
+        long long posInParent = (_hash >> (64 - 2 * (parentBits + 1))) & 3LL;
+
+        // 1 bit at parent's level, the least significant bit of parent.
+        unsigned parentMask = 1U << (32 - parentBits);
+
+        // Along X Axis
+        if ((posInParent & 2LL) == 0LL) {
+            // Left side of parent, X - 1
+            if (!parentHash.atMinX()) output->push_back(GeoHash(px - parentMask, py, parentBits));
+        } else {
+            // Right side of parent, X + 1
+            if (!parentHash.atMaxX()) output->push_back(GeoHash(px + parentMask, py, parentBits));
+        }
+
+        // Along Y Axis
+        if ((posInParent & 1LL) == 0LL) {
+            // Bottom of parent, Y - 1
+            if (!parentHash.atMinY()) output->push_back(GeoHash(px, py - parentMask, parentBits));
+        } else {
+            // Top of parent, Y + 1
+            if (!parentHash.atMaxY()) output->push_back(GeoHash(px, py + parentMask, parentBits));
+        }
+
+        // Four corners
+        if (posInParent == 0LL) {
+            if (!parentHash.atMinX() && !parentHash.atMinY())
+                output->push_back(GeoHash(px - parentMask, py - parentMask, parentBits));
+        } else if (posInParent == 1LL) {
+            if (!parentHash.atMinX() && !parentHash.atMaxY())
+                output->push_back(GeoHash(px - parentMask, py + parentMask, parentBits));
+        } else if (posInParent == 2LL) {
+            if (!parentHash.atMaxX() && !parentHash.atMinY())
+                output->push_back(GeoHash(px + parentMask, py - parentMask, parentBits));
+        } else {
+            // PosInParent == 3LL
+            if (!parentHash.atMaxX() && !parentHash.atMaxY())
+                output->push_back(GeoHash(px + parentMask, py + parentMask, parentBits));
+        }
     }
 
     static BSONField<int> bitsField("bits", 26);

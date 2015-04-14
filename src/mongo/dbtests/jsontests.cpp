@@ -31,7 +31,7 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <limits>
 
@@ -42,6 +42,14 @@
 
 
 namespace JsonTests {
+
+    using std::cout;
+    using std::endl;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     namespace JsonStringTests {
 
         class Empty {
@@ -521,7 +529,7 @@ namespace JsonTests {
         public:
             void run() {
                 BSONObjBuilder b;
-                b.appendTimestamp( "x" , 4000 , 10 );
+                b.append( "x" , Timestamp(4, 10) );
                 BSONObj o = b.obj();
                 ASSERT_EQUALS( "{ \"x\" : { \"$timestamp\" : { \"t\" : 4, \"i\" : 10 } } }",
                         o.jsonString( Strict ) );
@@ -1764,10 +1772,10 @@ namespace JsonTests {
             }
         };
 
-        class Timestamp : public Base {
+        class JSTimestamp : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendTimestamp( "a", (unsigned long long) 20000, 5 );
+                b.append( "a", Timestamp(20, 5) );
                 return b.obj();
             }
             virtual string json() const {
@@ -1784,7 +1792,7 @@ namespace JsonTests {
         class TimestampZero : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendTimestamp( "a", 0ULL, 0 );
+                b.append( "a", Timestamp() );
                 return b.obj();
             }
             virtual string json() const {
@@ -1831,7 +1839,7 @@ namespace JsonTests {
         class TimestampObject : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendTimestamp( "a", (unsigned long long) 20000, 5 );
+                b.append( "a", Timestamp(20, 5) );
                 return b.obj();
             }
             virtual string json() const {
@@ -1872,7 +1880,7 @@ namespace JsonTests {
         class TimestampObjectZero : public Base {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
-                b.appendTimestamp( "a", 0ULL, 0 );
+                b.append( "a", Timestamp() );
                 return b.obj();
             }
             virtual string json() const {
@@ -2828,7 +2836,7 @@ namespace JsonTests {
             add< FromJsonTests::NumberIntNeg >();
             add< FromJsonTests::NumberLongBad >();
             add< FromJsonTests::NumberIntBad >();
-            add< FromJsonTests::Timestamp >();
+            add< FromJsonTests::JSTimestamp >();
             add< FromJsonTests::TimestampNoIncrement >();
             add< FromJsonTests::TimestampZero >();
             add< FromJsonTests::TimestampNoArgs >();
@@ -2931,7 +2939,9 @@ namespace JsonTests {
             add< FromJsonTests::MinKey >();
             add< FromJsonTests::MaxKey >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace JsonTests
 

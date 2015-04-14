@@ -30,8 +30,8 @@
  */
 
 #include "mongo/base/init.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage_options.h"
@@ -41,8 +41,25 @@ namespace mongo {
     namespace {
         class DevNullStorageEngineFactory : public StorageEngine::Factory {
         public:
-            virtual StorageEngine* create( const StorageGlobalParams& params ) const {
-                return new KVStorageEngine( new DevNullKVEngine() );
+            virtual StorageEngine* create(const StorageGlobalParams& params,
+                                          const StorageEngineLockFile& lockFile) const {
+                KVStorageEngineOptions options;
+                options.directoryPerDB = params.directoryperdb;
+                options.forRepair = params.repair;
+                return new KVStorageEngine( new DevNullKVEngine(), options );
+            }
+
+            virtual StringData getCanonicalName() const {
+                return "devnull";
+            }
+
+            virtual Status validateMetadata(const StorageEngineMetadata& metadata,
+                                            const StorageGlobalParams& params) const {
+                return Status::OK();
+            }
+
+            virtual BSONObj createMetadataOptions(const StorageGlobalParams& params) const {
+                return BSONObj();
             }
         };
     } // namespace
@@ -50,7 +67,7 @@ namespace mongo {
     MONGO_INITIALIZER_WITH_PREREQUISITES(DevNullEngineInit,
                                          ("SetGlobalEnvironment"))
         (InitializerContext* context ) {
-        getGlobalEnvironment()->registerStorageEngine("devnull", new DevNullStorageEngineFactory() );
+        getGlobalServiceContext()->registerStorageEngine("devnull", new DevNullStorageEngineFactory() );
         return Status::OK();
     }
 

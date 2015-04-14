@@ -32,7 +32,7 @@
  * The primary entry point at runtime is saslClientAuthenticateImpl().
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetworking
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -53,6 +53,8 @@
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
+
+    using std::endl;
 
 namespace {
 
@@ -169,7 +171,8 @@ namespace {
         if (status.isOK()) {
             session->setParameter(SaslClientSession::parameterPassword, value);
         }
-        else if (status != ErrorCodes::NoSuchKey) {
+        else if (!(status == ErrorCodes::NoSuchKey && targetDatabase == "$external")) {
+            // $external users do not have passwords, hence NoSuchKey is expected
             return status;
         }
 

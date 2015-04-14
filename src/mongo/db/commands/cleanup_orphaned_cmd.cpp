@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,11 +42,11 @@
 #include "mongo/db/field_parser.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/range_arithmetic.h"
 #include "mongo/db/range_deleter_service.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/d_state.h"
-#include "mongo/s/range_arithmetic.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/util/log.h"
 
@@ -60,6 +60,9 @@ namespace {
 }
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
 
     using mongoutils::str::stream;
 

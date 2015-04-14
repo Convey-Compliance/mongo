@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include <boost/config.hpp>
 #include <boost/noncopyable.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
@@ -151,6 +152,18 @@
                      " where " #PREDICATE                               \
                      "(ex) was true, but it was false.");               \
             }                                                           \
+        }                                                               \
+    } while (false)
+
+#define ASSERT_STRING_CONTAINS(BIG_STRING, CONTAINS ) do {              \
+        std::string myString( BIG_STRING );                             \
+        if ( myString.find(CONTAINS) == std::string::npos ) {           \
+            std::string err( "Expected " #BIG_STRING " (" );            \
+            err += myString;                                            \
+            err += std::string(") to contain " #CONTAINS );             \
+            ::mongo::unittest::TestAssertionFailure(__FILE__,           \
+                                                    __LINE__,           \
+                                                    err).stream();      \
         }                                                               \
     } while (false)
 
@@ -359,7 +372,8 @@ namespace mongo {
             virtual void setupTests();
 
         private:
-            typedef std::vector<TestHolder *> TestHolderList;
+            // TODO(C++11): Make this hold unique_ptrs.
+            typedef std::vector< boost::shared_ptr<TestHolder> > TestHolderList;
 
             template <typename T>
             static void runTestObject() {
@@ -378,6 +392,20 @@ namespace mongo {
             bool _ran;
 
             void registerSuite( const std::string& name , Suite* s );
+        };
+
+        // A type that makes it easy to declare a self registering suite for old style test
+        // declarations. Suites are self registering so this is *not* a memory leak.
+        template<typename T>
+        struct SuiteInstance {
+            SuiteInstance() {
+                new T;
+            }
+
+            template<typename U>
+            SuiteInstance(const U& u) {
+                new T(u);
+            }
         };
 
         /**
@@ -413,11 +441,7 @@ namespace mongo {
             TestAssertionFailure(
                     const std::string& file, unsigned line, const std::string& message);
             TestAssertionFailure(const TestAssertionFailure& other);
-#if __cplusplus < 201103
-            ~TestAssertionFailure();
-#else
-            ~TestAssertionFailure() noexcept(false);
-#endif
+            ~TestAssertionFailure() BOOST_NOEXCEPT_IF(false);
 
             TestAssertionFailure& operator=(const TestAssertionFailure& other);
 
@@ -436,8 +460,8 @@ namespace mongo {
             ComparisonAssertion_##NAME(                                 \
                     const std::string& theFile,                         \
                     unsigned theLine,                                   \
-                    const StringData& aExpression,                      \
-                    const StringData& bExpression,                      \
+                    StringData aExpression,                             \
+                    StringData bExpression,                             \
                     const A& a,                                         \
                     const B& b)  {                                      \
                 if (a OPERATOR b) {                                     \

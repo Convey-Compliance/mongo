@@ -35,12 +35,13 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/diskloc.h"
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 
 namespace mongo {
 
     class DataFile;
     class Record;
+    class RecordFetcher;
     class OperationContext;
 
     struct Extent;
@@ -110,6 +111,12 @@ namespace mongo {
          * manager.
          */
         virtual Record* recordForV1( const DiskLoc& loc ) const = 0;
+
+        /**
+         * The extent manager tracks accesses to DiskLocs. This returns non-NULL if the DiskLoc has
+         * been recently accessed, and therefore has likely been paged into physical memory.
+         */
+        virtual RecordFetcher* recordNeedsFetch( const DiskLoc& loc ) const = 0;
 
         /**
          * @param loc - has to be for a specific Record (not an Extent)

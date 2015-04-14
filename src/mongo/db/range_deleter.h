@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/thread/thread.hpp>
 #include <deque>
 #include <set>
@@ -40,7 +41,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/range_arithmetic.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/time_support.h"
@@ -71,13 +71,12 @@ namespace mongo {
      *   RangeDeleter* deleter = new RangeDeleter(new ...);
      *   deleter->startWorkers();
      *   ...
-     *   getGlobalEnvironment()->killAllOperations(); // stop all deletes
+     *   getGlobalServiceContext()->killAllOperations(); // stop all deletes
      *   deleter->stopWorkers();
      *   delete deleter;
      */
     class RangeDeleter {
         MONGO_DISALLOW_COPYING(RangeDeleter);
-
     public:
 
         /**
@@ -137,7 +136,8 @@ namespace mongo {
          * Returns true if the task is queued and false If the given range is blacklisted,
          * is already queued, or stopWorkers() was called.
          */
-        bool queueDelete(const RangeDeleterOptions& options,
+        bool queueDelete(OperationContext* txn,
+                         const RangeDeleterOptions& options,
                          Notification* notifyDone,
                          std::string* errMsg);
 
@@ -190,7 +190,7 @@ namespace mongo {
         void doWork();
 
         /** Returns true if the range doesn't intersect with one other range */
-        bool canEnqueue_inlock(const StringData& ns,
+        bool canEnqueue_inlock(StringData ns,
                                const BSONObj& min,
                                const BSONObj& max,
                                std::string* errMsg) const;
@@ -198,10 +198,10 @@ namespace mongo {
         /** Returns true if stopWorkers() was called. This call is synchronized. */
         bool stopRequested() const;
 
-        scoped_ptr<RangeDeleterEnv> _env;
+        boost::scoped_ptr<RangeDeleterEnv> _env;
 
         // Initially not active. Must be started explicitly.
-        scoped_ptr<boost::thread> _worker;
+        boost::scoped_ptr<boost::thread> _worker;
 
         // Protects _stopRequested.
         mutable mutex _stopMutex;
@@ -330,7 +330,7 @@ namespace mongo {
          * Must not throw exception.
          */
         virtual void getCursorIds(OperationContext* txn,
-                                  const StringData& ns,
+                                  StringData ns,
                                   std::set<CursorId>* openCursors) = 0;
     };
 

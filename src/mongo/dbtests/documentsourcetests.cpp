@@ -28,12 +28,15 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
+#include <boost/thread/condition.hpp>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/pipeline/dependencies.h"
@@ -44,6 +47,13 @@
 #include "mongo/dbtests/dbtests.h"
 
 namespace DocumentSourceTests {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     static const char* const ns = "unittests.documentsourcetests";
     static const BSONObj metaTextScore = BSON("$meta" << "textScore");
@@ -173,7 +183,7 @@ namespace DocumentSourceTests {
                 _source.reset();
                 _exec.reset();
 
-                Client::WriteContext ctx(&_opCtx, ns);
+                OldClientWriteContext ctx(&_opCtx, ns);
                 CanonicalQuery* cq;
                 uassertStatusOK(CanonicalQuery::canonicalize(ns, /*query=*/BSONObj(), &cq));
                 PlanExecutor* execBare;
@@ -205,11 +215,11 @@ namespace DocumentSourceTests {
             void run() {
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The collection is empty, so the source produces no results.
                 ASSERT( !source()->getNext() );
                 // Exhausting the source releases the read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -220,7 +230,7 @@ namespace DocumentSourceTests {
                 client.insert( ns, BSON( "a" << 1 ) );
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The cursor will produce the expected result.
                 boost::optional<Document> next = source()->getNext();
                 ASSERT(bool(next));
@@ -228,7 +238,7 @@ namespace DocumentSourceTests {
                 // There are no more results.
                 ASSERT( !source()->getNext() );
                 // Exhausting the source releases the read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );                
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -238,10 +248,10 @@ namespace DocumentSourceTests {
             void run() {
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 source()->dispose();
                 // Releasing the cursor releases the read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The source is marked as exhausted.
                 ASSERT( !source()->getNext() );
             }
@@ -264,10 +274,10 @@ namespace DocumentSourceTests {
                 ASSERT(bool(next));
                 ASSERT_EQUALS(Value(2), next->getField("a"));
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 source()->dispose();
                 // Disposing of the source releases the lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 // The source cannot be advanced further.
                 ASSERT( !source()->getNext() );
             }
@@ -276,19 +286,16 @@ namespace DocumentSourceTests {
         /** Set a value or await an expected value. */
         class PendingValue {
         public:
-            PendingValue( int initialValue ) :
-            _value( initialValue ),
-            _mutex( "DocumentSourceTests::PendingValue::_mutex" ) {
-            }
+            PendingValue( int initialValue ) : _value( initialValue ) {}
             void set( int newValue ) {
-                scoped_lock lk( _mutex );
+                boost::lock_guard<boost::mutex> lk( _mutex );
                 _value = newValue;
                 _condition.notify_all();
             }
             void await( int expectedValue ) const {
-                scoped_lock lk( _mutex );
+                boost::unique_lock<boost::mutex> lk( _mutex );
                 while( _value != expectedValue ) {
-                    _condition.wait( lk.boost() );
+                    _condition.wait( lk );
                 }
             }
         private:
@@ -356,7 +363,7 @@ namespace DocumentSourceTests {
                 client.insert( ns, BSON( "a" << 2 ) );
                 createSource();
                 // The DocumentSourceCursor doesn't hold a read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
                 createLimit( 1 );
                 limit()->setSource( source() );
                 // The limit's result is as expected.
@@ -366,7 +373,7 @@ namespace DocumentSourceTests {
                 // The limit is exhausted.
                 ASSERT( !limit()->getNext() );
                 // The limit disposes the source, releasing the read lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -395,7 +402,7 @@ namespace DocumentSourceTests {
                 ASSERT( !limit()->getNext() );
                 // The limit disposes the match, which disposes the source and releases the read
                 // lock.
-                ASSERT( !_opCtx.lockState()->hasAnyReadLock() );
+                ASSERT( !_opCtx.lockState()->isReadLocked() );
             }
         };
 
@@ -1501,35 +1508,6 @@ namespace DocumentSourceTests {
             }
         };
 
-        /** A document with a number field produces a UserException. */
-        class UnexpectedNumber : public UnexpectedTypeBase {
-            void populateData() {
-                client.insert( ns, BSON( "a" << 1 ) );
-            }
-        };
-
-        /** An additional document with a number field produces a UserException. */
-        class LaterUnexpectedNumber : public UnexpectedTypeBase {
-            void populateData() {
-                client.insert( ns, BSON( "a" << BSON_ARRAY( 1 ) ) );
-                client.insert( ns, BSON( "a" << 1 ) );
-            }
-        };
-
-        /** A document with a string field produces a UserException. */
-        class UnexpectedString : public UnexpectedTypeBase {
-            void populateData() {
-                client.insert( ns, BSON( "a" << "foo" ) );
-            }
-        };
-
-        /** A document with an object field produces a UserException. */
-        class UnexpectedObject : public UnexpectedTypeBase {
-            void populateData() {
-                client.insert( ns, BSON( "a" << BSONObj() ) );
-            }
-        };
-
         /** Unwind an array with one value. */
         class UnwindOneValue : public CheckResultsBase {
             void populateData() {
@@ -1966,10 +1944,6 @@ namespace DocumentSourceTests {
             add<DocumentSourceUnwind::MissingField>();
             add<DocumentSourceUnwind::NullField>();
             add<DocumentSourceUnwind::EmptyArray>();
-            add<DocumentSourceUnwind::UnexpectedNumber>();
-            add<DocumentSourceUnwind::LaterUnexpectedNumber>();
-            add<DocumentSourceUnwind::UnexpectedString>();
-            add<DocumentSourceUnwind::UnexpectedObject>();
             add<DocumentSourceUnwind::UnwindOneValue>();
             add<DocumentSourceUnwind::UnwindTwoValues>();
             add<DocumentSourceUnwind::UnwindNull>();
@@ -1986,6 +1960,8 @@ namespace DocumentSourceTests {
             add<DocumentSourceMatch::RedactSafePortion>();
             add<DocumentSourceMatch::Coalesce>();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace DocumentSourceTests

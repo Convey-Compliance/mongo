@@ -32,8 +32,8 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -42,7 +42,7 @@ namespace mongo {
 
     class CollectionCatalogEntry {
     public:
-        CollectionCatalogEntry( const StringData& ns )
+        CollectionCatalogEntry( StringData ns )
             : _ns( ns ){
         }
         virtual ~CollectionCatalogEntry(){}
@@ -63,41 +63,48 @@ namespace mongo {
                                     std::vector<std::string>* names ) const = 0;
 
         virtual BSONObj getIndexSpec( OperationContext* txn,
-                                      const StringData& idxName ) const = 0;
+                                      StringData idxName ) const = 0;
 
         virtual bool isIndexMultikey( OperationContext* txn,
-                                      const StringData& indexName) const = 0;
+                                      StringData indexName) const = 0;
 
         virtual bool setIndexIsMultikey(OperationContext* txn,
-                                        const StringData& indexName,
+                                        StringData indexName,
                                         bool multikey = true) = 0;
 
-        virtual DiskLoc getIndexHead( OperationContext* txn,
-                                      const StringData& indexName ) const = 0;
+        virtual RecordId getIndexHead( OperationContext* txn,
+                                      StringData indexName ) const = 0;
 
         virtual void setIndexHead( OperationContext* txn,
-                                   const StringData& indexName,
-                                   const DiskLoc& newHead ) = 0;
+                                   StringData indexName,
+                                   const RecordId& newHead ) = 0;
 
         virtual bool isIndexReady( OperationContext* txn,
-                                   const StringData& indexName ) const = 0;
+                                   StringData indexName ) const = 0;
 
         virtual Status removeIndex( OperationContext* txn,
-                                    const StringData& indexName ) = 0;
+                                    StringData indexName ) = 0;
 
         virtual Status prepareForIndexBuild( OperationContext* txn,
                                              const IndexDescriptor* spec ) = 0;
 
         virtual void indexBuildSuccess( OperationContext* txn,
-                                        const StringData& indexName ) = 0;
+                                        StringData indexName ) = 0;
 
         /* Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
          * The specified index must already contain an expireAfterSeconds field, and the value in
          * that field and newExpireSecs must both be numeric.
          */
         virtual void updateTTLSetting( OperationContext* txn,
-                                       const StringData& idxName,
+                                       StringData idxName,
                                        long long newExpireSeconds ) = 0;
+
+        /**
+         * Sets the flags field of CollectionOptions to newValue.
+         * Subsequent calls to getCollectionOptions should have flags==newValue and flagsSet==true.
+         */
+        virtual void updateFlags(OperationContext* txn, int newValue) = 0;
+
     private:
         NamespaceString _ns;
     };

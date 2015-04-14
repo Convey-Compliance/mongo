@@ -32,8 +32,8 @@
 
 #include <iterator>
 
-#include "mongo/db/repl/repl_coordinator_external_state.h"
 #include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -258,13 +258,13 @@ namespace {
             return StatusWith<int>(status);
         }
 
-        if (force) {
-            return findSelfInConfig(externalState, newConfig);
-        }
-
         status = validateOldAndNewConfigsCompatible(oldConfig, newConfig);
         if (!status.isOK()) {
             return StatusWith<int>(status);
+        }
+
+        if (force) {
+            return findSelfInConfig(externalState, newConfig);
         }
 
         return findSelfInConfigIfElectable(externalState, newConfig);

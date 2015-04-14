@@ -28,20 +28,21 @@
 
 #pragma once
 
+#include <string>
+
 #include "mongo/db/catalog/head_manager.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/mmap_v1/btree/btree_ondisk.h"
 #include "mongo/db/storage/mmap_v1/btree/key.h"
-#include "mongo/db/storage/mmap_v1/btree/bucket_deletion_notification.h"
-
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 
 namespace mongo {
 
-    class BucketDeletionNotification;
     class RecordStore;
+    class SavedCursorRegistry;
 
     // Used for unit-testing only
     template <class BtreeLayout> class BtreeLogicTestBase;
@@ -77,15 +78,14 @@ namespace mongo {
          */
         BtreeLogic(HeadManager* head,
                    RecordStore* store,
+                   SavedCursorRegistry* cursors,
                    const Ordering& ordering,
-                   const string& indexName,
-                   BucketDeletionNotification* bucketDeletion)
+                   const std::string& indexName)
             : _headManager(head),
               _recordStore(store),
+              _cursorRegistry(cursors),
               _ordering(ordering),
-              _indexName(indexName),
-              _bucketDeletion(bucketDeletion) { 
-        
+              _indexName(indexName) {
         }
 
         //
@@ -101,6 +101,8 @@ namespace mongo {
 
         private:
             friend class BtreeLogic;
+
+            class SetRightLeafLocChange;
 
             Builder(BtreeLogic* logic, OperationContext* txn, bool dupsAllowed);
 
@@ -119,7 +121,7 @@ namespace mongo {
 
             DiskLoc _rightLeafLoc; // DiskLoc of right-most (highest) leaf bucket.
             bool _dupsAllowed;
-            auto_ptr<KeyDataOwnedType> _keyLast;
+            std::auto_ptr<KeyDataOwnedType> _keyLast;
 
             // Not owned.
             OperationContext* _txn;
@@ -182,7 +184,9 @@ namespace mongo {
                        const DiskLoc& bucketLoc,
                        const int keyOffset) const;
 
-        DiskLoc getHead(OperationContext* txn) const { return _headManager->getHead(txn); }
+        DiskLoc getHead(OperationContext* txn) const {
+            return DiskLoc::fromRecordId(_headManager->getHead(txn));
+        }
 
         Status touch(OperationContext* txn) const;
 
@@ -193,21 +197,13 @@ namespace mongo {
         void customLocate(OperationContext* txn,
                           DiskLoc* locInOut,
                           int* keyOfsInOut,
-                          const BSONObj& keyBegin,
-                          int keyBeginLen,
-                          bool afterKey,
-                          const vector<const BSONElement*>& keyEnd,
-                          const vector<bool>& keyEndInclusive,
+                          const IndexSeekPoint& seekPoint,
                           int direction) const;
 
         void advanceTo(OperationContext*,
                        DiskLoc* thisLocInOut,
                        int* keyOfsInOut,
-                       const BSONObj &keyBegin,
-                       int keyBeginLen,
-                       bool afterKey,
-                       const vector<const BSONElement*>& keyEnd,
-                       const vector<bool>& keyEndInclusive,
+                       const IndexSeekPoint& seekPoint,
                        int direction) const;
 
         void restorePosition(OperationContext* txn,
@@ -232,7 +228,15 @@ namespace mongo {
 
         const RecordStore* getRecordStore() const { return _recordStore; }
 
+        SavedCursorRegistry* savedCursors() const { return _cursorRegistry; }
+
         static int lowWaterMark();
+        
+        Ordering ordering() const { return _ordering; }
+
+        int customBSONCmp(const BSONObj& inIndex_left,
+                          const IndexSeekPoint& seekPoint_right,
+                          int direction) const;
 
     private:
         friend class BtreeLogic::Builder;
@@ -343,13 +347,9 @@ namespace mongo {
         void customLocate(OperationContext* txn,
                           DiskLoc* locInOut,
                           int* keyOfsInOut,
-                          const BSONObj& keyBegin,
-                          int keyBeginLen,
-                          bool afterKey,
-                          const vector<const BSONElement*>& keyEnd,
-                          const vector<bool>& keyEndInclusive,
+                          const IndexSeekPoint& seekPoint,
                           int direction,
-                          pair<DiskLoc, int>& bestParent) const;
+                          std::pair<DiskLoc, int>& bestParent) const;
 
         Status _find(OperationContext* txn,
                      BucketType* bucket,
@@ -362,25 +362,16 @@ namespace mongo {
         bool customFind(OperationContext* txn,
                         int low,
                         int high,
-                        const BSONObj& keyBegin,
-                        int keyBeginLen,
-                        bool afterKey,
-                        const vector<const BSONElement*>& keyEnd,
-                        const vector<bool>& keyEndInclusive,
-                        const Ordering& order,
+                        const IndexSeekPoint& seekPoint,
                         int direction,
                         DiskLoc* thisLocInOut,
                         int* keyOfsInOut,
-                        pair<DiskLoc, int>& bestParent) const;
+                        std::pair<DiskLoc, int>& bestParent) const;
 
         void advanceToImpl(OperationContext* txn,
                            DiskLoc* thisLocInOut,
                            int* keyOfsInOut,
-                           const BSONObj &keyBegin,
-                           int keyBeginLen,
-                           bool afterKey,
-                           const vector<const BSONElement*>& keyEnd,
-                           const vector<bool>& keyEndInclusive,
+                           const IndexSeekPoint& seekPoint,
                            int direction) const;
 
         bool wouldCreateDup(OperationContext* txn,
@@ -542,16 +533,6 @@ namespace mongo {
                      BucketType* bucket,
                      int keyPos) const;
 
-        // TODO 'this' for _ordering(?)
-        int customBSONCmp(const BSONObj& l,
-                          const BSONObj& rBegin,
-                          int rBeginLen,
-                          bool rSup,
-                          const std::vector<const BSONElement*>& rEnd,
-                          const std::vector<bool>& rEndInclusive,
-                          const Ordering& o,
-                          int direction) const;
-
         /**
          * Tries to push key into bucket. Return false if it can't because key doesn't fit.
          *
@@ -568,7 +549,10 @@ namespace mongo {
 
         BucketType* childForPos(OperationContext* txn, BucketType* bucket, int pos) const;
 
-        BucketType* getBucket(OperationContext* txn, const DiskLoc dl) const;
+        BucketType* getBucket(OperationContext* txn, const DiskLoc dl) const {
+            return getBucket(txn, dl.toRecordId());
+        }
+        BucketType* getBucket(OperationContext* txn, const RecordId dl) const;
 
         BucketType* getRoot(OperationContext* txn) const;
 
@@ -584,12 +568,12 @@ namespace mongo {
         // Not owned here.
         RecordStore* _recordStore;
 
+        // Not owned Here.
+        SavedCursorRegistry* _cursorRegistry;
+
         Ordering _ordering;
 
-        string _indexName;
-
-        // Not owned here
-        BucketDeletionNotification* _bucketDeletion;
+        std::string _indexName;
     };
 
 }  // namespace mongo

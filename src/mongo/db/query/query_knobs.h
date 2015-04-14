@@ -92,4 +92,16 @@ namespace mongo {
     // during explodeForSort?
     extern int internalQueryMaxScansToExplode;
 
+    //
+    // Query execution.
+    //
+
+    extern int internalQueryExecMaxBlockingSortBytes;
+
+    // Yield after this many "should yield?" checks.
+    extern int internalQueryExecYieldIterations;
+
+    // Yield if it's been at least this many milliseconds since we last yielded.
+    extern int internalQueryExecYieldPeriodMS;
+
 }  // namespace mongo

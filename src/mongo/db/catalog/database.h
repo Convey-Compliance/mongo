@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage_options.h"
-#include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
 
@@ -56,7 +55,7 @@ namespace mongo {
     */
     class Database {
     public:
-        Database(const StringData& name, DatabaseCatalogEntry* dbEntry);
+        Database(OperationContext* txn, StringData name, DatabaseCatalogEntry* dbEntry);
 
         // must call close first
         ~Database();
@@ -69,19 +68,12 @@ namespace mongo {
         void clearTmpCollections(OperationContext* txn);
 
         /**
-         * @return true if success.  false if bad level or error creating profile ns
+         * Sets a new profiling level for the database and returns the outcome.
+         *
+         * @param txn Operation context which to use for creating the profiling collection.
+         * @param newLevel New profiling level to use.
          */
-        bool setProfilingLevel( OperationContext* txn, int newLevel , std::string& errmsg );
-
-        /**
-         * @return true if ns is part of the database
-         *         ns=foo.bar, db=foo returns true
-         */
-        bool ownsNS( const std::string& ns ) const {
-            if ( ! mongoutils::str::startsWith( ns , _name ) )
-                return false;
-            return ns[_name.size()] == '.';
-        }
+        Status setProfilingLevel(OperationContext* txn, int newLevel);
 
         int getProfilingLevel() const { return _profile; }
         const char* getProfilingNS() const { return _profileName.c_str(); }
@@ -90,28 +82,27 @@ namespace mongo {
 
         const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
 
-        Status dropCollection( OperationContext* txn, const StringData& fullns );
+        Status dropCollection(OperationContext* txn, StringData fullns);
 
         Collection* createCollection( OperationContext* txn,
-                                      const StringData& ns,
+                                      StringData ns,
                                       const CollectionOptions& options = CollectionOptions(),
-                                      bool allocateSpace = true,
                                       bool createDefaultIndexes = true );
 
         /**
          * @param ns - this is fully qualified, which is maybe not ideal ???
          */
-        Collection* getCollection( OperationContext* txn, const StringData& ns );
+        Collection* getCollection( StringData ns ) const ;
 
-        Collection* getCollection( OperationContext* txn, const NamespaceString& ns ) {
-            return getCollection( txn, ns.ns() );
+        Collection* getCollection( const NamespaceString& ns ) const {
+            return getCollection( ns.ns() );
         }
 
-        Collection* getOrCreateCollection( OperationContext* txn, const StringData& ns );
+        Collection* getOrCreateCollection( OperationContext* txn, StringData ns );
 
         Status renameCollection( OperationContext* txn,
-                                 const StringData& fromNS,
-                                 const StringData& toNS,
+                                 StringData fromNS,
+                                 StringData toNS,
                                  bool stayTemp );
 
         /**
@@ -120,19 +111,27 @@ namespace mongo {
          * 'duplicates' is specified, it is filled with all duplicate names.
          // TODO move???
          */
-        static string duplicateUncasedName( const std::string &name,
-                                            std::set< std::string > *duplicates = 0 );
+        static std::string duplicateUncasedName( const std::string &name,
+                                                 std::set< std::string > *duplicates = 0 );
 
-        static Status validateDBName( const StringData& dbname );
+        static Status validateDBName( StringData dbname );
 
         const std::string& getSystemIndexesName() const { return _indexesName; }
     private:
 
-        void _clearCollectionCache( const StringData& fullns );
+        /**
+         * Gets or creates collection instance from existing metadata,
+         * Returns NULL if invalid
+         *
+         * Note: This does not add the collection to _collections map, that must be done
+         * by the caller, who takes onership of the Collection*
+         */
+        Collection* _getOrCreateCollectionInstance(OperationContext* txn, StringData fullns);
 
-        void _clearCollectionCache_inlock( const StringData& fullns );
+        void _clearCollectionCache(OperationContext* txn, StringData fullns );
 
-        class CollectionCacheChange; // to allow rollback actions for invalidating above cache
+        class AddCollectionChange;
+        class RemoveCollectionChange;
 
         const std::string _name; // "alleyinsider"
 
@@ -148,7 +147,6 @@ namespace mongo {
         // but it points to a much more useful data structure
         typedef StringMap< Collection* > CollectionMap;
         CollectionMap _collections;
-        mongo::mutex _collectionLock;
 
         friend class Collection;
         friend class NamespaceDetails;
@@ -161,9 +159,8 @@ namespace mongo {
 
     Status userCreateNS( OperationContext* txn,
                          Database* db,
-                         const StringData& ns,
+                         StringData ns,
                          BSONObj options,
-                         bool logForReplication,
                          bool createDefaultIndexes = true );
 
 } // namespace mongo

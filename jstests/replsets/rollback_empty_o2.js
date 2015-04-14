@@ -27,6 +27,8 @@ var b_conn = conns[1];
 var AID = replTest.getNodeId(a_conn);
 var BID = replTest.getNodeId(b_conn);
 
+replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
+
 // get master and do an initial write
 var master = replTest.getMaster();
 assert(master === conns[0], "conns[0] assumed to be master");
@@ -44,6 +46,7 @@ options = {writeConcern: {w: 1, wtimeout: 60000}, upsert: true};
 // another insert to set minvalid ahead
 assert.writeOK(b_conn.getDB(name).foo.insert({x: 123}));
 var oplog_entry = b_conn.getDB("local").oplog.rs.find().sort({$natural: -1})[0];
+oplog_entry["ts"] = Timestamp(oplog_entry["ts"].t, oplog_entry["ts"].i + 1);
 oplog_entry["op"] = "u";
 oplog_entry["o2"] = {};
 assert.writeOK(b_conn.getDB("local").oplog.rs.insert(oplog_entry));
@@ -60,7 +63,7 @@ assert.writeOK(a_conn.getDB(name).foo.insert({x: 2}, options));
 
 // restart B, which should rollback and log a message about not rolling back empty o2'd oplog entry
 replTest.restart(BID);
-var msg = RegExp("replSet warning ignoring op on rollback : ");
+var msg = RegExp("ignoring op on rollback : ");
 assert.soon(function() {
     try {
         var log = b_conn.getDB("admin").adminCommand({getLog: "global"}).log;

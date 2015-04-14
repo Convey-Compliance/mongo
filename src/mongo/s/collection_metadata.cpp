@@ -28,13 +28,21 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/collection_metadata.h"
 
-#include "mongo/bson/util/builder.h" // for StringBuilder
+#include "mongo/bson/util/builder.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::make_pair;
+    using std::string;
+    using std::vector;
 
     using mongoutils::str::stream;
 
@@ -108,7 +116,7 @@ namespace mongo {
                 newShardVersion > _collVersion ? newShardVersion : this->_collVersion;
         metadata->fillRanges();
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -162,7 +170,7 @@ namespace mongo {
                 newShardVersion > _collVersion ? newShardVersion : this->_collVersion;
         metadata->fillRanges();
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -204,7 +212,7 @@ namespace mongo {
         metadata->_shardVersion = _shardVersion;
         metadata->_collVersion = _collVersion;
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -262,7 +270,7 @@ namespace mongo {
 
         metadata->_pendingMap.insert( make_pair( pending.getMin(), pending.getMax() ) );
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -353,7 +361,7 @@ namespace mongo {
                 metadata->_shardVersion > _collVersion ? metadata->_shardVersion : _collVersion;
         metadata->fillRanges();
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -436,7 +444,7 @@ namespace mongo {
 
         metadata->_chunksMap.insert( make_pair( minKey, maxKey ) );
 
-        dassert(metadata->isValid());
+        invariant(metadata->isValid());
         return metadata.release();
     }
 
@@ -669,9 +677,26 @@ namespace mongo {
     }
 
     bool CollectionMetadata::isValid() const {
-        if ( _shardVersion > _collVersion ) return false;
-        if ( _collVersion.majorVersion() == 0 ) return false;
-        if ( _collVersion.epoch() != _shardVersion.epoch() ) return false;
+        if (_shardVersion > _collVersion)
+            return false;
+        if (_collVersion.majorVersion() == 0)
+            return false;
+        if (_collVersion.epoch() != _shardVersion.epoch())
+            return false;
+
+        if (_shardVersion.majorVersion() > 0) {
+            // Must be chunks
+            if (_rangesMap.size() == 0 || _chunksMap.size() == 0)
+                return false;
+        }
+        else {
+            // No chunks
+            if (_shardVersion.minorVersion() > 0)
+                return false;
+            if (_rangesMap.size() > 0 || _chunksMap.size() > 0)
+                return false;
+        }
+
         return true;
     }
 

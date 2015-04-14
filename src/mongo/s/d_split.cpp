@@ -40,27 +40,38 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/s/chunk.h" // for static genID only
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/distlock.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/type_chunk.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::ostringstream;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class CmdMedianKey : public Command {
     public:
@@ -165,7 +176,7 @@ namespace mongo {
             // TODO if $exist for nulls were picking the index, it could be used instead efficiently
             int keyPatternLength = keyPattern.nFields();
 
-            DiskLoc loc;
+            RecordId loc;
             BSONObj currKey;
             while (PlanExecutor::ADVANCED == exec->getNext(&currKey, &loc)) {
                 //check that current key contains non missing elements for all fields in keyPattern
@@ -183,7 +194,7 @@ namespace mongo {
 
                     // This is a fetch, but it's OK.  The underlying code won't throw a page fault
                     // exception.
-                    BSONObj obj = collection->docFor(txn, loc);
+                    BSONObj obj = collection->docFor(txn, loc).value();
                     BSONObjIterator j( keyPattern );
                     BSONElement real;
                     for ( int x=0; x <= k; x++ )
@@ -630,7 +641,7 @@ namespace mongo {
                 return false;
             }
 
-            // From mongos >= v2.8.
+            // From mongos >= v3.0.
             BSONElement epochElem(cmdObj["epoch"]);
             if (epochElem.type() == jstOID) {
                 OID cmdEpoch = epochElem.OID();
@@ -793,7 +804,9 @@ namespace mongo {
             //
             
             {
-                Lock::DBLock writeLk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock writeLk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_IX);
+                Lock::CollectionLock collLock(txn->lockState(), ns, MODE_X);
 
                 // NOTE: The newShardVersion resulting from this split is higher than any
                 // other chunk version, so it's also implicitly the newCollVersion
@@ -815,7 +828,8 @@ namespace mongo {
             if ( newChunks.size() == 2 ) {
                 appendShortVersion(logDetail.subobjStart("left"), *newChunks[0]);
                 appendShortVersion(logDetail.subobjStart("right"), *newChunks[1]);
-                configServer.logChange( "split" , ns , logDetail.obj() );
+
+                grid.catalogManager()->logChange(txn, "split", ns, logDetail.obj());
             }
             else {
                 BSONObj beforeDetailObj = logDetail.obj();
@@ -828,16 +842,24 @@ namespace mongo {
                     chunkDetail.append( "number", i+1 );
                     chunkDetail.append( "of" , newChunksSize );
                     appendShortVersion(chunkDetail.subobjStart("chunk"), *newChunks[i]);
-                    configServer.logChange( "multi-split" , ns , chunkDetail.obj() );
+
+                    grid.catalogManager()->logChange(txn, "multi-split", ns, chunkDetail.obj());
                 }
             }
 
             dassert(newChunks.size() > 1);
 
             {
+                // Select chunk to move out for "top chunk optimization".
+                KeyPattern shardKeyPattern(collMetadata->getKeyPattern());
+
                 AutoGetCollectionForRead ctx(txn, ns);
                 Collection* collection = ctx.getCollection();
-                invariant(collection);
+                if (!collection) {
+                    warning() << "will not perform top-chunk checking since " << ns
+                              << " does not exist after splitting";
+                    return true;
+                }
 
                 // Allow multiKey based on the invariant that shard keys must be
                 // single-valued. Therefore, any multi-key index prefixed by shard
@@ -849,20 +871,20 @@ namespace mongo {
                     return true;
                 }
 
-                const ChunkType* chunk = newChunks.vector().back();
-                KeyPattern kp(idx->keyPattern());
-                BSONObj newmin = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMin(), false));
-                BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), false));
+                const ChunkType* backChunk = newChunks.vector().back();
+                const ChunkType* frontChunk = newChunks.vector().front();
 
-                auto_ptr<PlanExecutor> exec(
-                        InternalPlanner::indexScan(txn, collection, idx, newmin, newmax, false));
-
-                // check if exactly one document found
-                if (PlanExecutor::ADVANCED == exec->getNext(NULL, NULL)) {
-                    if (PlanExecutor::IS_EOF == exec->getNext(NULL, NULL)) {
-                        result.append("shouldMigrate",
-                                      BSON("min" << chunk->getMin() << "max" << chunk->getMax()));
-                    }
+                if (shardKeyPattern.globalMax().woCompare(backChunk->getMax()) == 0 &&
+                    checkIfSingleDoc(txn, collection, idx, backChunk)) {
+                    result.append("shouldMigrate",
+                                  BSON("min" << backChunk->getMin()
+                                       << "max" << backChunk->getMax()));
+                }
+                else if (shardKeyPattern.globalMin().woCompare(frontChunk->getMin()) == 0 &&
+                    checkIfSingleDoc(txn, collection, idx, frontChunk)) {
+                    result.append("shouldMigrate",
+                                  BSON("min" << frontChunk->getMin()
+                                       << "max" << frontChunk->getMax()));
                 }
             }
 
@@ -881,6 +903,27 @@ namespace mongo {
             if (chunk.isVersionSet())
                 chunk.getVersion().addToBSON(bb, ChunkType::DEPRECATED_lastmod());
             bb.done();
+        }
+
+        static bool checkIfSingleDoc(OperationContext* txn,
+                                     Collection* collection,
+                                     const IndexDescriptor* idx,
+                                     const ChunkType* chunk) {
+            KeyPattern kp(idx->keyPattern());
+            BSONObj newmin = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMin(), false));
+            BSONObj newmax = Helpers::toKeyFormat(kp.extendRangeBound(chunk->getMax(), true));
+
+            auto_ptr<PlanExecutor> exec(
+                InternalPlanner::indexScan(txn, collection, idx, newmin, newmax, false));
+
+            // check if exactly one document found
+            if (PlanExecutor::ADVANCED == exec->getNext(NULL, NULL)) {
+                if (PlanExecutor::IS_EOF == exec->getNext(NULL, NULL)) {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
     } cmdSplitChunk;

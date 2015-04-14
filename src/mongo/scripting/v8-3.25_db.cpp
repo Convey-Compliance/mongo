@@ -32,10 +32,10 @@
 #include <iostream>
 #include <iomanip>
 #include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine_v8-3.25.h"
@@ -46,6 +46,8 @@
 #include "mongo/util/text.h"
 
 using namespace std;
+using boost::scoped_array;
+using boost::shared_ptr;
 
 namespace mongo {
 
@@ -126,13 +128,10 @@ namespace mongo {
 
     v8::Local<v8::Value> mongoConsExternal(V8Scope* scope,
                                            const v8::FunctionCallbackInfo<v8::Value>& args) {
-        char host[255];
+        string host = "127.0.0.1";
         if (args.Length() > 0 && args[0]->IsString()) {
-            uassert(16666, "string argument too long", args[0]->ToString()->Utf8Length() < 250);
-            args[0]->ToString()->WriteUtf8(host);
-        }
-        else {
-            strcpy(host, "127.0.0.1");
+            v8::String::Utf8Value utf(args[0]);
+            host = string(*utf);
         }
 
         // only allow function template to be used by a constructor
@@ -842,8 +841,9 @@ namespace mongo {
         string tmpBase64 = base64::decode(*utf);
         // length property stores the decoded length
         it->ForceSet(scope->v8StringData("len"),
-                     v8::Number::New(scope->getIsolate(), tmpBase64.length()));
-        it->ForceSet(scope->v8StringData("type"), type);
+                     v8::Number::New(scope->getIsolate(), tmpBase64.length()),
+                     v8::PropertyAttribute::ReadOnly);
+        it->ForceSet(scope->v8StringData("type"), type, v8::PropertyAttribute::ReadOnly);
         it->SetInternalField(0, args[1]);
 
         return it;
@@ -873,16 +873,14 @@ namespace mongo {
                                       const v8::FunctionCallbackInfo<v8::Value>& args) {
         v8::Local<v8::Object> it = args.This();
         verify(scope->BinDataFT()->HasInstance(it));
-        int len = v8::Local<v8::Number>::Cast(it->Get(
-            v8::String::NewFromUtf8(scope->getIsolate(), "len")))->Int32Value();
         verify(it->InternalFieldCount() == 1);
         string data = base64::decode(toSTLString(it->GetInternalField(0)));
         stringstream ss;
         ss.setf (ios_base::hex, ios_base::basefield);
         ss.fill ('0');
         ss.setf (ios_base::right, ios_base::adjustfield);
-        for(int i = 0; i < len; i++) {
-            unsigned v = (unsigned char) data[i];
+        for(std::string::iterator it = data.begin(); it != data.end(); ++it) {
+            unsigned v = (unsigned char) *it;
             ss << setw(2) << v;
         }
         return v8::String::NewFromUtf8(scope->getIsolate(), ss.str().c_str());

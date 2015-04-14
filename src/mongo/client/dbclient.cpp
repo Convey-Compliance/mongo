@@ -27,7 +27,7 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetworking
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -38,18 +38,29 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/syncclusterconnection.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
 #include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/get_status_from_command_result.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::list;
+    using std::map;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     AtomicInt64 DBClientBase::ConnectionIdSequence;
 
@@ -104,7 +115,7 @@ namespace mongo {
         _string = ss.str();
     }
 
-    mutex ConnectionString::_connectHookMutex( "ConnectionString::_connectHook" );
+    mutex ConnectionString::_connectHookMutex;
     ConnectionString::ConnectionHook* ConnectionString::_connectHook = NULL;
 
     DBClientBase* ConnectionString::connect( string& errmsg, double socketTimeout ) const {
@@ -146,7 +157,7 @@ namespace mongo {
         case CUSTOM: {
 
             // Lock in case other things are modifying this at the same time
-            scoped_lock lk( _connectHookMutex );
+            boost::lock_guard<boost::mutex> lk( _connectHookMutex );
 
             // Allow the replacement of connections with other connections - useful for testing.
 
@@ -468,6 +479,43 @@ namespace mongo {
         return runCommand(dbname, b.done(), *info);
     }
 
+    bool DBClientWithCommands::runPseudoCommand(StringData db,
+                                                StringData realCommandName,
+                                                StringData pseudoCommandCol,
+                                                const BSONObj& cmdArgs,
+                                                BSONObj& info,
+                                                int options) {
+
+        BSONObjBuilder bob;
+        bob.append(realCommandName, 1);
+        bob.appendElements(cmdArgs);
+        auto cmdObj = bob.done();
+
+        bool success = false;
+
+        if (!(success = runCommand(db.toString(), cmdObj, info, options))) {
+
+            auto status = getStatusFromCommandResult(info);
+            verify(!status.isOK());
+
+            if (status == ErrorCodes::CommandResultSchemaViolation) {
+                msgasserted(28624, str::stream() << "Received bad "
+                                                 << realCommandName
+                                                 << " response from server: "
+                                                 << info);
+            } else if (status == ErrorCodes::CommandNotFound ||
+                       str::startsWith(status.reason(), "no such")) {
+
+                NamespaceString pseudoCommandNss(db, pseudoCommandCol);
+                // if this throws we just let it escape as that's how runCommand works.
+                info = findOne(pseudoCommandNss.ns(), cmdArgs, nullptr, options);
+                return true;
+            }
+        }
+
+        return success;
+    }
+
     unsigned long long DBClientWithCommands::count(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
         BSONObj cmd = _countCmd( myns , query , options , limit , skip );
         BSONObj res;
@@ -622,7 +670,7 @@ namespace mongo {
                     result.toString(),
                     _authMongoCR(db, user, password, &result, digestPassword));
         }
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         else if (mechanism == StringData("MONGODB-X509", StringData::LiteralTag())){
             std::string db;
             if (params.hasField(saslCommandUserSourceFieldName)) {
@@ -865,7 +913,10 @@ namespace mongo {
 
     list<string> DBClientWithCommands::getDatabaseNames() {
         BSONObj info;
-        uassert( 10005 ,  "listdatabases failed" , runCommand( "admin" , BSON( "listDatabases" << 1 ) , info ) );
+        uassert(10005, "listdatabases failed", runCommand("admin",
+                                                          BSON("listDatabases" << 1),
+                                                          info,
+                                                          QueryOption_SlaveOk));
         uassert( 10006 ,  "listDatabases.databases not array" , info["databases"].type() == Array );
 
         list<string> names;
@@ -892,18 +943,35 @@ namespace mongo {
         list<BSONObj> infos;
 
         // first we're going to try the command
-        // it was only added in 2.8, so if we're talking to an older server
+        // it was only added in 3.0, so if we're talking to an older server
         // we'll fail back to querying system.namespaces
+        // TODO(spencer): remove fallback behavior after 3.0 
 
         {
             BSONObj res;
-            if ( runCommand( db, BSON( "listCollections" << 1 << "filter" << filter ), res ) ) {
-                BSONObj collections = res["collections"].Obj();
+            if (runCommand(db,
+                           BSON("listCollections" << 1 << "filter" << filter
+                                                       << "cursor" << BSONObj()),
+                           res,
+                           QueryOption_SlaveOk)) {
+                BSONObj cursorObj = res["cursor"].Obj();
+                BSONObj collections = cursorObj["firstBatch"].Obj();
                 BSONObjIterator it( collections );
                 while ( it.more() ) {
                     BSONElement e = it.next();
                     infos.push_back( e.Obj().getOwned() );
                 }
+
+                const long long id = cursorObj["id"].Long();
+
+                if ( id != 0 ) {
+                    const std::string ns = cursorObj["ns"].String();
+                    auto_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
+                    while ( cursor->more() ) {
+                        infos.push_back(cursor->nextSafe().getOwned());
+                    }
+                }
+
                 return infos;
             }
 
@@ -929,7 +997,10 @@ namespace mongo {
         fallbackFilter.appendElementsUnique( filter );
 
         string ns = db + ".system.namespaces";
-        auto_ptr<DBClientCursor> c = query( ns.c_str(), fallbackFilter.obj() );
+        auto_ptr<DBClientCursor> c = query(
+                ns.c_str(), fallbackFilter.obj(), 0, 0, 0, QueryOption_SlaveOk);
+        uassert(28611, str::stream() << "listCollections failed querying " << ns, c.get());
+
         while ( c->more() ) {
             BSONObj obj = c->nextSafe();
             string ns = obj["name"].valuestr();
@@ -1041,10 +1112,10 @@ namespace mongo {
             LOG( 1 ) << "connected to server " << toString() << endl;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         int sslModeVal = sslGlobalParams.sslMode.load();
-        if (sslModeVal == SSLGlobalParams::SSLMode_preferSSL ||
-            sslModeVal == SSLGlobalParams::SSLMode_requireSSL) {
+        if (sslModeVal == SSLParams::SSLMode_preferSSL ||
+            sslModeVal == SSLParams::SSLMode_requireSSL) {
             return p->secure( sslManager(), _server.host() );
         }
 #endif
@@ -1338,13 +1409,29 @@ namespace mongo {
         list<BSONObj> specs;
 
         {
-            BSONObj cmd = BSON( "listIndexes" << nsToCollectionSubstring( ns ) );
+            BSONObj cmd = BSON(
+                "listIndexes" << nsToCollectionSubstring( ns ) <<
+                "cursor" << BSONObj()
+            );
+
             BSONObj res;
             if ( runCommand( nsToDatabase( ns ), cmd, res, options ) ) {
-                BSONObjIterator i( res["indexes"].Obj() );
+                BSONObj cursorObj = res["cursor"].Obj();
+                BSONObjIterator i( cursorObj["firstBatch"].Obj() );
                 while ( i.more() ) {
                     specs.push_back( i.next().Obj().getOwned() );
                 }
+
+                const long long id = cursorObj["id"].Long();
+
+                if ( id != 0 ) {
+                    const std::string ns = cursorObj["ns"].String();
+                    auto_ptr<DBClientCursor> cursor = getMore(ns, id, 0, 0);
+                    while ( cursor->more() ) {
+                        specs.push_back(cursor->nextSafe().getOwned());
+                    }
+                }
+
                 return specs;
             }
             int code = res["code"].numberInt();
@@ -1362,8 +1449,11 @@ namespace mongo {
         }
 
         // fallback to querying system.indexes
+        // TODO(spencer): Remove fallback behavior after 3.0
         auto_ptr<DBClientCursor> cursor = query(NamespaceString(ns).getSystemIndexesCollection(),
-                                                BSON("ns" << ns));
+                                                BSON("ns" << ns), 0, 0, 0, options);
+        uassert(28612, str::stream() << "listIndexes failed querying " << ns, cursor.get());
+
         while ( cursor->more() ) {
             BSONObj spec = cursor->nextSafe();
             specs.push_back( spec.getOwned() );
@@ -1484,15 +1574,11 @@ namespace mongo {
     }
 
     /* -- DBClientCursor ---------------------------------------------- */
-
-#ifdef _DEBUG
-#define CHECK_OBJECT( o , msg ) massert( 10337 ,  (string)"object not valid" + (msg) , (o).isValid() )
-#else
-#define CHECK_OBJECT( o , msg )
-#endif
-
     void assembleRequest( const string &ns, BSONObj query, int nToReturn, int nToSkip, const BSONObj *fieldsToReturn, int queryOptions, Message &toSend ) {
-        CHECK_OBJECT( query , "assembleRequest query" );
+        if (kDebugBuild) {
+            massert( 10337 ,  (string)"object not valid assembleRequest query" , query.isValid() );
+        }
+
         // see query.h for the protocol we are using here.
         BufBuilder b;
         int opts = queryOptions;
@@ -1606,7 +1692,7 @@ namespace mongo {
             say(m);
     }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
     static SimpleMutex s_mtx("SSLManager");
     static SSLManagerInterface* s_sslMgr(NULL);
 

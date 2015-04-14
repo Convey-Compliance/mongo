@@ -33,12 +33,17 @@
 #include "mongo/db/storage/mmap_v1/data_file_sync.h"
 
 #include "mongo/db/commands/server_status_metric.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
 
 namespace mongo {
+
+    using std::endl;
 
     DataFileSync dataFileSync;
 
@@ -79,19 +84,24 @@ namespace mongo {
             }
 
             Date_t start = jsTime();
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
             int numFiles = storageEngine->flushAllFiles( true );
             time_flushing = (int) (jsTime() - start);
 
             _flushed(time_flushing);
 
-            if( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000 ) {
+            if( shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000 ) {
                 log() << "flushing mmaps took " << time_flushing << "ms " << " for " << numFiles << " files" << endl;
             }
         }
     }
 
-    BSONObj DataFileSync::generateSection(const BSONElement& configElement) const {
+    BSONObj DataFileSync::generateSection(OperationContext* txn,
+                                          const BSONElement& configElement) const {
+        if (!running()) {
+            return BSONObj();
+        }
+
         BSONObjBuilder b;
         b.appendNumber( "flushes" , _flushes );
         b.appendNumber( "total_ms" , _total_time );

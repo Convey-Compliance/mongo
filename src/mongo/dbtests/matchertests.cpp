@@ -29,6 +29,9 @@
  *    then also delete it in the license file.
  */
 
+#include <iostream>
+
+#include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/operation_context_impl.h"
@@ -36,6 +39,10 @@
 #include "mongo/util/timer.h"
 
 namespace MatcherTests {
+
+    using std::cout;
+    using std::endl;
+    using std::string;
 
     class CollectionBase {
     public:
@@ -270,7 +277,9 @@ namespace MatcherTests {
             ADD_BOTH(WithinCenter);
             ADD_BOTH(WithinPolygon);
         }
-    } dball;
+    };
+
+    SuiteInstance<All> dball;
 
 } // namespace MatcherTests
 

@@ -30,8 +30,11 @@
  * This file tests db/exec/delete.cpp.
  */
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/delete.h"
@@ -40,6 +43,9 @@
 
 namespace QueryStageDelete {
 
+    using boost::scoped_ptr;
+    using std::vector;
+
     //
     // Stage-specific tests.
     //
@@ -47,7 +53,7 @@ namespace QueryStageDelete {
     class QueryStageDeleteBase {
     public:
         QueryStageDeleteBase() : _client(&_txn) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             for (size_t i = 0; i < numObj(); ++i) {
                 BSONObjBuilder bob;
@@ -57,7 +63,7 @@ namespace QueryStageDelete {
         }
 
         virtual ~QueryStageDeleteBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
@@ -67,7 +73,7 @@ namespace QueryStageDelete {
 
         void getLocs(Collection* collection,
                      CollectionScanParams::Direction direction,
-                     vector<DiskLoc>* out) {
+                     vector<RecordId>* out) {
             WorkingSet ws;
 
             CollectionScanParams params;
@@ -106,12 +112,12 @@ namespace QueryStageDelete {
     class QueryStageDeleteInvalidateUpcomingObject : public QueryStageDeleteBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             Collection* coll = ctx.getCollection();
 
-            // Get the DiskLocs that would be returned by an in-order scan.
-            vector<DiskLoc> locs;
+            // Get the RecordIds that would be returned by an in-order scan.
+            vector<RecordId> locs;
             getLocs(coll, CollectionScanParams::FORWARD, &locs);
 
             // Configure the scan.
@@ -142,8 +148,8 @@ namespace QueryStageDelete {
 
             // Remove locs[targetDocIndex];
             deleteStage.saveState();
-            deleteStage.invalidate(locs[targetDocIndex], INVALIDATION_DELETION);
-            BSONObj targetDoc = coll->docFor(&_txn, locs[targetDocIndex]);
+            deleteStage.invalidate(&_txn, locs[targetDocIndex], INVALIDATION_DELETION);
+            BSONObj targetDoc = coll->docFor(&_txn, locs[targetDocIndex]).value();
             ASSERT(!targetDoc.isEmpty());
             remove(targetDoc);
             deleteStage.restoreState(&_txn);
@@ -167,6 +173,8 @@ namespace QueryStageDelete {
             // Stage-specific tests below.
             add<QueryStageDeleteInvalidateUpcomingObject>();
         }
-    } all;
+    };
+
+    SuiteInstance<All> all;
 
 }

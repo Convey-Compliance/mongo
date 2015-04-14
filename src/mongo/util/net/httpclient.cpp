@@ -27,11 +27,12 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/net/httpclient.h"
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
@@ -39,6 +40,9 @@
 #include "mongo/util/net/ssl_manager.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
 
     //#define HD(x) cout << x << endl;
 #define HD(x)
@@ -117,7 +121,7 @@ namespace mongo {
             return -1;
         
         if ( ssl ) {
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
             // pointer to global singleton instance
             SSLManagerInterface* mgr = getSSLManager();
 

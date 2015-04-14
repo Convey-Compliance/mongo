@@ -36,7 +36,9 @@
 namespace mongo {
 namespace repl {
 
-    OperationContextReplMock::OperationContextReplMock() : _lockState(new LockerImpl<true>) {}
+    OperationContextReplMock::OperationContextReplMock()
+        : _lockState(new MMAPV1LockerImpl()) { }
+
     OperationContextReplMock::~OperationContextReplMock() {}
 
 }  // namespace repl

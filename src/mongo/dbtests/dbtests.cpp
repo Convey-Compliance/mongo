@@ -29,41 +29,89 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/dbtests/dbtests.h"
 
 #include "mongo/base/initializer.h"
-#include "mongo/db/commands.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_coordinator_mock.h"
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/db/auth/authz_manager_external_state_d.h"
+#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/framework.h"
-#include "mongo/util/exception_filter_win32.h"
-#include "mongo/util/gcov.h"
+#include "mongo/stdx/memory.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/signal_handlers_synchronous.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
-#include "mongo/util/quick_exit.h"
 
 namespace mongo {
+namespace dbtests {
     // This specifies default dbpath for our testing framework
     const std::string default_test_dbpath = "/tmp/unittest";
+
+    Status createIndex(OperationContext* txn,
+                       StringData ns,
+                       const BSONObj& keys,
+                       bool unique) {
+        BSONObjBuilder specBuilder;
+        specBuilder <<
+            "name" << DBClientBase::genIndexName(keys) <<
+            "ns" << ns <<
+            "key" << keys;
+        if (unique) {
+            specBuilder << "unique" << true;
+        }
+        return createIndexFromSpec(txn, ns, specBuilder.done());
+    }
+
+    Status createIndexFromSpec(OperationContext* txn, StringData ns, const BSONObj& spec) {
+        AutoGetOrCreateDb autoDb(txn, nsToDatabaseSubstring(ns), MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(txn);
+            coll = autoDb.getDb()->getOrCreateCollection(txn, ns);
+            invariant(coll);
+            wunit.commit();
+        }
+        MultiIndexBlock indexer(txn, coll);
+        Status status = indexer.init(spec);
+        if (status == ErrorCodes::IndexAlreadyExists) {
+            return Status::OK();
+        }
+        if (!status.isOK()) {
+            return status;
+        }
+        status = indexer.insertAllDocumentsInCollection();
+        if (!status.isOK()) {
+            return status;
+        }
+        WriteUnitOfWork wunit(txn);
+        indexer.commit();
+        wunit.commit();
+        return Status::OK();
+    }
+
+}  // namespace dbtests
 } // namespace mongo
 
 
 int dbtestsMain( int argc, char** argv, char** envp ) {
     static StaticObserver StaticObserver;
-    setWindowsUnhandledExceptionFilter();
-    setGlobalEnvironment(new GlobalEnvironmentMongoD());
+    ::mongo::setupSynchronousSignalHandlers();
+    setGlobalServiceContext(stdx::make_unique<ServiceContextMongoD>());
     repl::ReplSettings replSettings;
     replSettings.oplogSize = 10 * 1024 * 1024;
     repl::setGlobalReplicationCoordinator(new repl::ReplicationCoordinatorMock(replSettings));
     Command::testCommandsEnabled = 1;
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    setGlobalAuthorizationManager(new AuthorizationManager(new AuthzManagerExternalStateMock()));
+    setGlobalAuthorizationManager(new AuthorizationManager(new AuthzManagerExternalStateMongod()));
     StartupTest::runTests();
     return mongo::dbtests::runDbTests(argc, argv);
 }
@@ -82,7 +130,6 @@ int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
 #else
 int main(int argc, char* argv[], char** envp) {
     int exitCode = dbtestsMain(argc, argv, envp);
-    flushForGcov();
     quickExit(exitCode);
 }
 #endif

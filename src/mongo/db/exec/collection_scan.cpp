@@ -35,13 +35,18 @@
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 #include "mongo/db/client.h" // XXX-ERH
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::vector;
 
     // static
     const char* CollectionScan::kStageType = "COLLSCAN";
@@ -55,9 +60,16 @@ namespace mongo {
           _filter(filter),
           _params(params),
           _isDead(false),
+          _wsidForFetch(_workingSet->allocate()),
           _commonStats(kStageType) {
         // Explain reports the direction of the collection scan.
         _specificStats.direction = params.direction;
+
+        // We pre-allocate a WSM and use it to pass up fetch requests. This should never be used
+        // for anything other than passing up NEED_YIELD. We use the loc and owned obj state, but
+        // the loc isn't really pointing at any obj. The obj field of the WSM should never be used.
+        WorkingSetMember* member = _workingSet->get(_wsidForFetch);
+        member->state = WorkingSetMember::LOC_AND_OWNED_OBJ;
     }
 
     PlanStage::StageState CollectionScan::work(WorkingSetID* out) {
@@ -75,63 +87,108 @@ namespace mongo {
                 return PlanStage::DEAD;
             }
 
-            if (_lastSeenLoc.isNull()) {
-                _iter.reset( _params.collection->getIterator( _txn,
-                                                              _params.start,
-                                                              _params.direction ) );
-            }
-            else {
-                invariant(_params.tailable);
-
-                _iter.reset( _params.collection->getIterator( _txn,
-                                                              _lastSeenLoc,
-                                                              _params.direction ) );
-
-                // Advance _iter past where we were last time. If it returns something else, mark us
-                // as dead since we want to signal an error rather than silently dropping data from
-                // the stream. This is related to the _lastSeenLock handling in invalidate.
-                if (_iter->getNext() != _lastSeenLoc) {
-                    _isDead = true;
-                    return PlanStage::DEAD;
+            try {
+                if (_lastSeenLoc.isNull()) {
+                    _iter.reset( _params.collection->getIterator( _txn,
+                                                                  _params.start,
+                                                                  _params.direction ) );
                 }
+                else {
+                    invariant(_params.tailable);
+
+                    _iter.reset( _params.collection->getIterator( _txn,
+                                                                  _lastSeenLoc,
+                                                                  _params.direction ) );
+
+                    // Advance _iter past where we were last time. If it returns something else,
+                    // mark us as dead since we want to signal an error rather than silently
+                    // dropping data from the stream. This is related to the _lastSeenLock handling
+                    // in invalidate.
+                    if (_iter->getNext() != _lastSeenLoc) {
+                        _isDead = true;
+                        return PlanStage::DEAD;
+                    }
+                }
+            }
+            catch (const WriteConflictException& wce) {
+                // Leave us in a state to try again next time.
+                _iter.reset();
+                *out = WorkingSet::INVALID_ID;
+                return PlanStage::NEED_YIELD;
             }
 
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
 
-        // What we'll return to the user.
-        DiskLoc nextLoc;
-
         // Should we try getNext() on the underlying _iter?
         if (isEOF())
             return PlanStage::IS_EOF;
 
-        // See if _iter gives us anything new.
-        nextLoc = _iter->getNext();
-        if (nextLoc.isNull()) {
+        const RecordId curr = _iter->curr();
+        if (curr.isNull()) {
+            // We just hit EOF
             if (_params.tailable)
                 _iter.reset(); // pick up where we left off on the next call to work()
             return PlanStage::IS_EOF;
         }
 
-        _lastSeenLoc = nextLoc;
+        _lastSeenLoc = curr;
+
+        // See if the record we're about to access is in memory. If not, pass a fetch request up.
+        // Note that curr() does not touch the record. This way, we are able to yield before
+        // fetching the record.
+        {
+            std::auto_ptr<RecordFetcher> fetcher(
+                _params.collection->documentNeedsFetch(_txn, curr));
+            if (NULL != fetcher.get()) {
+                WorkingSetMember* member = _workingSet->get(_wsidForFetch);
+                member->loc = curr;
+                // Pass the RecordFetcher off to the WSM.
+                member->setFetcher(fetcher.release());
+                *out = _wsidForFetch;
+                _commonStats.needYield++;
+                return NEED_YIELD;
+            }
+        }
+
+        // Do this before advancing because it is more efficient while the iterator is still on this
+        // document.
+        const Snapshotted<BSONObj> obj = Snapshotted<BSONObj>(_txn->recoveryUnit()->getSnapshotId(),
+                                                              _iter->dataFor(curr).releaseToBson());
+
+        // Advance the iterator.
+        try {
+            invariant(_iter->getNext() == curr);
+        }
+        catch (const WriteConflictException& wce) {
+            // If getNext thows, it leaves us on the original document.
+            invariant(_iter->curr() == curr);
+            *out = WorkingSet::INVALID_ID;
+            return PlanStage::NEED_YIELD;
+        }
 
         WorkingSetID id = _workingSet->allocate();
         WorkingSetMember* member = _workingSet->get(id);
-        member->loc = nextLoc;
-        member->obj = _iter->dataFor(member->loc).toBson();
+        member->loc = curr;
+        member->obj = obj;
         member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
 
+        return returnIfMatches(member, id, out);
+    }
+
+    PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
+                                                          WorkingSetID memberID,
+                                                          WorkingSetID* out) {
         ++_specificStats.docsTested;
 
         if (Filter::passes(member, _filter)) {
-            *out = id;
+            *out = memberID;
             ++_commonStats.advanced;
             return PlanStage::ADVANCED;
         }
         else {
-            _workingSet->free(id);
+            _workingSet->free(memberID);
             ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
@@ -147,7 +204,9 @@ namespace mongo {
         return _iter->isEOF();
     }
 
-    void CollectionScan::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void CollectionScan::invalidate(OperationContext* txn,
+                                    const RecordId& dl,
+                                    InvalidationType type) {
         ++_commonStats.invalidates;
 
         // We don't care about mutations since we apply any filters to the result when we (possibly)
@@ -171,6 +230,7 @@ namespace mongo {
     }
 
     void CollectionScan::saveState() {
+        _txn = NULL;
         ++_commonStats.yields;
         if (NULL != _iter) {
             _iter->saveState();
@@ -178,11 +238,13 @@ namespace mongo {
     }
 
     void CollectionScan::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
         _txn = opCtx;
         ++_commonStats.unyields;
         if (NULL != _iter) {
             if (!_iter->restoreState(opCtx)) {
-                warning() << "Collection dropped or state deleted during yield of CollectionScan";
+                warning() << "Collection dropped or state deleted during yield of CollectionScan: "
+                          << opCtx->getNS();
                 _isDead = true;
             }
         }

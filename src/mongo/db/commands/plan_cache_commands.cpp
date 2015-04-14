@@ -26,27 +26,30 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/commands/plan_cache_commands.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/plan_cache_commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/util/log.h"
 
 namespace {
 
+    using boost::scoped_ptr;
     using std::string;
     using namespace mongo;
 

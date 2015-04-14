@@ -44,6 +44,9 @@
 
 namespace mongo {
 
+    using std::abs;
+    using std::numeric_limits;
+
     namespace mb = mutablebson;
     namespace str = mongoutils::str;
 
@@ -433,7 +436,7 @@ namespace mongo {
     }
 
     Status ModifierPush::prepare(mutablebson::Element root,
-                                 const StringData& matchedField,
+                                 StringData matchedField,
                                  ExecInfo* execInfo) {
 
         _preparedState.reset(new PreparedState(&root.getDocument()));

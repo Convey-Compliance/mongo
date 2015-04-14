@@ -51,8 +51,8 @@ namespace mongo {
         STAGE_DELETE,
 
         // If we're running a distinct, we only care about one value for each key.  The distinct
-        // stage is an ixscan with some key-skipping behvaior that only distinct uses.
-        STAGE_DISTINCT,
+        // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
+        STAGE_DISTINCT_SCAN,
 
         // Dummy stage used for receiving notifications of deletions during chunk migration.
         STAGE_NOTIFY_DELETE,
@@ -74,7 +74,6 @@ namespace mongo {
         STAGE_IDHACK,
         STAGE_IXSCAN,
         STAGE_LIMIT,
-        STAGE_MOCK,
 
         // Implements parallelCollectionScan.
         STAGE_MULTI_ITERATOR,
@@ -87,6 +86,7 @@ namespace mongo {
         // Stage for running aggregation pipelines.
         STAGE_PIPELINE_PROXY,
 
+        STAGE_QUEUED_DATA,
         STAGE_SHARDING_FILTER,
         STAGE_SKIP,
         STAGE_SORT,

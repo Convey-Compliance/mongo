@@ -28,9 +28,8 @@
 
 #pragma once
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/db/jsobj.h"
-#include <iostream>
 
 namespace mongo {
 
@@ -127,6 +126,15 @@ namespace mongo {
         // Return the parent at given level.
         GeoHash parent(unsigned int level) const;
         GeoHash parent() const;
+
+        // Return the neighbors of closest vertex to this cell at the given level,
+        // by appending them to "output".  Normally there are four neighbors, but
+        // the closest vertex may only have two or one neighbor if it is next to the
+        // boundary.
+        //
+        // Requires: level < this->_bits, so that we can determine which vertex is
+        // closest (in particular, level == kMaxBits is not allowed).
+        void appendVertexNeighbors(unsigned level, std::vector<GeoHash>* output) const;
 
     private:
 

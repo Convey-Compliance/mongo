@@ -28,7 +28,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -42,11 +42,13 @@ namespace mongo {
                                bool modifiers_,
                                unsigned long long numDocsModified_,
                                unsigned long long numMatched_,
-                               const BSONObj& upsertedObject_)
+                               const BSONObj& upsertedObject_,
+                               const BSONObj& newObj_)
         : existing(existing_),
           modifiers(modifiers_),
           numDocsModified(numDocsModified_),
-          numMatched(numMatched_) {
+          numMatched(numMatched_),
+          newObj(newObj_) {
 
         BSONElement id = upsertedObject_["_id"];
         if ( ! existing && numMatched == 1 && !id.eoo() ) {

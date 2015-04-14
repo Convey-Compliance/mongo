@@ -27,7 +27,9 @@
  */
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -35,7 +37,6 @@
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -55,7 +56,7 @@ namespace QueryStageDistinct {
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         void insert(const BSONObj& obj) {
@@ -79,11 +80,11 @@ namespace QueryStageDistinct {
 
             // Distinct hack execution is always covered.
             // Key value is retrieved from working set key data
-            // instead of DiskLoc.
+            // instead of RecordId.
             ASSERT_FALSE(member->hasObj());
             BSONElement keyElt;
             ASSERT_TRUE(member->getFieldDotted(field, &keyElt));
-            ASSERT_EQUALS(mongo::NumberInt, keyElt.type());
+            ASSERT_TRUE(keyElt.isNumber());
 
             return keyElt.numberInt();
         }
@@ -235,6 +236,8 @@ namespace QueryStageDistinct {
             add<QueryStageDistinctBasic>();
             add<QueryStageDistinctMultiKey>();
         }
-    }  queryStageDistinctAll;
+    };
+
+    SuiteInstance<All> queryStageDistinctAll;
 
 }  // namespace QueryStageDistinct

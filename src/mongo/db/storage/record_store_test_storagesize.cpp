@@ -30,29 +30,16 @@
 
 #include "mongo/db/storage/record_store_test_harness.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/storage/record_store.h"
 #include "mongo/unittest/unittest.h"
 
+using boost::scoped_ptr;
 using std::string;
 using std::stringstream;
 
 namespace mongo {
-
-    // Verify that an empty collection takes up no space on disk.
-    TEST( RecordStoreTestHarness, StorageSizeEmpty ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<RecordStore> rs( harnessHelper->newNonCappedRecordStore() );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 0, rs->numRecords( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( rs->storageSize( opCtx.get(), NULL ) == 0 );
-        }
-    }
 
     // Verify that a nonempty collection maybe takes up some space on disk.
     TEST( RecordStoreTestHarness, StorageSizeNonEmpty ) {
@@ -73,7 +60,7 @@ namespace mongo {
                 string data = ss.str();
 
                 WriteUnitOfWork uow( opCtx.get() );
-                StatusWith<DiskLoc> res = rs->insertRecord( opCtx.get(),
+                StatusWith<RecordId> res = rs->insertRecord( opCtx.get(),
                                                             data.c_str(),
                                                             data.size() + 1,
                                                             false );

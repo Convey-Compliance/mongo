@@ -28,10 +28,11 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <time.h>
 
 #include "mongo/base/disallow_copying.h"
@@ -48,15 +49,22 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/background.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/drop_collection.h"
+#include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/shutdown.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_d.h"
+#include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
@@ -64,25 +72,36 @@
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repair_database.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/scripting/engine.h"
-#include "mongo/server.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/print.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::ostringstream;
+    using std::string;
+    using std::stringstream;
 
     CmdShutdown cmdShutdown;
 
@@ -96,42 +115,25 @@ namespace mongo {
     }
 
     bool CmdShutdown::run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        invariant(!fromRepl == txn->writesAreReplicated());
         bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
 
-        repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        if (!force &&
-                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
-                replCoord->getCurrentMemberState().primary()) {
-            long long timeoutSecs = 0;
-            if (cmdObj.hasField("timeoutSecs")) {
-                timeoutSecs = cmdObj["timeoutSecs"].numberLong();
-            }
-
-            Status status = repl::getGlobalReplicationCoordinator()->stepDown(
-                    txn,
-                    false,
-                    repl::ReplicationCoordinator::Milliseconds(timeoutSecs * 1000),
-                    repl::ReplicationCoordinator::Milliseconds(120 * 1000));
-            if (!status.isOK() && status.code() != ErrorCodes::NotMaster) { // ignore not master
-                return appendCommandStatus(result, status);
-            }
-
-            // TODO(spencer): This block can be removed once stepDown() guarantees that a secondary
-            // is fully caught up instead of just within 10 seconds of the primary.
-            if (status.code() != ErrorCodes::NotMaster) {
-                WriteConcernOptions writeConcern;
-                writeConcern.wNumNodes = 2;
-                writeConcern.wTimeout = 60 * 1000; // 1 minute
-                // Note that return value is ignored - we shut down after 1 minute even if we're not
-                // done replicating.
-                repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpApplied(
-                        txn, writeConcern);
-            }
+        long long timeoutSecs = 0;
+        if (cmdObj.hasField("timeoutSecs")) {
+            timeoutSecs = cmdObj["timeoutSecs"].numberLong();
         }
 
-        writelocktry wlt(txn->lockState(), 2 * 60 * 1000);
-        uassert( 13455 , "dbexit timed out getting lock" , wlt.got() );
-        return shutdownHelper(txn);
+        Status status = repl::getGlobalReplicationCoordinator()->stepDown(
+                txn,
+                force,
+                repl::ReplicationCoordinator::Milliseconds(timeoutSecs * 1000),
+                repl::ReplicationCoordinator::Milliseconds(120 * 1000));
+        if (!status.isOK() && status.code() != ErrorCodes::NotMaster) { // ignore not master
+            return appendCommandStatus(result, status);
+        }
+
+        shutdownHelper();
+        return true;
     }
 
     class CmdDropDatabase : public Command {
@@ -153,70 +155,46 @@ namespace mongo {
 
         virtual bool isWriteCommandForConfigServer() const { return true; }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj) {
-            invariant(db);
-            std::list<std::string> collections;
-            db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collections);
-
-            std::vector<BSONObj> allKilledIndexes;
-            for (std::list<std::string>::iterator it = collections.begin(); 
-                 it != collections.end(); 
-                 ++it) {
-                std::string ns = *it;
-
-                IndexCatalog::IndexKillCriteria criteria;
-                criteria.ns = ns;
-                std::vector<BSONObj> killedIndexes = 
-                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(opCtx, ns), criteria);
-                allKilledIndexes.insert(allKilledIndexes.end(), 
-                                        killedIndexes.begin(), 
-                                        killedIndexes.end());
-            }
-            return allKilledIndexes;
-        }
-
         CmdDropDatabase() : Command("dropDatabase") {}
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
             // disallow dropping the config database
             if (serverGlobalParams.configsvr && (dbname == "config")) {
-                errmsg = "Cannot drop 'config' database if mongod started with --configsvr";
-                return false;
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::IllegalOperation,
+                                                  "Cannot drop 'config' database if mongod started "
+                                                  "with --configsvr"));
+            }
+
+            if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                 repl::ReplicationCoordinator::modeNone) &&
+                (dbname == "local")) {
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::IllegalOperation,
+                                                  "Cannot drop 'local' database while replication "
+                                                  "is active"));
             }
             BSONElement e = cmdObj.firstElement();
             int p = (int) e.number();
             if ( p != 1 ) {
-                errmsg = "have to pass 1 as db parameter";
-                return false;
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::IllegalOperation,
+                                                  "have to pass 1 as db parameter"));
             }
 
-            {
-
-                // this is suboptimal but syncDataAndTruncateJournal is called from dropDatabase,
-                // and that may need a global lock.
-                Lock::GlobalWrite lk(txn->lockState());
-                Client::Context context(txn, dbname);
-                WriteUnitOfWork wunit(txn);
-
-                log() << "dropDatabase " << dbname << " starting" << endl;
-
-                stopIndexBuilds(txn, context.db(), cmdObj);
-                dropDatabase(txn, context.db());
-
-                log() << "dropDatabase " << dbname << " finished";
-
-                if (!fromRepl)
-                    repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-
-                wunit.commit();
+            Status status = dropDatabase(txn, dbname);
+            if (status.isOK()) {
+                result.append( "dropped" , dbname );
             }
-
-            result.append( "dropped" , dbname );
-
-            return true;
+            return appendCommandStatus(result, status);
         }
+
     } cmdDropDatabase;
 
     class CmdRepairDatabase : public Command {
@@ -244,22 +222,22 @@ namespace mongo {
         }
 
         virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
+                                                     Database* db,
                                                      const BSONObj& cmdObj) {
             invariant(db);
             std::list<std::string> collections;
             db->getDatabaseCatalogEntry()->getCollectionNamespaces(&collections);
 
             std::vector<BSONObj> allKilledIndexes;
-            for (std::list<std::string>::iterator it = collections.begin(); 
-                 it != collections.end(); 
+            for (std::list<std::string>::iterator it = collections.begin();
+                 it != collections.end();
                  ++it) {
                 std::string ns = *it;
 
                 IndexCatalog::IndexKillCriteria criteria;
                 criteria.ns = ns;
                 std::vector<BSONObj> killedIndexes = 
-                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(opCtx, ns), criteria);
+                    IndexBuilder::killMatchingIndexBuilds(db->getCollection(ns), criteria);
                 allKilledIndexes.insert(allKilledIndexes.end(), 
                                         killedIndexes.begin(), 
                                         killedIndexes.end());
@@ -268,16 +246,17 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             BSONElement e = cmdObj.firstElement();
             if ( e.numberInt() != 1 ) {
                 errmsg = "bad option";
                 return false;
             }
 
-            // SERVER-4328 todo don't lock globally. currently syncDataAndTruncateJournal is being
-            // called within, and that requires a global lock i believe.
+            // TODO: SERVER-4328 Don't lock globally
+            ScopedTransaction transaction(txn, MODE_X);
             Lock::GlobalWrite lk(txn->lockState());
-            Client::Context context(txn,  dbname );
+            OldClientContext context(txn,  dbname );
 
             log() << "repairDatabase " << dbname;
             std::vector<BSONObj> indexesInProg = stopIndexBuilds(txn, context.db(), cmdObj);
@@ -287,11 +266,17 @@ namespace mongo {
             e = cmdObj.getField( "backupOriginalFiles" );
             bool backupOriginalFiles = e.isBoolean() && e.boolean();
 
-            Status status = getGlobalEnvironment()->getGlobalStorageEngine()->repairDatabase(
-                txn, dbname, preserveClonedFilesOnFailure, backupOriginalFiles );
+            StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
+            bool shouldReplicateWrites = txn->writesAreReplicated();
+            txn->setReplicatedWrites(false);
+            ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
+            Status status = repairDatabase(txn, engine, dbname, preserveClonedFilesOnFailure,
+                                           backupOriginalFiles );
 
-            IndexBuilder::restoreIndexes(indexesInProg);
+            IndexBuilder::restoreIndexes(txn, indexesInProg);
 
+            // Open database before returning
+            dbHolder().openDb(txn, dbname);
             return appendCommandStatus( result, status );
         }
     } cmdRepairDatabase;
@@ -344,33 +329,46 @@ namespace mongo {
 
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& cmdObj,
+                 int options,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
+
             // Needs to be locked exclusively, because creates the system.profile collection
             // in the local database.
-            //
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, dbname);
+            OldClientContext ctx(txn, dbname);
 
             BSONElement e = cmdObj.firstElement();
             result.append("was", ctx.db()->getProfilingLevel());
             result.append("slowms", serverGlobalParams.slowMS);
 
             int p = (int) e.number();
-            bool ok = false;
+            Status status = Status::OK();
 
-            if ( p == -1 )
-                ok = true;
+            if (p == -1)
+                status = Status::OK();
             else if ( p >= 0 && p <= 2 ) {
-                ok = ctx.db()->setProfilingLevel( txn, p , errmsg );
+                status = ctx.db()->setProfilingLevel(txn, p);
             }
 
-            BSONElement slow = cmdObj["slowms"];
+            const BSONElement slow = cmdObj["slowms"];
             if (slow.isNumber()) {
                 serverGlobalParams.slowMS = slow.numberInt();
             }
 
-            return ok;
+            if (!status.isOK()) {
+                errmsg = status.reason();
+            }
+
+            return status.isOK();
         }
+
     } cmdProfile;
 
     class CmdDiagLogging : public Command {
@@ -396,15 +394,16 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            const char* deprecationWarning = 
+            const char* deprecationWarning =
                 "CMD diagLogging is deprecated and will be removed in a future release";
             warning() << deprecationWarning << startupWarningsLog;
 
             // This doesn't look like it requires exclusive DB lock, because it uses its own diag
             // locking, but originally the lock was set to be WRITE, so preserving the behaviour.
             //
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, dbname);
+            OldClientContext ctx(txn, dbname);
 
             int was = _diaglog.setLevel( cmdObj.firstElement().numberInt() );
             _diaglog.flush();
@@ -438,59 +437,33 @@ namespace mongo {
 
         virtual bool isWriteCommandForConfigServer() const { return true; }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj) {
-            std::string nsToDrop = db->name() + '.' + cmdObj.firstElement().valuestr();
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
+            const std::string nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
 
-            IndexCatalog::IndexKillCriteria criteria;
-            criteria.ns = nsToDrop;
-            return IndexBuilder::killMatchingIndexBuilds(db->getCollection(opCtx, nsToDrop), criteria);
-        }
-
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            const string nsToDrop = dbname + '.' + cmdObj.firstElement().valuestr();
-            if (!serverGlobalParams.quiet) {
-                LOG(0) << "CMD: drop " << nsToDrop << endl;
-            }
-
-            if ( nsToDrop.find( '$' ) != string::npos ) {
+            if (nsToDrop.find('$') != string::npos) {
                 errmsg = "can't drop collection with reserved $ character in name";
                 return false;
             }
 
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
-            Client::Context ctx(txn, nsToDrop);
-            Database* db = ctx.db();
-
-            Collection* coll = db->getCollection( txn, nsToDrop );
-            // If collection does not exist, short circuit and return.
-            if ( !coll ) {
-                errmsg = "ns not found";
+            if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                 repl::ReplicationCoordinator::modeNone) &&
+                NamespaceString(nsToDrop).isOplog()) {
+                errmsg = "can't drop live oplog while replicating";
                 return false;
             }
 
-            int numIndexes = coll->getIndexCatalog()->numIndexesTotal( txn );
-
-            stopIndexBuilds(txn, db, cmdObj);
-
-            result.append( "ns", nsToDrop );
-            result.append( "nIndexesWas", numIndexes );
-
-            Status s = db->dropCollection( txn, nsToDrop );
-
-            if ( !s.isOK() ) {
-                return appendCommandStatus( result, s );
-            }
-            
-            if ( !fromRepl ) {
-                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-            }
-            wunit.commit();
-            return true;
-
+            result.append("ns", nsToDrop);
+            return appendCommandStatus(result,
+                                       dropCollection(txn, NamespaceString(nsToDrop), result));
         }
+
     } cmdDrop;
 
     /* create collection */
@@ -531,7 +504,14 @@ namespace mongo {
 
             return Status(ErrorCodes::Unauthorized, "unauthorized");
         }
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             BSONObjIterator it(cmdObj);
 
             // Extract ns from first cmdObj element.
@@ -545,7 +525,7 @@ namespace mongo {
                 return appendCommandStatus( result, status );
             }
 
-            const string ns = dbname + '.' + firstElt.valuestr();
+            const std::string ns = dbname + '.' + firstElt.valuestrsafe();
 
             // Build options object from remaining cmdObj elements.
             BSONObjBuilder optionsBuilder;
@@ -559,17 +539,26 @@ namespace mongo {
                     !options["capped"].trueValue() || options["size"].isNumber() ||
                         options.hasField("$nExtents"));
 
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
-            Client::Context ctx(txn, ns);
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                ScopedTransaction transaction(txn, MODE_IX);
+                Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
+                OldClientContext ctx(txn, ns);
+                if (!fromRepl &&
+                    !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+                    return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
+                        << "Not primary while creating collection " << ns));
+                }
 
-            // Create collection.
-            status =  userCreateNS(txn, ctx.db(), ns.c_str(), options, !fromRepl);
-            if ( !status.isOK() ) {
-                return appendCommandStatus( result, status );
-            }
+                WriteUnitOfWork wunit(txn);
 
-            wunit.commit();
+                // Create collection.
+                status =  userCreateNS(txn, ctx.db(), ns.c_str(), options);
+                if ( !status.isOK() ) {
+                    return appendCommandStatus( result, status );
+                }
+
+                wunit.commit();
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "create", ns);
             return true;
         }
     } cmdCreate;
@@ -606,6 +595,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             const std::string ns = parseNs(dbname, jsobj);
 
             md5digest d;
@@ -633,60 +623,84 @@ namespace mongo {
             BSONObj query = BSON( "files_id" << jsobj["filemd5"] << "n" << GTE << n );
             BSONObj sort = BSON( "files_id" << 1 << "n" << 1 );
 
-            // Check shard version at startup.
-            // This will throw before we've done any work if shard version is outdated
-            AutoGetCollectionForRead ctx(txn, ns);
-            Collection* coll = ctx.getCollection();
-
-            CanonicalQuery* cq;
-            if (!CanonicalQuery::canonicalize(ns, query, sort, BSONObj(), &cq).isOK()) {
-                uasserted(17240, "Can't canonicalize query " + query.toString());
-                return 0;
-            }
-
-            PlanExecutor* rawExec;
-            if (!getExecutor(txn, coll, cq, PlanExecutor::YIELD_MANUAL, &rawExec,
-                             QueryPlannerParams::NO_TABLE_SCAN).isOK()) {
-                uasserted(17241, "Can't get executor for query " + query.toString());
-                return 0;
-            }
-
-            auto_ptr<PlanExecutor> exec(rawExec);
-
-            const ChunkVersion shardVersionAtStart = shardingState.getVersion(ns);
-
-            BSONObj obj;
-            PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
-                BSONElement ne = obj["n"];
-                verify(ne.isNumber());
-                int myn = ne.numberInt();
-                if ( n != myn ) {
-                    if (partialOk) {
-                        break; // skipped chunk is probably on another shard
-                    }
-                    log() << "should have chunk: " << n << " have:" << myn << endl;
-                    dumpChunks(txn, ns, query, sort);
-                    uassert( 10040 ,  "chunks out of order" , n == myn );
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                CanonicalQuery* cq;
+                if (!CanonicalQuery::canonicalize(ns, query, sort, BSONObj(), &cq).isOK()) {
+                    uasserted(17240, "Can't canonicalize query " + query.toString());
+                    return 0;
                 }
 
-                // make a copy of obj since we access data in it while yielding
-                BSONObj owned = obj.getOwned();
-                int len;
-                const char * data = owned["data"].binDataClean( len );
+                // Check shard version at startup.
+                // This will throw before we've done any work if shard version is outdated
+                // We drop and re-acquire these locks every document because md5'ing is expensive
+                scoped_ptr<AutoGetCollectionForRead> ctx(new AutoGetCollectionForRead(txn, ns));
+                Collection* coll = ctx->getCollection();
+                const ChunkVersion shardVersionAtStart = shardingState.getVersion(ns);
 
-                md5_append( &st , (const md5_byte_t*)(data) , len );
-                n++;
-            }
+                PlanExecutor* rawExec;
+                if (!getExecutor(txn, coll, cq, PlanExecutor::YIELD_MANUAL, &rawExec,
+                                 QueryPlannerParams::NO_TABLE_SCAN).isOK()) {
+                    uasserted(17241, "Can't get executor for query " + query.toString());
+                    return 0;
+                }
 
-            if (partialOk)
-                result.appendBinData("md5state", sizeof(st), BinDataGeneral, &st);
+                auto_ptr<PlanExecutor> exec(rawExec);
+                // Process notifications when the lock is released/reacquired in the loop below
+                exec->registerExec();
 
-            // This must be *after* the capture of md5state since it mutates st
-            md5_finish(&st, d);
+                BSONObj obj;
+                PlanExecutor::ExecState state;
+                while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+                    BSONElement ne = obj["n"];
+                    verify(ne.isNumber());
+                    int myn = ne.numberInt();
+                    if ( n != myn ) {
+                        if (partialOk) {
+                            break; // skipped chunk is probably on another shard
+                        }
+                        log() << "should have chunk: " << n << " have:" << myn << endl;
+                        dumpChunks(txn, ns, query, sort);
+                        uassert( 10040 ,  "chunks out of order" , n == myn );
+                    }
 
-            result.append( "numChunks" , n );
-            result.append( "md5" , digestToString( d ) );
+                    // make a copy of obj since we access data in it while yielding locks
+                    BSONObj owned = obj.getOwned();
+                    exec->saveState();
+                    // UNLOCKED
+                    ctx.reset();
+
+                    int len;
+                    const char * data = owned["data"].binDataClean( len );
+                    // This is potentially an expensive operation, so do it out of the lock
+                    md5_append( &st , (const md5_byte_t*)(data) , len );
+                    n++;
+
+                    try {
+                        // RELOCKED
+                        ctx.reset(new AutoGetCollectionForRead(txn, ns));
+                    }
+                    catch (const SendStaleConfigException& ex) {
+                        LOG(1) << "chunk metadata changed during filemd5, will retarget and continue";
+                        break;
+                    }
+
+                    // Have the lock again. See if we were killed.
+                    if (!exec->restoreState(txn)) {
+                        if (!partialOk) {
+                            uasserted(13281, "File deleted during filemd5 command");
+                        }
+                    }
+                }
+
+                if (partialOk)
+                    result.appendBinData("md5state", sizeof(st), BinDataGeneral, &st);
+
+                // This must be *after* the capture of md5state since it mutates st
+                md5_finish(&st, d);
+
+                result.append( "numChunks" , n );
+                result.append( "md5" , digestToString( d ) );
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "filemd5", dbname);
             return true;
         }
 
@@ -705,7 +719,7 @@ namespace mongo {
 
 
     class CmdDatasize : public Command {
-        virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const { 
+        virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const {
             return parseNsFullyQualified(dbname, cmdObj);
         }
     public:
@@ -735,6 +749,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             Timer timer;
 
             string ns = jsobj.firstElement().String();
@@ -801,7 +816,7 @@ namespace mongo {
             long long size = 0;
             long long numObjects = 0;
 
-            DiskLoc loc;
+            RecordId loc;
             PlanExecutor::ExecState state;
             while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
                 if ( estimate )
@@ -859,6 +874,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             int scale = 1;
             if ( jsobj["scale"].isNumber() ) {
                 scale = jsobj["scale"].numberInt();
@@ -902,13 +918,33 @@ namespace mongo {
             if( numRecords )
                 result.append( "avgObjSize" , collection->averageObjectSize(txn) );
 
-            result.appendNumber( "storageSize",
-                                 static_cast<long long>(collection->getRecordStore()->storageSize( txn, &result,
-                                                                                                   verbose ? 1 : 0 ) ) / 
-                                 scale );
-            result.append( "nindexes" , collection->getIndexCatalog()->numIndexesReady( txn ) );
+            result.appendNumber("storageSize",
+                                static_cast<long long>(collection->getRecordStore()
+                                                       ->storageSize(txn,
+                                                                     &result,
+                                                                     verbose ? 1 : 0)) / scale);
 
             collection->getRecordStore()->appendCustomStats( txn, &result, scale );
+
+            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            result.append( "nindexes" , indexCatalog->numIndexesReady( txn ) );
+
+            // indexes
+            BSONObjBuilder indexDetails;
+
+            IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(txn, false);
+            while (i.more()) {
+                const IndexDescriptor* descriptor = i.next();
+                IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
+                invariant(iam);
+
+                BSONObjBuilder bob;
+                if (iam->appendCustomStats(txn, &bob, scale)) {
+                    indexDetails.append(descriptor->indexName(), bob.obj());
+                }
+            }
+
+            result.append("indexDetails", indexDetails.done());
 
             BSONObjBuilder indexSizes;
             long long indexSize = collection->getIndexSize(txn, &indexSizes, scale);
@@ -930,7 +966,7 @@ namespace mongo {
         virtual bool slaveOk() const { return false; }
         virtual bool isWriteCommandForConfigServer() const { return true; }
         virtual void help( stringstream &help ) const {
-            help << 
+            help <<
                 "Sets collection options.\n"
                 "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
                 "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} }";
@@ -944,107 +980,21 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            const string ns = dbname + "." + jsobj.firstElement().valuestr();
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
 
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
-            Client::Context ctx(txn,  ns );
-
-            Collection* coll = ctx.db()->getCollection( txn, ns );
-            if ( !coll ) {
-                errmsg = "ns does not exist";
-                return false;
-            }
-
-            bool ok = true;
-
-            BSONForEach( e, jsobj ) {
-                if ( str::equals( "collMod", e.fieldName() ) ) {
-                    // no-op
-                }
-                else if ( LiteParsedQuery::cmdOptionMaxTimeMS == e.fieldNameStringData() ) {
-                    // no-op
-                }
-                else if ( str::equals( "index", e.fieldName() ) ) {
-                    BSONObj indexObj = e.Obj();
-                    BSONObj keyPattern = indexObj.getObjectField( "keyPattern" );
-
-                    if ( keyPattern.isEmpty() ){
-                        errmsg = "no keyPattern specified";
-                        ok = false;
-                        continue;
-                    }
-
-                    BSONElement newExpireSecs = indexObj["expireAfterSeconds"];
-                    if ( newExpireSecs.eoo() ) {
-                        errmsg = "no expireAfterSeconds field";
-                        ok = false;
-                        continue;
-                    }
-                    if ( ! newExpireSecs.isNumber() ) {
-                        errmsg = "expireAfterSeconds field must be a number";
-                        ok = false;
-                        continue;
-                    }
-
-                    IndexDescriptor* idx = coll->getIndexCatalog()->findIndexByKeyPattern( txn, keyPattern );
-                    if ( idx == NULL ) {
-                        errmsg = str::stream() << "cannot find index " << keyPattern
-                                               << " for ns " << ns;
-                        ok = false;
-                        continue;
-                    }
-                    BSONElement oldExpireSecs = idx->infoObj().getField("expireAfterSeconds");
-                    if( oldExpireSecs.eoo() ){
-                        errmsg = "no expireAfterSeconds field to update";
-                        ok = false;
-                        continue;
-                    }
-                    if( ! oldExpireSecs.isNumber() ) {
-                        errmsg = "existing expireAfterSeconds field is not a number";
-                        ok = false;
-                        continue;
-                    }
-
-                    if ( oldExpireSecs != newExpireSecs ) {
-                        // change expireAfterSeconds
-                        result.appendAs( oldExpireSecs, "expireAfterSeconds_old" );
-                        coll->getCatalogEntry()->updateTTLSetting( txn,
-                                                                   idx->indexName(),
-                                                                   newExpireSecs.numberLong() );
-                        result.appendAs( newExpireSecs , "expireAfterSeconds_new" );
-                    }
-                }
-                else {
-                    Status s = coll->getRecordStore()->setCustomOption( txn, e, &result );
-                    if ( s.isOK() ) {
-                        // no-op
-                    }
-                    else if ( s.code() == ErrorCodes::InvalidOptions ) {
-                        errmsg = str::stream() << "unknown option to collMod: " << e.fieldName();
-                        ok = false;
-                    }
-                    else {
-                        return appendCommandStatus( result, s );
-                    }
-                }
-            }
-
-            if (!ok) {
-                return false;
-            }
-            
-            if (!fromRepl) {
-                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
-            }
-
-            wunit.commit();
-            return true;
+            const std::string ns = parseNsCollectionRequired(dbname, jsobj);
+            return appendCommandStatus(result,
+                                       collMod(txn, NamespaceString(ns), jsobj, &result));
         }
 
     } collectionModCommand;
-
 
     class DBStats : public Command {
     public:
@@ -1055,8 +1005,9 @@ namespace mongo {
         virtual bool slaveOk() const { return true; }
         virtual bool isWriteCommandForConfigServer() const { return false; }
         virtual void help( stringstream &help ) const {
-            help << 
-                "Get stats on a database. Not instantaneous. Slower for databases with large .ns files.\n" << 
+            help <<
+                "Get stats on a database. Not instantaneous. Slower for databases with large "
+                ".ns files.\n"
                 "Example: { dbStats:1, scale:1 }";
         }
 
@@ -1069,6 +1020,7 @@ namespace mongo {
         }
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             int scale = 1;
             if ( jsobj["scale"].isNumber() ) {
                 scale = jsobj["scale"].numberInt();
@@ -1084,13 +1036,14 @@ namespace mongo {
 
             const string ns = parseNs(dbname, jsobj);
 
-            // TODO: Client::Context legacy, needs to be removed
+            // TODO: OldClientContext legacy, needs to be removed
             txn->getCurOp()->ensureStarted();
             txn->getCurOp()->setNS(dbname);
 
             // We lock the entire database in S-mode in order to ensure that the contents will not
             // change for the stats snapshot. This might be unnecessary and if it becomes a
             // performance issue, we can take IS lock and then lock collection-by-collection.
+            ScopedTransaction scopedXact(txn, MODE_IS);
             AutoGetDb autoDb(txn, ns, MODE_S);
 
             result.append("db", ns);
@@ -1113,7 +1066,7 @@ namespace mongo {
                 result.appendNumber("fileSize", 0);
             }
             else {
-                // TODO: Client::Context legacy, needs to be removed
+                // TODO: OldClientContext legacy, needs to be removed
                 txn->getCurOp()->enter(dbname.c_str(), db->getProfilingLevel());
 
                 db->getStats(txn, &result, scale);
@@ -1144,6 +1097,32 @@ namespace mongo {
         }
     } cmdWhatsMyUri;
 
+    class AvailableQueryOptions: public Command {
+    public:
+        AvailableQueryOptions(): Command("availableQueryOptions",
+                                         false,
+                                         "availablequeryoptions") {
+        }
+
+        virtual bool slaveOk() const { return true; }
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual Status checkAuthForCommand(ClientBasic* client,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj) {
+            return Status::OK();
+        }
+
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool) {
+            result << "options" << QueryOption_AllSupported;
+            return true;
+        }
+    } availableQueryOptionsCmd;
 
     bool _execCommand(OperationContext* txn,
                       Command *c,
@@ -1157,40 +1136,41 @@ namespace mongo {
         try {
             return c->run(txn, dbname, cmdObj, queryOptions, errmsg, result, fromRepl);
         }
-        catch ( SendStaleConfigException& e ){
-            LOG(1) << "command failed because of stale config, can retry" << causedBy( e ) << endl;
+        catch (const SendStaleConfigException& e) {
+            LOG(1) << "command failed because of stale config, can retry" << causedBy(e);
             throw;
         }
-        catch ( DBException& e ) {
-
+        catch (const DBException& e) {
             // TODO: Rethrown errors have issues here, should divorce SendStaleConfigException from the DBException tree
 
-            stringstream ss;
-            ss << "exception: " << e.what();
-            result.append( "errmsg" , ss.str() );
-            result.append( "code" , e.getCode() );
+            result.append("errmsg", e.what());
+            result.append("code", e.getCode());
             return false;
         }
     }
 
-    /* Sometimes we cannot set maintenance mode, in which case the call to setMaintenanceMode will
-       return a non-OK status.  This class does not treat that case as an error which means that
-       anybody using it is assuming it is ok to continue execution without maintenance mode.  This
-       assumption needs to be audited and documented. */
+    /**
+     * Guard object for making a good-faith effort to enter maintenance mode and leave it when it
+     * goes out of scope.
+     *
+     * Sometimes we cannot set maintenance mode, in which case the call to setMaintenanceMode will
+     * return a non-OK status.  This class does not treat that case as an error which means that
+     * anybody using it is assuming it is ok to continue execution without maintenance mode.
+     *
+     * TODO: This assumption needs to be audited and documented, or this behavior should be moved
+     * elsewhere.
+     */
     class MaintenanceModeSetter {
     public:
-        MaintenanceModeSetter(OperationContext* txn) :
-            _txn(txn),
+        MaintenanceModeSetter() :
             maintenanceModeSet(
-                    repl::getGlobalReplicationCoordinator()->setMaintenanceMode(txn, true).isOK())
+                    repl::getGlobalReplicationCoordinator()->setMaintenanceMode(true).isOK())
             {}
         ~MaintenanceModeSetter() {
             if (maintenanceModeSet)
-                repl::getGlobalReplicationCoordinator()->setMaintenanceMode(_txn, false);
-        } 
+                repl::getGlobalReplicationCoordinator()->setMaintenanceMode(false);
+        }
     private:
-        // Not owned.
-        OperationContext* _txn;
         bool maintenanceModeSet;
     };
 
@@ -1225,9 +1205,9 @@ namespace mongo {
     };
 
     namespace {
-        void appendGLEHelperData(BSONObjBuilder& bob, const OpTime& opTime, const OID& oid) {
+        void appendGLEHelperData(BSONObjBuilder& bob, const Timestamp& opTime, const OID& oid) {
             BSONObjBuilder subobj(bob.subobjStart(kGLEStatsFieldName));
-            subobj.appendTimestamp(kGLEStatsLastOpTimeFieldName, opTime.asDate());
+            subobj.append(kGLEStatsLastOpTimeFieldName, opTime);
             subobj.appendOID(kGLEStatsElectionIdFieldName, const_cast<OID*>(&oid));
             subobj.done();
         }
@@ -1307,14 +1287,19 @@ namespace mongo {
 
         if ( ! canRunHere ) {
             result.append( "note" , "from execCommand" );
-            appendCommandStatus(result, false, "not master");
+            if ( c->slaveOverrideOk() ) {
+                appendCommandStatus(result, false, "not master and slaveOk=false");
+            }
+            else {
+                appendCommandStatus(result, false, "not master");
+            }
             return;
         }
 
         if (!c->maintenanceOk()
                 && replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
                 && !replCoord->canAcceptWritesForDatabase(dbname)
-                && !replCoord->getCurrentMemberState().secondary()) {
+                && !replCoord->getMemberState().secondary()) {
             result.append( "note" , "from execCommand" );
             appendCommandStatus(result, false, "node is recovering");
             return;
@@ -1326,10 +1311,8 @@ namespace mongo {
 
         txn->getCurOp()->setCommand(c);
 
-        if (c->maintenanceMode() &&
-                repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                        repl::ReplicationCoordinator::modeReplSet) {
-            mmSetter.reset(new MaintenanceModeSetter(txn));
+        if (c->maintenanceMode()) {
+            mmSetter.reset(new MaintenanceModeSetter);
         }
 
         if (c->shouldAffectCommandCounter()) {
@@ -1376,18 +1359,17 @@ namespace mongo {
         }
 
         appendCommandStatus(result, retval, errmsg);
-        
+
         // For commands from mongos, append some info to help getLastError(w) work.
-        if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
-            // Detect mongos connections by looking for setShardVersion to have been run previously
-            // on this connection.
-            if (shardingState.needCollectionMetadata(dbname)) {
-                appendGLEHelperData(result, txn->getClient()->getLastOp(), replCoord->getElectionId());
-            }
+        if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
+                shardingState.enabled()) {
+            appendGLEHelperData(
+                    result,
+                    repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                    replCoord->getElectionId());
         }
         return;
     }
-
 
     /* TODO make these all command objects -- legacy stuff here
 
@@ -1403,8 +1385,6 @@ namespace mongo {
                       BSONObjBuilder& anObjBuilder,
                       bool fromRepl, int queryOptions) {
         string dbname = nsToDatabase( ns );
-
-        LOG(2) << "run command " << ns << ' ' << _cmdobj << endl;
 
         const char *p = strchr(ns, '.');
         if ( !p ) return false;
@@ -1445,12 +1425,17 @@ namespace mongo {
         Command * c = e.type() ? Command::findCommand( e.fieldName() ) : 0;
 
         if ( c ) {
+            LOG(2) << "run command " << ns << ' ' << c->getRedactedCopyForLogging(_cmdobj);
             Command::execCommand(txn, c, queryOptions, ns, jsobj, anObjBuilder, fromRepl);
         }
         else {
-            Command::appendCommandStatus(anObjBuilder,
-                                         false,
-                                         str::stream() << "no such cmd: " << e.fieldName());
+            // In the absence of a Command object, no redaction is possible. Therefore
+            // to avoid displaying potentially sensitive information in the logs,
+            // we restrict the log message to the name of the unrecognized command.
+            // However, the complete command object will still be echoed to the client.
+            string msg = str::stream() << "no such command: " << e.fieldName();
+            LOG(2) << msg;
+            Command::appendCommandStatus(anObjBuilder, false, msg);
             anObjBuilder.append("code", ErrorCodes::CommandNotFound);
             anObjBuilder.append("bad cmd" , _cmdobj );
             Command::unknownCommands.increment();
@@ -1459,6 +1444,31 @@ namespace mongo {
         BSONObj x = anObjBuilder.done();
         b.appendBuf(x.objdata(), x.objsize());
 
+        return true;
+    }
+
+    bool runCommands(OperationContext* txn,
+                     const char* ns,
+                     BSONObj& jsobj,
+                     CurOp& curop,
+                     BufBuilder& b,
+                     BSONObjBuilder& anObjBuilder,
+                     bool fromRepl,
+                     int queryOptions) {
+        try {
+            return _runCommands(txn, ns, jsobj, b, anObjBuilder, fromRepl, queryOptions);
+        }
+        catch (const SendStaleConfigException&){
+            throw;
+        }
+        catch (const AssertionException& e) {
+            verify( e.getCode() != SendStaleConfigCode && e.getCode() != RecvStaleConfigCode );
+
+            Command::appendCommandStatus(anObjBuilder, e.toStatus());
+            curop.debug().exceptionInfo = e.getInfo();
+        }
+        BSONObj x = anObjBuilder.done();
+        b.appendBuf(x.objdata(), x.objsize());
         return true;
     }
 

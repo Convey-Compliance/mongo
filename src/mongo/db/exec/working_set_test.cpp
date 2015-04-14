@@ -42,6 +42,8 @@ using namespace mongo;
 
 namespace {
 
+    using std::string;
+
     class WorkingSetFixture : public mongo::unittest::Test {
     protected:
         void setUp() {
@@ -86,9 +88,9 @@ namespace {
         BSONObj obj = BSON(fieldName << 5);
         // Not truthful since the loc is bogus, but the loc isn't accessed anyway...
         member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-        member->obj = BSONObj(obj.objdata());
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), BSONObj(obj.objdata()));
         ASSERT_TRUE(obj.isOwned());
-        ASSERT_FALSE(member->obj.isOwned());
+        ASSERT_FALSE(member->obj.value().isOwned());
 
         // Get out the field we put in.
         BSONElement elt;
@@ -100,8 +102,8 @@ namespace {
         string fieldName = "x";
 
         BSONObj obj = BSON(fieldName << 5);
-        member->obj = obj;
-        ASSERT_TRUE(member->obj.isOwned());
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), obj);
+        ASSERT_TRUE(member->obj.value().isOwned());
         member->state = WorkingSetMember::OWNED_OBJ;
         BSONElement elt;
         ASSERT_TRUE(member->getFieldDotted(fieldName, &elt));
@@ -115,7 +117,7 @@ namespace {
         string secondName = "y";
         int secondValue = 10;
 
-        member->keyData.push_back(IndexKeyDatum(BSON(firstName << 1), BSON("" << firstValue)));
+        member->keyData.push_back(IndexKeyDatum(BSON(firstName << 1), BSON("" << firstValue), NULL));
         // Also a minor lie as loc is bogus.
         member->state = WorkingSetMember::LOC_AND_IDX;
         BSONElement elt;
@@ -125,7 +127,7 @@ namespace {
         ASSERT_FALSE(member->getFieldDotted("foo", &elt));
 
         // Add another index datum.
-        member->keyData.push_back(IndexKeyDatum(BSON(secondName << 1), BSON("" << secondValue)));
+        member->keyData.push_back(IndexKeyDatum(BSON(secondName << 1), BSON("" << secondValue), NULL));
         ASSERT_TRUE(member->getFieldDotted(secondName, &elt));
         ASSERT_EQUALS(elt.numberInt(), secondValue);
         ASSERT_TRUE(member->getFieldDotted(firstName, &elt));
@@ -138,13 +140,109 @@ namespace {
         string firstName = "x.y";
         int firstValue = 5;
 
-        member->keyData.push_back(IndexKeyDatum(BSON(firstName << 1), BSON("" << firstValue)));
+        member->keyData.push_back(IndexKeyDatum(BSON(firstName << 1), BSON("" << firstValue), NULL));
         member->state = WorkingSetMember::LOC_AND_IDX;
         BSONElement elt;
         ASSERT_TRUE(member->getFieldDotted(firstName, &elt));
         ASSERT_EQUALS(elt.numberInt(), firstValue);
         ASSERT_FALSE(member->getFieldDotted("x", &elt));
         ASSERT_FALSE(member->getFieldDotted("y", &elt));
+    }
+
+    //
+    // WorkingSet::iterator tests
+    //
+
+    TEST(WorkingSetIteratorTest, BasicIteratorTest) {
+        WorkingSet ws;
+
+        WorkingSetID id1 = ws.allocate();
+        WorkingSetMember* member1 = ws.get(id1);
+        member1->state = WorkingSetMember::LOC_AND_IDX;
+        member1->keyData.push_back(IndexKeyDatum(BSON("a" << 1), BSON("" << 3), NULL));
+
+        WorkingSetID id2 = ws.allocate();
+        WorkingSetMember* member2 = ws.get(id2);
+        member2->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
+        member2->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("a" << 3));
+
+        int counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            ASSERT(it->state == WorkingSetMember::LOC_AND_IDX ||
+                   it->state == WorkingSetMember::LOC_AND_UNOWNED_OBJ);
+            counter++;
+        }
+        ASSERT_EQ(counter, 2);
+    }
+
+    TEST(WorkingSetIteratorTest, EmptyWorkingSet) {
+        WorkingSet ws;
+
+        int counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            counter++;
+        }
+        ASSERT_EQ(counter, 0);
+    }
+
+    TEST(WorkingSetIteratorTest, EmptyWorkingSetDueToFree) {
+        WorkingSet ws;
+
+        WorkingSetID id = ws.allocate();
+        ws.free(id);
+
+        int counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            counter++;
+        }
+        ASSERT_EQ(counter, 0);
+    }
+
+    TEST(WorkingSetIteratorTest, MixedFreeAndInUse) {
+        WorkingSet ws;
+
+        WorkingSetID id1 = ws.allocate();
+        WorkingSetID id2 = ws.allocate();
+        WorkingSetID id3 = ws.allocate();
+
+        WorkingSetMember* member = ws.get(id2);
+        member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), BSON("a" << 3));
+
+        ws.free(id1);
+        ws.free(id3);
+
+        int counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            ASSERT(it->state == WorkingSetMember::LOC_AND_UNOWNED_OBJ);
+            counter++;
+        }
+        ASSERT_EQ(counter, 1);
+    }
+
+    TEST(WorkingSetIteratorTest, FreeWhileIterating) {
+        WorkingSet ws;
+
+        ws.allocate();
+        ws.allocate();
+        ws.allocate();
+
+        // Free the last two members during iteration.
+        int counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            if (counter > 0) {
+                it.free();
+            }
+            counter++;
+        }
+        ASSERT_EQ(counter, 3);
+
+        // Verify that only one item remains in the working set.
+        counter = 0;
+        for (WorkingSet::iterator it = ws.begin(); it != ws.end(); ++it) {
+            counter++;
+        }
+        ASSERT_EQ(counter, 1);
     }
 
 }  // namespace

@@ -33,6 +33,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     using mongoutils::str::stream;
     const BSONField<int> WCErrorDetail::errCode("code");
     const BSONField<BSONObj> WCErrorDetail::errInfo("errInfo");
@@ -159,7 +161,7 @@ namespace mongo {
         return _errInfo;
     }
 
-    void WCErrorDetail::setErrMessage(const StringData& errMessage) {
+    void WCErrorDetail::setErrMessage(StringData errMessage) {
         _errMessage = errMessage.toString();
         _isErrMessageSet = true;
     }

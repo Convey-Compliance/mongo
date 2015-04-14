@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,8 @@
 
 namespace mongo {
 
+    class AuthorizationManager;
+    class AuthzSessionExternalState;
     class OperationContext;
 
     /**
@@ -61,6 +64,13 @@ namespace mongo {
          * than Status::OK().
          */
         virtual Status initialize(OperationContext* txn) = 0;
+
+        /**
+         * Creates an external state manipulator for an AuthorizationSession whose
+         * AuthorizationManager uses this object as its own external state manipulator.
+         */
+        virtual std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
+                AuthorizationManager* authzManager) = 0;
 
         /**
          * Retrieves the schema version of the persistent data describing users and roles.
@@ -215,28 +225,12 @@ namespace mongo {
                               int* numRemoved) = 0;
 
         /**
-         * Creates an index with the given pattern on "collectionName".
-         */
-        virtual Status createIndex(OperationContext* txn,
-                                   const NamespaceString& collectionName,
-                                   const BSONObj& pattern,
-                                   bool unique,
-                                   const BSONObj& writeConcern) = 0;
-
-        /**
-         * Drops indexes other than the _id index on "collectionName".
-         */
-        virtual Status dropIndexes(OperationContext* txn,
-                                   const NamespaceString& collectionName,
-                                   const BSONObj& writeConcern) = 0;
-
-        /**
          * Tries to acquire the global lock guarding modifications to all persistent data related
          * to authorization, namely the admin.system.users, admin.system.roles, and
          * admin.system.version collections.  This serializes all writers to the authorization
          * documents, but does not impact readers.
          */
-        virtual bool tryAcquireAuthzUpdateLock(const StringData& why) = 0;
+        virtual bool tryAcquireAuthzUpdateLock(StringData why) = 0;
 
         /**
          * Releases the lock guarding modifications to persistent authorization data, which must
@@ -245,11 +239,11 @@ namespace mongo {
         virtual void releaseAuthzUpdateLock() = 0;
 
         virtual void logOp(
+                OperationContext* txn,
                 const char* op,
                 const char* ns,
                 const BSONObj& o,
-                BSONObj* o2,
-                bool* b) {}
+                BSONObj* o2) {}
 
 
     protected:

@@ -42,6 +42,11 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+
     class WhereMatchExpression : public MatchExpression {
     public:
         WhereMatchExpression(OperationContext* txn)
@@ -55,7 +60,7 @@ namespace mongo {
 
         virtual ~WhereMatchExpression(){}
 
-        Status init(const StringData& dbName, const StringData& theCode, const BSONObj& scope);
+        Status init(StringData dbName, StringData theCode, const BSONObj& scope);
 
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
 
@@ -93,8 +98,8 @@ namespace mongo {
         OperationContext* _txn;
     };
 
-    Status WhereMatchExpression::init( const StringData& dbName,
-                                       const StringData& theCode,
+    Status WhereMatchExpression::init( StringData dbName,
+                                       StringData theCode,
                                        const BSONObj& scope ) {
 
         if (dbName.size() == 0) {
@@ -175,7 +180,7 @@ namespace mongo {
             _userScope == realOther->_userScope;
     }
 
-    WhereCallbackReal::WhereCallbackReal(OperationContext* txn, const StringData& dbName)
+    WhereCallbackReal::WhereCallbackReal(OperationContext* txn, StringData dbName)
         : _txn(txn),
           _dbName(dbName) {
 

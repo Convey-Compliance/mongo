@@ -26,18 +26,19 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/signal_handlers_synchronous.h"
 
-#include <boost/thread/mutex.hpp>
+#include <boost/thread.hpp>
 #include <exception>
 #include <iostream>
 #include <memory>
 #include <signal.h>
 #include <streambuf>
+#include <typeinfo>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
@@ -45,6 +46,7 @@
 #include "mongo/logger/logger.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
+#include "mongo/util/debugger.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
@@ -127,19 +129,62 @@ namespace {
     // this will be called in certain c++ error cases, for example if there are two active
     // exceptions
     void myTerminate() {
-        boost::mutex::scoped_lock lk(streamMutex);
-        printStackTrace(mallocFreeOStream << "terminate() called.\n");
+        boost::lock_guard<boost::mutex> lk(streamMutex);
+
+        // In c++11 we can recover the current exception to print it.
+        if (std::exception_ptr eptr = std::current_exception()) {
+            mallocFreeOStream << "terminate() called. An exception is active;"
+                              << " attempting to gather more information";
+            writeMallocFreeStreamToLog();
+
+            const std::type_info* typeInfo = nullptr;
+            try {
+                try {
+                    std::rethrow_exception(eptr);
+                }
+                catch (const DBException& ex) {
+                    typeInfo = &typeid(ex);
+                    mallocFreeOStream << "DBException::toString(): " << ex.toString() << '\n';
+                }
+                catch (const std::exception& ex) {
+                    typeInfo = &typeid(ex);
+                    mallocFreeOStream << "std::exception::what(): " << ex.what() << '\n';
+                }
+                catch (...) {
+                    mallocFreeOStream << "A non-standard exception type was thrown\n";
+                }
+
+                if (typeInfo) {
+                    const std::string name = demangleName(*typeInfo);
+                    mallocFreeOStream << "Actual exception type: " << name << '\n';
+                }
+            }
+            catch (...) {
+                mallocFreeOStream << "Exception while trying to print current exception.\n";
+                if (typeInfo) {
+                    // It is possible that we failed during demangling. At least try to print the
+                    // mangled name.
+                    mallocFreeOStream << "Actual exception type: " << typeInfo->name() << '\n';
+                }
+            }
+        }
+        else {
+            mallocFreeOStream << "terminate() called. No exception is active";
+        }
+
+        printStackTrace(mallocFreeOStream);
         writeMallocFreeStreamToLog();
 
 #if defined(_WIN32)
         doMinidump();
 #endif
 
+        breakpoint();
         quickExit(EXIT_ABRUPT);
     }
 
     void abruptQuit(int signalNum) {
-        boost::mutex::scoped_lock lk(streamMutex);
+        boost::lock_guard<boost::mutex> lk(streamMutex);
         printSignalAndBacktrace(signalNum);
 
         // Don't go through normal shutdown procedure. It may make things worse.
@@ -178,7 +223,7 @@ namespace {
 #else
 
     void abruptQuitWithAddrSignal( int signalNum, siginfo_t *siginfo, void * ) {
-        boost::mutex::scoped_lock lk(streamMutex);
+        boost::lock_guard<boost::mutex> lk(streamMutex);
 
         const char* action = (signalNum == SIGSEGV || signalNum == SIGBUS) ? "access" : "operation";
         mallocFreeOStream << "Invalid " << action << " at address: " << siginfo->si_addr;
@@ -189,6 +234,7 @@ namespace {
         writeMallocFreeStreamToLog();
 
         printSignalAndBacktrace(signalNum);
+        breakpoint();
         quickExit(EXIT_ABRUPT);
     }
 
@@ -218,6 +264,9 @@ namespace {
         sigemptyset(&addrSignals.sa_mask);
         addrSignals.sa_flags = SA_SIGINFO;
 
+        // ^\ is the stronger ^C. Log and quit hard without waiting for cleanup.
+        invariant(signal(SIGQUIT, abruptQuit) != SIG_ERR);
+
         invariant(sigaction(SIGSEGV, &addrSignals, 0) == 0);
         invariant(sigaction(SIGBUS, &addrSignals, 0) == 0);
         invariant(sigaction(SIGILL, &addrSignals, 0) == 0);
@@ -228,7 +277,7 @@ namespace {
     }
 
     void reportOutOfMemoryErrorAndExit() {
-        boost::mutex::scoped_lock lk(streamMutex);
+        boost::lock_guard<boost::mutex> lk(streamMutex);
         printStackTrace(mallocFreeOStream << "out of memory.\n");
         writeMallocFreeStreamToLog();
         quickExit(EXIT_ABRUPT);

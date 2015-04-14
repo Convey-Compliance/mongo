@@ -63,7 +63,7 @@ namespace mongo {
          *  configures the internal state of the mod as necessary.
          */
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
         /** Updates the Element used in prepare with the effects of the $bit operation */
@@ -94,7 +94,7 @@ namespace mongo {
         OpEntries _ops;
 
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
     };
 
 } // namespace mongo

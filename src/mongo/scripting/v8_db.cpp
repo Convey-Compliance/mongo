@@ -32,10 +32,12 @@
 #include <iostream>
 #include <iomanip>
 #include <boost/scoped_array.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/client/syncclusterconnection.h"
+#include "mongo/client/native_sasl_client_session.h"
+#include "mongo/client/sasl_scramsha1_client_conversation.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine_v8.h"
@@ -46,6 +48,8 @@
 #include "mongo/util/text.h"
 
 using namespace std;
+using boost::scoped_array;
+using boost::shared_ptr;
 
 namespace mongo {
 
@@ -114,6 +118,7 @@ namespace mongo {
         scope->injectV8Method("auth", mongoAuth, proto);
         scope->injectV8Method("logout", mongoLogout, proto);
         scope->injectV8Method("cursorFromId", mongoCursorFromId, proto);
+        scope->injectV8Method("copyDatabaseWithSCRAM", mongoCopyDatabaseWithSCRAM, proto);
 
         fassert(16468, _mongoPrototypeManipulatorsFrozen);
         for (size_t i = 0; i < _mongoPrototypeManipulators.size(); ++i)
@@ -124,13 +129,10 @@ namespace mongo {
 
 
     v8::Handle<v8::Value> mongoConsExternal(V8Scope* scope, const v8::Arguments& args) {
-        char host[255];
+        string host = "127.0.0.1";
         if (args.Length() > 0 && args[0]->IsString()) {
-            uassert(16666, "string argument too long", args[0]->ToString()->Utf8Length() < 250);
-            args[0]->ToString()->WriteAscii(host);
-        }
-        else {
-            strcpy(host, "127.0.0.1");
+            v8::String::Utf8Value utf(args[0]);
+            host = string(*utf);
         }
 
         // only allow function template to be used by a constructor
@@ -384,6 +386,94 @@ namespace mongo {
         BSONObj ret;
         conn->logout(db, ret);
         return scope->mongoToLZV8(ret, false);
+    }
+
+    v8::Handle<v8::Value> mongoCopyDatabaseWithSCRAM(V8Scope* scope, const v8::Arguments& args) {
+        boost::shared_ptr<DBClientBase> conn = getConnection(scope, args);
+        if (NULL == conn)
+            return v8AssertionException("no connection");
+
+        argumentCheck(args.Length() == 5, "copyDatabase needs 5 arg");
+
+        // copyDatabase(fromdb, todb, fromhost, username, password);
+        std::string fromDb = toSTLString(args[0]);
+        std::string toDb = toSTLString(args[1]);
+        std::string fromHost = toSTLString(args[2]);
+        std::string user = toSTLString(args[3]);
+        std::string hashedPwd = DBClientWithCommands::createPasswordDigest(user,
+                                                                           toSTLString(args[4]));
+
+        boost::scoped_ptr<SaslClientSession> session(new NativeSaslClientSession());
+
+        session->setParameter(SaslClientSession::parameterMechanism, "SCRAM-SHA-1");
+        session->setParameter(SaslClientSession::parameterUser, user);
+        session->setParameter(SaslClientSession::parameterPassword, hashedPwd);
+        session->initialize();
+
+        BSONObj saslFirstCommandPrefix = BSON(
+                "copydbsaslstart" << 1 <<
+                "fromhost" << fromHost <<
+                "fromdb" << fromDb <<
+                saslCommandMechanismFieldName << "SCRAM-SHA-1");
+
+        BSONObj saslFollowupCommandPrefix = BSON("copydb" << 1 <<
+                                                 "fromhost" << fromHost <<
+                                                 "fromdb" << fromDb <<
+                                                 "todb" << toDb);
+
+        BSONObj saslCommandPrefix = saslFirstCommandPrefix;
+        BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
+        bool isServerDone = false;
+
+        while (!session->isDone()) {
+            std::string payload;
+            BSONType type;
+
+            Status status = saslExtractPayload(inputObj, &payload, &type);
+            if (!status.isOK()) {
+                return v8AssertionException(status.reason());
+            }
+
+            std::string responsePayload;
+            status = session->step(payload, &responsePayload);
+            if (!status.isOK()) {
+                return v8AssertionException(status.reason());
+            }
+
+            BSONObjBuilder commandBuilder;
+
+            commandBuilder.appendElements(saslCommandPrefix);
+            commandBuilder.appendBinData(saslCommandPayloadFieldName,
+                                         int(responsePayload.size()),
+                                         BinDataGeneral,
+                                         responsePayload.c_str());
+            BSONElement conversationId = inputObj[saslCommandConversationIdFieldName];
+            if (!conversationId.eoo())
+                commandBuilder.append(conversationId);
+
+            BSONObj command = commandBuilder.obj();
+
+            bool ok = conn->runCommand("admin", command, inputObj);
+
+            ErrorCodes::Error code = ErrorCodes::fromInt(
+                    inputObj[saslCommandCodeFieldName].numberInt());
+
+            if (!ok || code != ErrorCodes::OK) {
+                if (code == ErrorCodes::OK)
+                    code = ErrorCodes::UnknownError;
+
+                return scope->mongoToLZV8(inputObj, true);
+            }
+
+            isServerDone = inputObj[saslCommandDoneFieldName].trueValue();
+            saslCommandPrefix = saslFollowupCommandPrefix;
+        }
+
+        if (!isServerDone) {
+            return v8AssertionException("copydb client finished before server.");
+        }
+
+        return scope->mongoToLZV8(inputObj, true);
     }
 
     /**
@@ -756,7 +846,7 @@ namespace mongo {
                 return v8AssertionException("Timestamp increment must be a number");
             }
             int64_t t = args[0]->IntegerValue();
-            int64_t largestVal = int64_t(OpTime::max().getSecs());
+            int64_t largestVal = int64_t(Timestamp::max().getSecs());
             if( t > largestVal )
                 return v8AssertionException( str::stream()
                         << "The first argument must be in seconds; "
@@ -792,8 +882,9 @@ namespace mongo {
         // uassert if invalid base64 string
         string tmpBase64 = base64::decode(*utf);
         // length property stores the decoded length
-        it->ForceSet(scope->v8StringData("len"), v8::Number::New(tmpBase64.length()));
-        it->ForceSet(scope->v8StringData("type"), type);
+        it->ForceSet(scope->v8StringData("len"), v8::Number::New(tmpBase64.length()),
+                     v8::PropertyAttribute::ReadOnly);
+        it->ForceSet(scope->v8StringData("type"), type, v8::PropertyAttribute::ReadOnly);
         it->SetInternalField(0, args[1]);
 
         return it;
@@ -820,15 +911,14 @@ namespace mongo {
     v8::Handle<v8::Value> binDataToHex(V8Scope* scope, const v8::Arguments& args) {
         v8::Handle<v8::Object> it = args.This();
         verify(scope->BinDataFT()->HasInstance(it));
-        int len = v8::Handle<v8::Number>::Cast(it->Get(v8::String::New("len")))->Int32Value();
         verify(it->InternalFieldCount() == 1);
         string data = base64::decode(toSTLString(it->GetInternalField(0)));
         stringstream ss;
         ss.setf (ios_base::hex, ios_base::basefield);
         ss.fill ('0');
         ss.setf (ios_base::right, ios_base::adjustfield);
-        for(int i = 0; i < len; i++) {
-            unsigned v = (unsigned char) data[i];
+        for(std::string::iterator it = data.begin(); it != data.end(); ++it) {
+            unsigned v = (unsigned char) *it;
             ss << setw(2) << v;
         }
         return v8::String::New(ss.str().c_str());

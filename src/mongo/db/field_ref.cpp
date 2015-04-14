@@ -26,24 +26,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/db/field_ref.h"
 
 #include <algorithm> // for min
 
-#include "mongo/util/log.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
     FieldRef::FieldRef() : _size(0) {}
 
-    FieldRef::FieldRef(const StringData& path) : _size(0) {
+    FieldRef::FieldRef(StringData path) : _size(0) {
         parse(path);
     }
 
-    void FieldRef::parse(const StringData& path) {
+    void FieldRef::parse(StringData path) {
         if (path.size() == 0) {
             return;
         }
@@ -90,7 +87,7 @@ namespace mongo {
         }
     }
 
-    void FieldRef::setPart(size_t i, const StringData& part) {
+    void FieldRef::setPart(size_t i, StringData part) {
         dassert(i < _size);
 
         if (_replacements.size() != _size) {
@@ -106,7 +103,7 @@ namespace mongo {
         }
     }
 
-    size_t FieldRef::appendPart(const StringData& part) {
+    size_t FieldRef::appendPart(StringData part) {
         if (_size < kReserveAhead) {
             _fixed[_size] = part;
         }
@@ -230,7 +227,7 @@ namespace mongo {
         return result.substr(startChar, endChar - startChar);
     }
 
-    bool FieldRef::equalsDottedField( const StringData& other ) const {
+    bool FieldRef::equalsDottedField( StringData other ) const {
         StringData rest = other;
 
         for ( size_t i = 0; i < _size; i++ ) {

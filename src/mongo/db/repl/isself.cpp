@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetworking
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -47,7 +47,7 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/log.h"
 
-#if defined(__linux__) || defined(__APPLE__) || defined(__freebsd__) || defined(__sunos__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__sun) || defined(__OpenBSD__)
 #define FASTPATH_UNIX 1
 #endif
 
@@ -60,7 +60,7 @@
 #include <ifaddrs.h>
 #include <netdb.h>
 
-#ifdef __freebsd__
+#ifdef __FreeBSD__
 #include <netinet/in.h>
 #endif
 
@@ -141,7 +141,7 @@ namespace {
 
         }
 
-        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(2))) {
+        if (shouldLog(logger::LogSeverity::Debug(2))) {
             StringBuilder builder;
             builder << "getAddrsForHost(\"" << iporhost << ":" << port << "\"):";
             for (std::vector<std::string>::const_iterator o = out.begin(); o != out.end(); ++o) {
@@ -184,15 +184,17 @@ namespace {
             }
         }
 
-        if (!Listener::getTimeTracker()) {
-            // this ensures we are actually running a server
-            // this may return true later, so may want to retry
+        // Ensure that the server is up and ready to accept incoming network requests.
+        const Listener* listener = Listener::getTimeTracker();
+        if (!listener) {
             return false;
         }
+        listener->waitUntilListening();
 
         try {
             DBClientConnection conn;
             std::string errmsg;
+            conn.setSoTimeout(30); // 30 second timeout
             if (!conn.connect(hostAndPort, errmsg)) {
                 return false;
             }
@@ -339,7 +341,7 @@ namespace {
 
 #endif  // defined(_WIN32)
 
-        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(2))) {
+        if (shouldLog(logger::LogSeverity::Debug(2))) {
             StringBuilder builder;
             builder << "getBoundAddrs():";
             for (std::vector<std::string>::const_iterator o = out.begin(); o != out.end(); ++o) {

@@ -35,12 +35,14 @@ DBCollection.prototype.help = function () {
     print("\tdb." + shortName + ".count()");
     print("\tdb." + shortName + ".copyTo(newColl) - duplicates collection by copying all documents to newColl; no indexes are copied.");
     print("\tdb." + shortName + ".convertToCapped(maxBytes) - calls {convertToCapped:'" + shortName + "', size:maxBytes}} command");
+    print("\tdb." + shortName + ".createIndex(keypattern[,options])");
     print("\tdb." + shortName + ".dataSize()");
     print("\tdb." + shortName + ".distinct( key ) - e.g. db." + shortName + ".distinct( 'x' )");
     print("\tdb." + shortName + ".drop() drop the collection");
     print("\tdb." + shortName + ".dropIndex(index) - e.g. db." + shortName + ".dropIndex( \"indexName\" ) or db." + shortName + ".dropIndex( { \"indexKey\" : 1 } )");
     print("\tdb." + shortName + ".dropIndexes()");
-    print("\tdb." + shortName + ".ensureIndex(keypattern[,options])");
+    print("\tdb." + shortName + ".ensureIndex(keypattern[,options]) - DEPRECATED, use createIndex() instead");
+    print("\tdb." + shortName + ".explain().help() - show explain help");
     print("\tdb." + shortName + ".reIndex()");
     print("\tdb." + shortName + ".find([query],[fields]) - query is an optional query filter. fields is optional set of fields to return.");
     print("\t                                              e.g. db." + shortName + ".find( {x:77} , {name:1, x:1} )");
@@ -62,7 +64,8 @@ DBCollection.prototype.help = function () {
     print("\tdb." + shortName + ".renameCollection( newName , <dropTarget> ) renames the collection.");
     print("\tdb." + shortName + ".runCommand( name , <options> ) runs a db command with the given name where the first param is the collection name");
     print("\tdb." + shortName + ".save(obj)");
-    print("\tdb." + shortName + ".stats()");
+    print("\tdb." + shortName + ".stats({scale: N, indexDetails: true/false, " +
+          "indexDetailsKey: <index key>, indexDetailsName: <index name>})");
     // print("\tdb." + shortName + ".diskStorageStats({[extent: <num>,] [granularity: <bytes>,] ...}) - analyze record layout on disk");
     // print("\tdb." + shortName + ".pagesInRAM({[extent: <num>,] [granularity: <bytes>,] ...}) - analyze resident memory pages");
     print("\tdb." + shortName + ".storageSize() - includes free space allocated to this collection");
@@ -987,13 +990,16 @@ DBCollection.prototype.getShardVersion = function(){
     return this._db._adminCommand( { getShardVersion : this._fullName } );
 }
 
-DBCollection.prototype._getIndexesSystemIndexes = function(){
+DBCollection.prototype._getIndexesSystemIndexes = function(filter){
     var si = this.getDB().getCollection( "system.indexes" );
-    return si.find( { ns : this.getFullName() } ).toArray();
+    var query = { ns : this.getFullName() };
+    if (filter)
+        query = Object.extend(query, filter)
+    return si.find( query ).toArray();
 }
 
-DBCollection.prototype._getIndexesCommand = function(){
-    var res = this.runCommand( "listIndexes" );
+DBCollection.prototype._getIndexesCommand = function(filter){
+    var res = this.runCommand( "listIndexes", filter );
 
     if ( !res.ok ) {
 
@@ -1014,15 +1020,15 @@ DBCollection.prototype._getIndexesCommand = function(){
         throw Error( "listIndexes failed: " + tojson( res ) );
     }
 
-    return res.indexes;
+    return new DBCommandCursor(this._mongo, res).toArray();
 }
 
-DBCollection.prototype.getIndexes = function(){
-    var res = this._getIndexesCommand();
+DBCollection.prototype.getIndexes = function(filter){
+    var res = this._getIndexesCommand(filter);
     if ( res ) {
         return res;
     }
-    return this._getIndexesSystemIndexes();
+    return this._getIndexesSystemIndexes(filter);
 }
 
 DBCollection.prototype.getIndices = DBCollection.prototype.getIndexes;
@@ -1041,15 +1047,15 @@ DBCollection.prototype.count = function( x ){
     return this.find( x ).count();
 }
 
-/**
- *  Drop free lists. Normally not used.
- *  Note this only does the collection itself, not the namespaces of its indexes (see cleanAll).
- */
-DBCollection.prototype.clean = function() {
-    return this._dbCommand( { clean: this.getName() } );
+DBCollection.prototype.hashAllDocs = function() {
+    var cmd = { dbhash : 1,
+                collections : [ this._shortName ] };
+    var res = this._dbCommand( cmd );
+    var hash = res.collections[this._shortName];
+    assert( hash );
+    assert( typeof(hash) == "string" );
+    return hash;
 }
-
-
 
 /**
  * <p>Drop a specified index.</p>
@@ -1095,8 +1101,68 @@ DBCollection.prototype.getCollection = function( subName ){
     return this._db.getCollection( this._shortName + "." + subName );
 }
 
-DBCollection.prototype.stats = function( scale ){
-    return this._db.runCommand( { collstats : this._shortName , scale : scale } );
+/**
+  * scale: The scale at which to deliver results. Unless specified, this command returns all data
+  *        in bytes.
+  * indexDetails: Includes indexDetails field in results. Default: false.
+  * indexDetailsKey: If indexDetails is true, filter contents in indexDetails by this index key.
+  * indexDetailsname: If indexDetails is true, filter contents in indexDetails by this index name.
+  *
+  * It is an error to provide both indexDetailsKey and indexDetailsName.
+  */
+DBCollection.prototype.stats = function(args) {
+    'use strict';
+
+    // For backwards compatibility with db.collection.stats(scale).
+    var scale = isObject(args) ? args.scale : args;
+
+    var options = isObject(args) ? args : {};
+    if (options.indexDetailsKey && options.indexDetailsName) {
+        throw new Error('Cannot filter indexDetails on both indexDetailsKey and ' +
+                        'indexDetailsName');
+    }
+
+    var res = this._db.runCommand({collStats: this._shortName, scale: scale});
+    if (!res.ok) {
+        return res;
+    }
+
+    var getIndexName = function(collection, indexKey) {
+        if (!isObject(indexKey)) return undefined;
+        var indexName;
+        collection.getIndexes().forEach(function(spec) {
+            if (friendlyEqual(spec.key, options.indexDetailsKey)) {
+                indexName = spec.name;
+            }
+        });
+        return indexName;
+    };
+
+    var filterIndexName =
+        options.indexDetailsName || getIndexName(this, options.indexDetailsKey);
+
+    var updateStats = function(stats, keepIndexDetails, indexName) {
+        if (!stats.indexDetails) return;
+        if (!keepIndexDetails) {
+            delete stats.indexDetails;
+            return;
+        }
+        if (!indexName) return;
+        for (var key in stats.indexDetails) {
+            if (key == indexName) continue;
+            delete stats.indexDetails[key];
+        }
+    };
+
+    updateStats(res, options.indexDetails, filterIndexName);
+
+    if (res.sharded) {
+        for (var shardName in res.shards) {
+            updateStats(res.shards[shardName], options.indexDetails, filterIndexName);
+        }
+    }
+
+    return res;
 }
 
 DBCollection.prototype.dataSize = function(){
@@ -1120,16 +1186,10 @@ DBCollection.prototype.totalIndexSize = function( verbose ){
 
 DBCollection.prototype.totalSize = function(){
     var total = this.storageSize();
-    var mydb = this._db;
-    var shortName = this._shortName;
-    this.getIndexes().forEach(
-        function( spec ){
-            var coll = mydb.getCollection( shortName + ".$" + spec.name );
-            var mysize = coll.storageSize();
-            //print( coll + "\t" + mysize + "\t" + tojson( coll.validate() ) );
-            total += coll.dataSize();
-        }
-    );
+    var totalIndexSize = this.totalIndexSize();
+    if (totalIndexSize) {
+        total += totalIndexSize;
+    }
     return total;
 }
 
@@ -1144,9 +1204,10 @@ DBCollection.prototype.exists = function(){
     var res = this._db.runCommand( "listCollections",
                                   { filter : { name : this._shortName } } );
     if ( res.ok ) {
-        if ( res.collections.length == 0 )
+        var cursor = new DBCommandCursor( this._mongo, res );
+        if ( !cursor.hasNext() )
             return null;
-        return res.collections[0];
+        return cursor.next();
     }
 
     if ( res.errmsg && res.errmsg.startsWith( "no such cmd" ) ) {

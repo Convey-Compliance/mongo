@@ -34,17 +34,24 @@
 
 #include <boost/algorithm/string/join.hpp>
 #include <boost/algorithm/string/replace.hpp>
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/crypto/crypto.h"
 #include "mongo/crypto/mechanism_scram.h"
+#include "mongo/db/auth/sasl_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/password_digest.h"
+#include "mongo/util/sequence_util.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::string;
+
     SaslSCRAMSHA1ServerConversation::SaslSCRAMSHA1ServerConversation(
                                                     SaslAuthenticationSession* saslAuthSession) :
         SaslServerConversation(saslAuthSession),
@@ -53,7 +60,7 @@ namespace mongo {
         _nonce("") {
     }
 
-    StatusWith<bool> SaslSCRAMSHA1ServerConversation::step(const StringData& inputData,
+    StatusWith<bool> SaslSCRAMSHA1ServerConversation::step(StringData inputData,
                                                            std::string* outputData) {
 
         std::vector<std::string> input = StringSplitter::split(inputData.toString(), ",");
@@ -131,9 +138,6 @@ namespace mongo {
                 "Incorrect SCRAM-SHA-1 client nonce: " << input[2]);
         }
 
-        // add client-first-message-bare to _authMessage
-        _authMessage += input[1] + "," + input[2] + ",";
-
         _user = input[1].substr(2);
         if (!authzId.empty() && _user != authzId) {
             return StatusWith<bool>(ErrorCodes::BadValue, mongoutils::str::stream() <<
@@ -141,13 +145,27 @@ namespace mongo {
         }
 
         decodeSCRAMUsername(_user);
+
+        // SERVER-16534, SCRAM-SHA-1 must be enabled for authenticating the internal user, so that
+        // cluster members may communicate with each other. Hence ignore disabled auth mechanism
+        // for the internal user.
+        UserName user(_user, _saslAuthSession->getAuthenticationDatabase());
+        if (!sequenceContains(saslGlobalParams.authenticationMechanisms, "SCRAM-SHA-1") &&
+            user != internalSecurity.user->getName()) {
+            return StatusWith<bool>(ErrorCodes::BadValue,
+                                    "SCRAM-SHA-1 authentication is disabled");
+        }
+
+        // add client-first-message-bare to _authMessage
+        _authMessage += input[1] + "," + input[2] + ",";
+
         std::string clientNonce = input[2].substr(2);
 
         // The authentication database is also the source database for the user.
         User* userObj;
         Status status = _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().
                 acquireUser(_saslAuthSession->getOpCtxt(),
-                            UserName(_user, _saslAuthSession->getAuthenticationDatabase()),
+                            user,
                             &userObj);
 
         if (!status.isOK()) {
@@ -155,8 +173,19 @@ namespace mongo {
         }
 
         _creds = userObj->getCredentials();
+        UserName userName = userObj->getName();
+
         _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().
                 releaseUser(userObj);
+
+        // Check for authentication attempts of the __system user on
+        // systems started without a keyfile.
+        if (userName == internalSecurity.user->getName() &&
+            _creds.scram.salt.empty()) {
+            return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
+                                    "It is not possible to authenticate as the __system user "
+                                    "on servers started without a --keyFile parameter");
+        }
 
         // Generate SCRAM credentials on the fly for mixed MONGODB-CR/SCRAM mode.
         if (_creds.scram.salt.empty() && !_creds.password.empty()) {
@@ -286,7 +315,7 @@ namespace mongo {
         if (memcmp(decodedStoredKey.c_str(), computedStoredKey, scram::hashSize) != 0) {
             return StatusWith<bool>(ErrorCodes::AuthenticationFailed,
                 mongoutils::str::stream() <<
-                    "SCRAM-SHA-1 auhentication failed, storedKey mismatch");
+                    "SCRAM-SHA-1 authentication failed, storedKey mismatch");
         }
 
         // ServerSignature := HMAC(ServerKey, AuthMessage)

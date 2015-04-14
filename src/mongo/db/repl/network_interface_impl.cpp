@@ -32,29 +32,39 @@
 
 #include "mongo/db/repl/network_interface_impl.h"
 
+#include <boost/make_shared.hpp>
 #include <boost/thread.hpp>
 #include <memory>
 #include <sstream>
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/repl/connections.h"  // For ScopedConn::keepOpen
-#include "mongo/db/repl/oplogreader.h"  // For replAuthenticate
+#include "mongo/db/repl/network_interface_impl_downconvert_find_getmore.h"
 #include "mongo/platform/unordered_map.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/stdx/list.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/get_status_from_command_result.h"
 #include "mongo/util/net/hostandport.h"
-#include "mongo/util/timer.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace repl {
 
 namespace {
-    const size_t kNumThreads = 8;
-    Seconds kDefaultMaxIdleConnectionAge(60);
+
+    const size_t kMinThreads = 1;
+    const size_t kMaxThreads = 51;  // Set to 1 + max repl set size, for heartbeat + wiggle room.
+    const unsigned long long kNeverTooStale = std::numeric_limits<unsigned long long>::max();
+    // 5 Minutes (Note: Must be larger than kMaxConnectionAge below)
+    const long long kCleanUpInterval = 5 * 60 * 1000;
+    const Seconds kMaxIdleThreadAge(30);
+    const Seconds kMaxConnectionAge(30);
 
 }  // namespace
 
@@ -68,19 +78,9 @@ namespace {
     public:
         struct ConnectionInfo;
 
-        /**
-         * Options for configuring the pool.
-         */
-        struct Options {
-            Options() : maxIdleConnectionAge(kDefaultMaxIdleConnectionAge) {}
-
-            // Maximum age of an idle connection, as measured since last operation completion,
-            // before it is reaped.
-            Seconds maxIdleConnectionAge;
-        };
-
         typedef stdx::list<ConnectionInfo> ConnectionList;
         typedef unordered_map<HostAndPort, ConnectionList> HostConnectionMap;
+        typedef std::map<HostAndPort, Date_t> HostLastUsedMap;
 
         /**
          * RAII class for connections from the pool.  To use the connection pool, instantiate one of
@@ -100,8 +100,9 @@ namespace {
              */
             ConnectionPtr(ConnectionPool* pool,
                           const HostAndPort& target,
-                          Seconds timeout) :
-                _pool(pool), _connInfo(pool->acquireConnection(target, timeout)) {}
+                          Date_t now,
+                          Milliseconds timeout) :
+                _pool(pool), _connInfo(pool->acquireConnection(target, now, timeout)) {}
 
             /**
              * Destructor reaps the connection if it wasn't already returned to the pool by calling
@@ -112,35 +113,32 @@ namespace {
             /**
              * Releases the connection back to the pool from which it was drawn.
              */
-            void done() { _pool->releaseConnection(_connInfo); _pool = NULL; }
+            void done(Date_t now) { _pool->releaseConnection(_connInfo, now); _pool = NULL; }
 
             DBClientConnection& operator*();
             DBClientConnection* operator->();
-
+            operator DBClientConnection*();
         private:
             ConnectionPool* _pool;
             const ConnectionList::iterator _connInfo;
         };
 
-        /**
-         * Constructs a new connection pool, configured with the given options.
-         */
-        explicit ConnectionPool(const Options& options);
-
+        ConnectionPool();
         ~ConnectionPool();
 
         /**
          * Acquires a connection to "target" with the given "timeout", or throws a DBException.
          * Intended for use by ConnectionPtr.
          */
-        ConnectionList::iterator acquireConnection(const HostAndPort& target, Seconds timeout);
+        ConnectionList::iterator acquireConnection(
+                const HostAndPort& target, Date_t now, Milliseconds timeout);
 
         /**
          * Releases a connection back into the pool.
          * Intended for use by ConnectionPtr.
          * Call this for connections that can safely be reused.
          */
-        void releaseConnection(ConnectionList::iterator);
+        void releaseConnection(ConnectionList::iterator iter, Date_t now);
 
         /**
          * Destroys a connection previously acquired from the pool.
@@ -156,53 +154,68 @@ namespace {
         void closeAllInUseConnections();
 
         /**
-         * Reap all connections in the pool that have been there continuously since before
-         * "date".
+         * Reaps all connections in the pool that are too old as of "now".
          */
-        void cleanUpOlderThan(Date_t date);
+        void cleanUpOlderThan(Date_t now);
 
     private:
         /**
-         * Implementation of cleanUpOlderThan which assumes that _mutex is already held.
+         * Returns true if the given connection is young enough to keep in the pool.
          */
-        void cleanUpOlderThan_inlock(Date_t date);
+        bool shouldKeepConnection(Date_t now, const ConnectionInfo& connInfo) const;
 
         /**
-         * Reaps connections in "hostConns" that were already in the pool as of "date".  Expects
-         * _mutex to be held.
+         * Apply cleanup policy to any host(s) not active in the last kCleanupInterval milliseconds.
          */
-        void cleanUpOlderThan_inlock(Date_t date, ConnectionList* hostConns);
+        void cleanUpStaleHosts_inlock(Date_t now);
+
+        /**
+         * Implementation of cleanUpOlderThan which assumes that _mutex is already held.
+         */
+        void cleanUpOlderThan_inlock(Date_t now);
+
+        /**
+         * Reaps connections in "hostConns" that are too old or have been in the pool too long as of
+         * "now".  Expects _mutex to be held.
+         */
+        void cleanUpOlderThan_inlock(Date_t now, ConnectionList* hostConns);
+
+        /**
+         * Destroys the connection associated with "iter" and removes "iter" fron connList.
+         */
+        static void destroyConnection_inlock(ConnectionList* connList,
+                                             ConnectionList::iterator iter);
 
         // Mutex guarding members of the connection pool
         boost::mutex _mutex;
 
-        // Map from HostAndPort to free connections.
+        // Map from HostAndPort to idle connections.
         HostConnectionMap _connections;
+
+        // List of non-idle connections.
         ConnectionList _inUseConnections;
 
-        // Options with which this pool was configured.
-        Options _options;
+        // Map of HostAndPorts to when they were last used.
+        HostLastUsedMap _lastUsedHosts;
+        
+        // Time representing when the connections were last cleaned.
+        Date_t _lastCleanUpTime;
     };
 
     /**
      * Information about a connection in the pool.
      */
     struct NetworkInterfaceImpl::ConnectionPool::ConnectionInfo {
-        ConnectionInfo() : conn(NULL), lastEnteredPoolDate(0ULL) {}
+        ConnectionInfo() : conn(NULL), creationDate(0ULL) {}
         ConnectionInfo(DBClientConnection* theConn, Date_t date) :
             conn(theConn),
-            lastEnteredPoolDate(date) {}
-
-        /**
-         * Returns true if the connection entered the pool  "date".
-         */
-        bool isNotNewerThan(Date_t date) { return lastEnteredPoolDate <= date; }
+            creationDate(date) {}
 
         // A connection in the pool.
         DBClientConnection* conn;
 
-        // The date at which the connection "conn" was last put into the pool.
-        Date_t lastEnteredPoolDate;
+        // The date at which the connection was created.
+        Date_t creationDate;
     };
 
     DBClientConnection& NetworkInterfaceImpl::ConnectionPool::ConnectionPtr::operator*() {
@@ -213,8 +226,11 @@ namespace {
         return _connInfo->conn;
     }
 
-    NetworkInterfaceImpl::ConnectionPool::ConnectionPool(const Options& options) :
-        _options(options) {}
+    NetworkInterfaceImpl::ConnectionPool::ConnectionPtr::operator DBClientConnection*() {
+        return _connInfo->conn;
+    }
+
+    NetworkInterfaceImpl::ConnectionPool::ConnectionPool() : _lastCleanUpTime(0ULL) {}
 
     NetworkInterfaceImpl::ConnectionPool::~ConnectionPool() {
         cleanUpOlderThan(Date_t(~0ULL));
@@ -222,15 +238,15 @@ namespace {
         invariant(_inUseConnections.empty());
     }
 
-    void NetworkInterfaceImpl::ConnectionPool::cleanUpOlderThan(Date_t date) {
+    void NetworkInterfaceImpl::ConnectionPool::cleanUpOlderThan(Date_t now) {
         boost::lock_guard<boost::mutex> lk(_mutex);
-        cleanUpOlderThan_inlock(date);
+        cleanUpOlderThan_inlock(now);
     }
 
-    void NetworkInterfaceImpl::ConnectionPool::cleanUpOlderThan_inlock(Date_t date) {
+    void NetworkInterfaceImpl::ConnectionPool::cleanUpOlderThan_inlock(Date_t now) {
         HostConnectionMap::iterator hostConns = _connections.begin();
         while (hostConns != _connections.end()) {
-            cleanUpOlderThan_inlock(date, &hostConns->second);
+            cleanUpOlderThan_inlock(now, &hostConns->second);
             if (hostConns->second.empty()) {
                 _connections.erase(hostConns++);
             }
@@ -241,19 +257,29 @@ namespace {
     }
 
     void NetworkInterfaceImpl::ConnectionPool::cleanUpOlderThan_inlock(
-            Date_t date,
+            Date_t now,
             ConnectionList* hostConns) {
         ConnectionList::iterator iter = hostConns->begin();
         while (iter != hostConns->end()) {
-            if (iter->isNotNewerThan(date)) {
-                ConnectionList::iterator toDelete = iter++;
-                delete toDelete->conn;
-                hostConns->erase(toDelete);
-            }
-            else {
+            if (shouldKeepConnection(now, *iter)) {
                 ++iter;
             }
+            else {
+                destroyConnection_inlock(hostConns, iter++);
+            }
         }
+    }
+
+    bool NetworkInterfaceImpl::ConnectionPool::shouldKeepConnection(
+            const Date_t now,
+            const ConnectionInfo& connInfo) const {
+
+        const Date_t expirationDate =
+            connInfo.creationDate + kMaxConnectionAge.total_milliseconds();
+        if (expirationDate <= now) {
+            return false;
+        }
+        return true;
     }
 
     void NetworkInterfaceImpl::ConnectionPool::closeAllInUseConnections() {
@@ -266,67 +292,164 @@ namespace {
         }
     }
 
+    void NetworkInterfaceImpl::ConnectionPool::cleanUpStaleHosts_inlock(Date_t now) {
+        if (now > _lastCleanUpTime + kCleanUpInterval) {
+            for (HostLastUsedMap::iterator itr = _lastUsedHosts.begin();
+                    itr != _lastUsedHosts.end();
+                    itr++) {
+                if (itr->second <= _lastCleanUpTime) {
+                    ConnectionList connList = _connections.find(itr->first)->second;
+                    cleanUpOlderThan_inlock(now, &connList);
+                    invariant(connList.empty());
+                    itr->second = Date_t(kNeverTooStale);
+                }
+            }
+            _lastCleanUpTime = now;
+        }
+    }
+
     NetworkInterfaceImpl::ConnectionPool::ConnectionList::iterator
     NetworkInterfaceImpl::ConnectionPool::acquireConnection(
             const HostAndPort& target,
-            Seconds timeout) {
+            Date_t now,
+            Milliseconds timeout) {
         boost::unique_lock<boost::mutex> lk(_mutex);
-        HostConnectionMap::iterator hostConns = _connections.find(target);
-        if (hostConns == _connections.end() || hostConns->second.empty()) {
-            // No free connection in the pool; make a new one.
+
+        // Clean up connections on stale/unused hosts
+        cleanUpStaleHosts_inlock(now);
+
+        for (HostConnectionMap::iterator hostConns;
+             ((hostConns = _connections.find(target)) != _connections.end());) {
+
+            // Clean up the requested host to remove stale/unused connections
+            cleanUpOlderThan_inlock(now, &hostConns->second);
+            if (hostConns->second.empty()) {
+                // prevent host from causing unnecessary cleanups
+                _lastUsedHosts[hostConns->first] = Date_t(kNeverTooStale);
+                break;
+            }
+            _inUseConnections.splice(_inUseConnections.begin(),
+                                     hostConns->second,
+                                     hostConns->second.begin());
+            const ConnectionList::iterator candidate = _inUseConnections.begin();
             lk.unlock();
-            std::auto_ptr<DBClientConnection> conn(new DBClientConnection);
-            conn->setSoTimeout(timeout.total_seconds());
-            std::string errmsg;
-            uassert(18915,
-                    str::stream() << "Failed attempt to connect to " << target.toString() << "; " <<
-                    errmsg,
-                    conn->connect(target, errmsg));
-            conn->port().tag |= ScopedConn::keepOpen;
-            uassert(ErrorCodes::AuthenticationFailed,
-                    str::stream() << "Failed to authenticate as cluster member to " <<
-                    target.toString(),
-                    replAuthenticate(conn.get()));
+            try {
+                if (candidate->conn->isStillConnected()) {
+                    // setSoTimeout takes a double representing the number of seconds for send and
+                    // receive timeouts.  Thus, we must take total_milliseconds() and divide by
+                    // 1000.0 to get the number of seconds with a fractional part.
+                    candidate->conn->setSoTimeout(timeout.total_milliseconds() / 1000.0);
+                    return candidate;
+                }
+            }
+            catch (...) {
+                lk.lock();
+                destroyConnection_inlock(&_inUseConnections, candidate);
+                throw;
+            }
             lk.lock();
-            return _inUseConnections.insert(
-                    _inUseConnections.begin(),
-                    ConnectionInfo(conn.release(), Date_t(0)));
+            destroyConnection_inlock(&_inUseConnections, candidate);
         }
-        ConnectionList::iterator result = hostConns->second.begin();
-        _inUseConnections.splice(_inUseConnections.begin(), hostConns->second, result);
-        if (hostConns->second.empty()) {
-            _connections.erase(hostConns);
-        }
+
+        // No idle connection in the pool; make a new one.
         lk.unlock();
-        result->conn->setSoTimeout(timeout.total_seconds());
-        return result;
+        std::auto_ptr<DBClientConnection> conn(new DBClientConnection);
+        // setSoTimeout takes a double representing the number of seconds for send and receive
+        // timeouts.  Thus, we must take total_milliseconds() and divide by 1000.0 to get the number
+        // of seconds with a fractional part.
+        conn->setSoTimeout(timeout.total_milliseconds() / 1000.0);
+        std::string errmsg;
+        uassert(18915,
+                str::stream() << "Failed attempt to connect to " << target.toString() << "; " <<
+                errmsg,
+                conn->connect(target, errmsg));
+        conn->port().tag |= ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen;
+        if (getGlobalAuthorizationManager()->isAuthEnabled()) {
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "Missing credentials for authenticating as internal user",
+                    isInternalAuthSet());
+            conn->auth(getInternalUserAuthParamsWithFallback());
+        }
+        lk.lock();
+        return _inUseConnections.insert(_inUseConnections.begin(),
+                                        ConnectionInfo(conn.release(), now));
     }
 
-    void NetworkInterfaceImpl::ConnectionPool::releaseConnection(ConnectionList::iterator iter) {
-        const Date_t now(curTimeMillis64());
+    void NetworkInterfaceImpl::ConnectionPool::releaseConnection(ConnectionList::iterator iter,
+                                                                 const Date_t now) {
         boost::lock_guard<boost::mutex> lk(_mutex);
+        if (!shouldKeepConnection(now, *iter)) {
+            destroyConnection_inlock(&_inUseConnections, iter);
+            return;
+        }
         ConnectionList& hostConns = _connections[iter->conn->getServerHostAndPort()];
-        cleanUpOlderThan_inlock(
-                now - _options.maxIdleConnectionAge.total_seconds(),
-                &hostConns);
-        iter->lastEnteredPoolDate = now;
+        cleanUpOlderThan_inlock(now, &hostConns);
         hostConns.splice(hostConns.begin(), _inUseConnections, iter);
+        _lastUsedHosts[iter->conn->getServerHostAndPort()] = now;
     }
 
     void NetworkInterfaceImpl::ConnectionPool::destroyConnection(ConnectionList::iterator iter) {
         boost::lock_guard<boost::mutex> lk(_mutex);
+        destroyConnection_inlock(&_inUseConnections, iter);
+    }
+
+    void NetworkInterfaceImpl::ConnectionPool::destroyConnection_inlock(
+            ConnectionList* connList, ConnectionList::iterator iter) {
         delete iter->conn;
-        _inUseConnections.erase(iter);
+        connList->erase(iter);
     }
 
     NetworkInterfaceImpl::NetworkInterfaceImpl() :
+        _numIdleThreads(0),
+        _nextThreadId(0),
+        _lastFullUtilizationDate(),
         _isExecutorRunnable(false),
-        _inShutdown(false) {
-        ConnectionPool::Options options;
-        _connPool.reset(new ConnectionPool(options));
+        _inShutdown(false),
+        _numActiveNetworkRequests(0) {
+        _connPool.reset(new ConnectionPool());
     }
 
     NetworkInterfaceImpl::~NetworkInterfaceImpl() { }
+
+    std::string NetworkInterfaceImpl::getDiagnosticString() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        str::stream output;
+        output << "NetworkImpl";
+        output << " threads:" << _threads.size();
+        output << " inShutdown:" << _inShutdown;
+        output << " active:" << _numActiveNetworkRequests;
+        output << " pending:" << _pending.size();
+        output << " execRunable:" << _isExecutorRunnable;
+        return output;
+
+    }
+
+    void NetworkInterfaceImpl::_startNewNetworkThread_inlock() {
+        if (_inShutdown) {
+            LOG(1) <<
+                "Not starting new replication networking thread while shutting down replication.";
+            return;
+        }
+        if (_threads.size() >= kMaxThreads) {
+            LOG(1) << "Not starting new replication networking thread because " << kMaxThreads <<
+                " are already running; " << _numIdleThreads << " threads are idle and " <<
+                _pending.size() << " network requests are waiting for a thread to serve them.";
+            return;
+        }
+        const std::string threadName(str::stream() << "ReplExecNetThread-" << _nextThreadId++);
+        try {
+            _threads.push_back(
+                    boost::make_shared<boost::thread>(
+                            stdx::bind(&NetworkInterfaceImpl::_requestProcessorThreadBody,
+                                       this,
+                                       threadName)));
+            ++_numIdleThreads;
+        }
+        catch (const std::exception& ex) {
+            error() << "Failed to start " << threadName << "; " << _threads.size() <<
+                " other network threads still running; caught exception: " << ex.what();
+        }
+    }
 
     void NetworkInterfaceImpl::startup() {
         boost::lock_guard<boost::mutex> lk(_mutex);
@@ -334,23 +457,22 @@ namespace {
         if (!_threads.empty()) {
             return;
         }
-        for (size_t i = 0; i < kNumThreads; ++i) {
-            _threads.push_back(
-                    boost::shared_ptr<boost::thread>(
-                            new boost::thread(
-                                    stdx::bind(&NetworkInterfaceImpl::_consumeNetworkRequests,
-                                               this))));
+        for (size_t i = 0; i < kMinThreads; ++i) {
+            _startNewNetworkThread_inlock();
         }
     }
 
     void NetworkInterfaceImpl::shutdown() {
+        using std::swap;
         boost::unique_lock<boost::mutex> lk(_mutex);
         _inShutdown = true;
         _hasPending.notify_all();
+        ThreadList threadsToJoin;
+        swap(threadsToJoin, _threads);
         lk.unlock();
         _connPool->closeAllInUseConnections();
-        std::for_each(_threads.begin(),
-                      _threads.end(),
+        std::for_each(threadsToJoin.begin(),
+                      threadsToJoin.end(),
                       stdx::bind(&boost::thread::join, stdx::placeholders::_1));
     }
 
@@ -386,23 +508,67 @@ namespace {
         _isExecutorRunnable = false;
     }
 
+    void NetworkInterfaceImpl::_requestProcessorThreadBody(
+            NetworkInterfaceImpl* net,
+            const std::string& threadName) {
+        setThreadName(threadName);
+        LOG(1) << "thread starting";
+        net->_consumeNetworkRequests();
+
+        // At this point, another thread may have destroyed "net", if this thread chose to detach
+        // itself and remove itself from net->_threads before releasing net->_mutex.  Do not access
+        // member variables of "net" from here, on.
+        LOG(1) << "thread shutting down";
+    }
+
     void NetworkInterfaceImpl::_consumeNetworkRequests() {
         boost::unique_lock<boost::mutex> lk(_mutex);
         while (!_inShutdown) {
             if (_pending.empty()) {
-                _hasPending.wait(lk);
+                if (_threads.size() > kMinThreads) {
+                    const Date_t nowDate = now();
+                    const Date_t nextThreadRetirementDate =
+                        _lastFullUtilizationDate + kMaxIdleThreadAge.total_milliseconds();
+                    if (nowDate > nextThreadRetirementDate) {
+                        _lastFullUtilizationDate = nowDate;
+                        break;
+                    }
+                }
+                _hasPending.timed_wait(lk, kMaxIdleThreadAge);
                 continue;
             }
             CommandData todo = _pending.front();
             _pending.pop_front();
+            ++_numActiveNetworkRequests;
+            --_numIdleThreads;
             lk.unlock();
             ResponseStatus result = _runCommand(todo.request);
             LOG(2) << "Network status of sending " << todo.request.cmdObj.firstElementFieldName() <<
                 " to " << todo.request.target << " was " << result.getStatus();
             todo.onFinish(result);
             lk.lock();
+            --_numActiveNetworkRequests;
+            ++_numIdleThreads;
             _signalWorkAvailable_inlock();
         }
+        --_numIdleThreads;
+        if (_inShutdown) {
+            return;
+        }
+        // This thread is ending because it was idle for too long.
+        // Find self in _threads, remove self from _threads, detach self.
+        for (size_t i = 0; i < _threads.size(); ++i) {
+            if (_threads[i]->get_id() != boost::this_thread::get_id()) {
+                continue;
+            }
+            _threads[i]->detach();
+            _threads[i].swap(_threads.back());
+            _threads.pop_back();
+            return;
+        }
+        severe().stream() << "Could not find this thread, with id " <<
+            boost::this_thread::get_id() << " in the replication networking thread pool";
+        fassertFailedNoTrace(28581);
     }
 
     void NetworkInterfaceImpl::startCommand(
@@ -417,6 +583,12 @@ namespace {
         cd.cbHandle = cbHandle;
         cd.request = request;
         cd.onFinish = onFinish;
+        if (_numIdleThreads < _pending.size()) {
+            _startNewNetworkThread_inlock();
+        }
+        if (_numIdleThreads <= _pending.size()) {
+            _lastFullUtilizationDate = curTimeMillis64();
+        }
         _hasPending.notify_one();
     }
 
@@ -446,22 +618,31 @@ namespace {
     }
 
     namespace {
-        // Duplicated in mock impl
-        StatusWith<int> getTimeoutMillis(Date_t expDate, Date_t nowDate) {
-            // check for timeout
-            int timeout = 0;
-            if (expDate != ReplicationExecutor::kNoExpirationDate) {
-                timeout = expDate >= nowDate ? expDate - nowDate :
-                                               ReplicationExecutor::kNoTimeout.total_milliseconds();
-                if (timeout < 0 ) {
-                    return StatusWith<int>(ErrorCodes::ExceededTimeLimit,
-                                               str::stream() << "Went to run command,"
-                                               " but it was too late. Expiration was set to "
-                                                             << expDate);
-                }
+
+        /**
+         * Calculates the timeout for a network operation expiring at "expDate", given
+         * that it is now "nowDate".
+         *
+         * Returns 0 to indicate no expiration date, a number of milliseconds until "expDate", or
+         * ErrorCodes::ExceededTimeLimit if "expDate" is not later than "nowDate".
+         *
+         * TODO: Change return type to StatusWith<Milliseconds> once Milliseconds supports default
+         * construction or StatusWith<T> supports not constructing T when the result is a non-OK
+         * status.
+         */
+        StatusWith<int64_t> getTimeoutMillis(const Date_t expDate, const Date_t nowDate) {
+            if (expDate == ReplicationExecutor::kNoExpirationDate) {
+                return StatusWith<int64_t>(0);
             }
-            return StatusWith<int>(timeout);
+            if (expDate <= nowDate) {
+                return StatusWith<int64_t>(
+                        ErrorCodes::ExceededTimeLimit,
+                        str::stream() << "Went to run command, but it was too late. "
+                        "Expiration was set to " << dateToISOStringUTC(expDate));
+            }
+            return StatusWith<int64_t>(expDate.asInt64() -  nowDate.asInt64());
         }
+
     } //namespace
 
     ResponseStatus NetworkInterfaceImpl::_runCommand(
@@ -470,16 +651,48 @@ namespace {
         try {
             BSONObj output;
 
-            StatusWith<int> timeoutStatus = getTimeoutMillis(request.expirationDate, now());
-            if (!timeoutStatus.isOK())
-                return ResponseStatus(timeoutStatus.getStatus());
+            const Date_t requestStartDate = now();
+            StatusWith<int64_t> timeoutMillis = getTimeoutMillis(request.expirationDate,
+                                                                 requestStartDate);
+            if (!timeoutMillis.isOK()) {
+                return ResponseStatus(timeoutMillis.getStatus());
+            }
 
-            Seconds timeout(timeoutStatus.getValue());
-            Timer timer;
-            ConnectionPool::ConnectionPtr conn(_connPool.get(), request.target, timeout);
-            conn->runCommand(request.dbname, request.cmdObj, output);
-            conn.done();
-            return ResponseStatus(Response(output, Milliseconds(timer.millis())));
+            ConnectionPool::ConnectionPtr conn(_connPool.get(),
+                                               request.target,
+                                               requestStartDate,
+                                               Milliseconds(timeoutMillis.getValue()));
+            bool ok = conn->runCommand(request.dbname, request.cmdObj, output);
+
+            // If remote server does not support either find or getMore commands, down convert
+            // to using DBClientInterface::query()/getMore().
+            // TODO: Perform down conversion based on wire protocol version.
+            //       Refer to the down conversion implementation in the shell.
+            if (!ok &&
+                getStatusFromCommandResult(output).code() == ErrorCodes::CommandNotFound) {
+
+                // 'commandName' will be an empty string if the command object is an empty BSON
+                // document.
+                StringData commandName = request.cmdObj.firstElement().fieldNameStringData();
+                if (commandName == "find") {
+                    runDownconvertedFindCommand(
+                        conn,
+                        request.dbname,
+                        request.cmdObj,
+                        &output);
+                }
+                else if (commandName == "getMore") {
+                    runDownconvertedGetMoreCommand(
+                        conn,
+                        request.dbname,
+                        request.cmdObj,
+                        &output);
+                }
+            }
+            const Date_t requestFinishDate = now();
+            conn.done(requestFinishDate);
+            return ResponseStatus(Response(output,
+                                           Milliseconds(requestFinishDate - requestStartDate)));
         }
         catch (const DBException& ex) {
             return ResponseStatus(ex.toStatus());
@@ -496,11 +709,9 @@ namespace {
 
     void NetworkInterfaceImpl::runCallbackWithGlobalExclusiveLock(
             const stdx::function<void (OperationContext*)>& callback) {
-
-        std::ostringstream sb;
-        sb << "repl" << boost::this_thread::get_id();
-        Client::initThreadIfNotAlready(sb.str().c_str());
+        Client::initThreadIfNotAlready();
         OperationContextImpl txn;
+        ScopedTransaction transaction(&txn, MODE_X);
         Lock::GlobalWrite lk(txn.lockState());
         callback(&txn);
     }

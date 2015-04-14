@@ -33,12 +33,13 @@
 #include "mongo/base/status.h"
 #include "mongo/db/invalidation_type.h"
 #include "mongo/db/query/query_solution.h"
+#include "mongo/db/storage/snapshot.h"
 
 namespace mongo {
 
     class BSONObj;
     class Collection;
-    class DiskLoc;
+    class RecordId;
     class PlanStage;
     class PlanExecutor;
     struct PlanStageStats;
@@ -71,24 +72,30 @@ namespace mongo {
             // If the underlying PlanStage has any information on the error, it will be available in
             // the objOut parameter. Call WorkingSetCommon::toStatusString() to retrieve the error
             // details from the output BSON object.
-            EXEC_ERROR,
+            FAILURE,
         };
 
         /**
-         * The yielding policy of the plan executor.  By default, a runner does not yield itself
+         * The yielding policy of the plan executor.  By default, an executor does not yield itself
          * (YIELD_MANUAL).
          */
         enum YieldPolicy {
-            // Any call to getNext() may yield.  In particular, the runner may be killed during any
-            // call to getNext().  If this occurs, getNext() will return RUNNER_DEAD.
+            // Any call to getNext() may yield. In particular, the executor may be killed during any
+            // call to getNext().  If this occurs, getNext() will return DEAD. Additionally, this
+            // will handle all WriteConflictExceptions that occur while processing the query.
             YIELD_AUTO,
+
+            // This will handle WriteConflictExceptions that occur while processing the query, but
+            // will not yield locks. commitAndRestart() will be called if a WriteConflictException
+            // occurs so callers must be prepared to get a new snapshot.
+            WRITE_CONFLICT_RETRY_ONLY,
 
             // Owner must yield manually if yields are requested.  How to yield yourself:
             //
             // 0. Let's say you have PlanExecutor* exec.
             //
             // 1. Register your PlanExecutor with ClientCursor. Registered executors are informed
-            // about DiskLoc deletions and namespace invalidation, as well as other important
+            // about RecordId deletions and namespace invalidation, as well as other important
             // events. Do this by calling registerExec() on the executor. Alternatively, this can
             // be done per-yield (as described below).
             //
@@ -101,6 +108,9 @@ namespace mongo {
             // 4. The call to yield() returns a boolean indicating whether or not 'exec' is
             // still alove. If it is false, then 'exec' was killed during the yield and is
             // no longer valid.
+            //
+            // It is not possible to handle WriteConflictExceptions in this mode without restarting
+            // the query.
             YIELD_MANUAL,
         };
 
@@ -109,13 +119,13 @@ namespace mongo {
         //
         // On success, return a new PlanExecutor, owned by the caller, through 'out'.
         //
-        // Passing YIELD_AUTO to any of these factories will construct a yielding runner which
+        // Passing YIELD_AUTO to any of these factories will construct a yielding executor which
         // may yield in the following circumstances:
         //   1) During plan selection inside the call to make().
         //   2) On any call to getNext().
         //   3) While executing the plan inside executePlan().
         //
-        // The runner will also be automatically registered to receive notifications in the
+        // The executor will also be automatically registered to receive notifications in the
         // case of YIELD_AUTO, so no further calls to registerExec() or setYieldPolicy() are
         // necessary.
         //
@@ -176,7 +186,7 @@ namespace mongo {
         //
 
         /**
-         * Get the working set used by this executor, withour transferring ownership.
+         * Get the working set used by this executor, without transferring ownership.
          */
         WorkingSet* getWorkingSet() const;
 
@@ -230,9 +240,19 @@ namespace mongo {
          * Returns true if the state was successfully restored and the execution tree can be
          * work()'d.
          *
+         * If allowed, will yield and retry if a WriteConflictException is encountered.
+         *
          * Returns false otherwise.  The execution tree cannot be worked and should be deleted.
          */
         bool restoreState(OperationContext* opCtx);
+
+        /**
+         * Same as restoreState but without the logic to retry if a WriteConflictException is
+         * thrown.
+         *
+         * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
+         */
+        bool restoreStateWithoutRetrying(OperationContext* opCtx);
 
         //
         // Running Support
@@ -245,9 +265,10 @@ namespace mongo {
          *
          * For write operations, the return depends on the particulars of the write stage.
          *
-         * If an AUTO_YIELD policy is set, then this method may yield.
+         * If a YIELD_AUTO policy is set, then this method may yield.
          */
-        ExecState getNext(BSONObj* objOut, DiskLoc* dlOut);
+        ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut);
+        ExecState getNext(BSONObj* objOut, RecordId* dlOut);
 
         /**
          * Returns 'true' if the plan is done producing results (or writing), 'false' otherwise.
@@ -261,7 +282,7 @@ namespace mongo {
          * Execute the plan to completion, throwing out the results.  Used when you want to work the
          * underlying tree without getting results back.
          *
-         * If an AUTO_YIELD policy is set on this executor, then this will automatically yield.
+         * If a YIELD_AUTO policy is set on this executor, then this will automatically yield.
          */
         Status executePlan();
 
@@ -270,7 +291,7 @@ namespace mongo {
         //
 
         /**
-         * Register this plan executor with the collection cursor cache so that it
+         * Register this plan executor with the collection cursor manager so that it
          * receives notifications for events that happen while yielding any locks.
          *
          * Deregistration happens automatically when this plan executor is destroyed.
@@ -296,7 +317,7 @@ namespace mongo {
          * state.  As such, if the plan yields, it must be notified of relevant writes so that
          * we can ensure that it doesn't crash if we try to access invalid state.
          */
-        void invalidate(const DiskLoc& dl, InvalidationType type);
+        void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         /**
          * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
@@ -311,7 +332,7 @@ namespace mongo {
          * Everybody who sets the policy to YIELD_AUTO really wants to call registerExec()
          * immediately after EXCEPT commands that create cursors...so we expose the ability to
          * register (or not) here, rather than require all users to have yet another RAII object.
-         * Only cursor-creating things like new_find.cpp set registerExecutor to false.
+         * Only cursor-creating things like find.cpp set registerExecutor to false.
          */
         void setYieldPolicy(YieldPolicy policy, bool registerExecutor = true);
 
@@ -319,7 +340,7 @@ namespace mongo {
         /**
          * RAII approach to ensuring that plan executors are deregistered.
          *
-         * While retrieving the first batch of results, newRunQuery manually registers the executor
+         * While retrieving the first batch of results, runQuery manually registers the executor
          * with ClientCursor.  Certain query execution paths, namely $where, can throw an exception.
          * If we fail to deregister the executor, we will call invalidate/kill on the
          * still-registered-yet-deleted executor.
@@ -367,8 +388,7 @@ namespace mongo {
          * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
          * this calls into their underlying plan selection facilities. Otherwise, does nothing.
          *
-         * If an AUTO_YIELD policy is set (and document-level locking is not supported), then
-         * locks are yielded during plan selection.
+         * If a YIELD_AUTO policy is set then locks are yielded during plan selection.
          */
         Status pickBestPlan(YieldPolicy policy);
 
@@ -383,7 +403,7 @@ namespace mongo {
         boost::scoped_ptr<CanonicalQuery> _cq;
         boost::scoped_ptr<WorkingSet> _workingSet;
         boost::scoped_ptr<QuerySolution> _qs;
-        std::auto_ptr<PlanStage> _root;
+        boost::scoped_ptr<PlanStage> _root;
 
         // Deregisters this executor when it is destroyed.
         boost::scoped_ptr<ScopedExecutorRegistration> _safety;
@@ -395,9 +415,10 @@ namespace mongo {
         // we'll be killed.
         bool _killed;
 
-        // If the yield policy is YIELD_AUTO, this is used to enforce automatic yielding. The plan
-        // may yield on any call to getNext() if this is non-NULL.
-        boost::scoped_ptr<PlanYieldPolicy> _yieldPolicy;
+        // This is used to handle automatic yielding when allowed by the YieldPolicy. Never NULL.
+        // TODO make this a non-pointer member. This requires some header shuffling so that this
+        // file includes plan_yield_policy.h rather than the other way around.
+        const boost::scoped_ptr<PlanYieldPolicy> _yieldPolicy;
     };
 
 }  // namespace mongo

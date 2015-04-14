@@ -39,32 +39,8 @@
 using namespace mongo;
 
 namespace {
-    TEST(SimpleRecordStoreV1, ChangeNoPaddingSetting) {
-        OperationContextNoop txn;
-        DummyExtentManager em;
-        DummyRecordStoreV1MetaData* md = new DummyRecordStoreV1MetaData( false, 0 );
 
-        string myns = "test.foo";
-        SimpleRecordStoreV1 rs(&txn, myns, md, &em, false);
-
-        BSONObjBuilder info;
-
-        ASSERT_FALSE(md->isUserFlagSet(RecordStoreV1Base::Flag_NoPadding));
-
-        ASSERT_OK(rs.setCustomOption(&txn, BSON("noPadding" << true).firstElement(), &info));
-        ASSERT_TRUE(md->isUserFlagSet(RecordStoreV1Base::Flag_NoPadding));
-
-        ASSERT_OK(rs.setCustomOption(&txn, BSON("noPadding" << false).firstElement(), &info));
-        ASSERT_FALSE(md->isUserFlagSet(RecordStoreV1Base::Flag_NoPadding));
-
-        // duplicate names are expected since we reused the same builder.
-        const BSONObj expectedInfo = BSON("noPadding_old" << false
-                                       << "noPadding_new" << true
-                                       << "noPadding_old" << true
-                                       << "noPadding_new" << false
-                                       );
-        ASSERT_EQUALS(info.done(), expectedInfo);
-    }
+    using std::string;
 
     TEST( SimpleRecordStoreV1, quantizeAllocationSpaceSimple ) {
         ASSERT_EQUALS(RecordStoreV1Base::quantizeAllocationSpace(33), 64);
@@ -143,7 +119,7 @@ namespace {
         SimpleRecordStoreV1 rs( &txn, myns, md, &em, false );
 
         BSONObj obj = docForRecordSize( 300 );
-        StatusWith<DiskLoc> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
+        StatusWith<RecordId> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
         ASSERT( result.isOK() );
 
         // The length of the allocated record is quantized.
@@ -154,13 +130,13 @@ namespace {
         OperationContextNoop txn;
         DummyExtentManager em;
         DummyRecordStoreV1MetaData* md = new DummyRecordStoreV1MetaData( false, 0 );
-        md->setUserFlag(&txn, RecordStoreV1Base::Flag_NoPadding);
+        md->setUserFlag(&txn, CollectionOptions::Flag_NoPadding);
 
         string myns = "test.AllocQuantized";
         SimpleRecordStoreV1 rs( &txn, myns, md, &em, false );
 
         BSONObj obj = docForRecordSize( 300 );
-        StatusWith<DiskLoc> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
+        StatusWith<RecordId> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
         ASSERT( result.isOK() );
 
         // The length of the allocated record is quantized.
@@ -171,13 +147,13 @@ namespace {
         OperationContextNoop txn;
         DummyExtentManager em;
         DummyRecordStoreV1MetaData* md = new DummyRecordStoreV1MetaData( false, 0 );
-        md->setUserFlag(&txn, RecordStoreV1Base::Flag_NoPadding);
+        md->setUserFlag(&txn, CollectionOptions::Flag_NoPadding);
 
         string myns = "test.AllocQuantized";
         SimpleRecordStoreV1 rs( &txn, myns, md, &em, false );
 
         BSONObj obj = docForRecordSize( 298 );
-        StatusWith<DiskLoc> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
+        StatusWith<RecordId> result = rs.insertRecord( &txn, obj.objdata(), obj.objsize(), false);
         ASSERT( result.isOK() );
 
         // The length of the allocated record is quantized.
@@ -194,7 +170,7 @@ namespace {
         SimpleRecordStoreV1 rs( &txn, myns, md, &em, false );
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), true);
-        StatusWith<DiskLoc> result = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> result = rs.insertRecord(&txn, &docWriter, false);
         ASSERT( result.isOK() );
 
         // The length of the allocated record is quantized.
@@ -213,7 +189,7 @@ namespace {
         SimpleRecordStoreV1 rs( &txn, myns + "$x", md, &em, false );
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), false);
-        StatusWith<DiskLoc> result = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> result = rs.insertRecord(&txn, &docWriter, false);
         ASSERT( result.isOK() );
 
         // The length of the allocated record is not quantized.
@@ -231,7 +207,7 @@ namespace {
         SimpleRecordStoreV1 rs( &txn, myns + "$x", md, &em, false );
 
         BsonDocWriter docWriter(docForRecordSize( 298 ), false);
-        StatusWith<DiskLoc> result = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> result = rs.insertRecord(&txn, &docWriter, false);
         ASSERT( result.isOK() );
 
         ASSERT_EQUALS( 300, rs.dataFor( &txn, result.getValue() ).size() + Record::HeaderSize );
@@ -254,7 +230,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), true);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -287,7 +263,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), true);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -321,7 +297,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), false);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -354,7 +330,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 300 ), false);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -392,7 +368,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 256 ), false);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -435,7 +411,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 1000 ), false);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -478,7 +454,7 @@ namespace {
         }
 
         BsonDocWriter docWriter(docForRecordSize( 8*1024*1024 ), false);
-        StatusWith<DiskLoc> actualLocation = rs.insertRecord(&txn, &docWriter, false);
+        StatusWith<RecordId> actualLocation = rs.insertRecord(&txn, &docWriter, false);
         ASSERT_OK( actualLocation.getStatus() );
 
         {
@@ -512,7 +488,7 @@ namespace {
 
 
         ASSERT_EQUALS( 0, md->numRecords() );
-        StatusWith<DiskLoc> result = rs.insertRecord( &txn, "abc", 4, 1000 );
+        StatusWith<RecordId> result = rs.insertRecord( &txn, "abc", 4, 1000 );
         ASSERT_TRUE( result.isOK() );
         ASSERT_EQUALS( 1, md->numRecords() );
         RecordData recordData = rs.dataFor( &txn, result.getValue() );

@@ -43,28 +43,46 @@
 #include "mongo/db/repl/master_slave.h"
 
 #include <pcrecpp.h>
-
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/rs.h" // replLocalAuth()
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/sync.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
-namespace mongo {
+using boost::scoped_ptr;
+using std::auto_ptr;
+using std::cout;
+using std::endl;
+using std::max;
+using std::min;
+using std::set;
+using std::stringstream;
+using std::vector;
 
+namespace mongo {
 namespace repl {
 
     void pretouchOperation(OperationContext* txn, const BSONObj& op);
@@ -101,8 +119,9 @@ namespace repl {
         uassert( 10119 ,  "only source='main' allowed for now with replication", sourceName() == "main" );
         BSONElement e = o.getField("syncedTo");
         if ( !e.eoo() ) {
-            uassert( 10120 ,  "bad sources 'syncedTo' field value", e.type() == Date || e.type() == Timestamp );
-            OpTime tmp( e.date() );
+            uassert(10120, "bad sources 'syncedTo' field value",
+                    e.type() == Date || e.type() == bsonTimestamp);
+            Timestamp tmp( e.date() );
             syncedTo = tmp;
         }
 
@@ -138,7 +157,7 @@ namespace repl {
         if ( !only.empty() )
             b.append("only", only);
         if ( !syncedTo.isNull() )
-            b.appendTimestamp("syncedTo", syncedTo.asDate());
+            b.append("syncedTo", syncedTo);
 
         BSONObjBuilder dbsNextPassBuilder;
         int n = 0;
@@ -168,6 +187,7 @@ namespace repl {
         bool exists = Helpers::getSingleton(txn, "local.me", _me);
 
         if (!exists || !_me.hasField("host") || _me["host"].String() != myname) {
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock dblk(txn->lockState(), "local", MODE_X);
             WriteUnitOfWork wunit(txn);
             // clean out local.me
@@ -199,16 +219,16 @@ namespace repl {
         {
             OpDebug debug;
 
-            Client::Context ctx(txn, "local.sources");
+            OldClientContext ctx(txn, "local.sources");
 
             const NamespaceString requestNs("local.sources");
-            UpdateRequest request(txn, requestNs);
+            UpdateRequest request(requestNs);
 
             request.setQuery(pattern);
             request.setUpdates(o);
             request.setUpsert();
 
-            UpdateResult res = update(ctx.db(), request, &debug);
+            UpdateResult res = update(txn, ctx.db(), request, &debug);
 
             verify( ! res.modifiers );
             verify( res.numMatched == 1 );
@@ -230,7 +250,7 @@ namespace repl {
             }
         }
 
-        v.push_back( shared_ptr< ReplSource >( new ReplSource( s ) ) );
+        v.push_back( boost::shared_ptr< ReplSource >( new ReplSource( s ) ) );
     }
 
     /* we reuse our existing objects so that we can keep our existing connection
@@ -238,7 +258,7 @@ namespace repl {
     */
     void ReplSource::loadAll(OperationContext* txn, SourceVector &v) {
         const char* localSources = "local.sources";
-        Client::Context ctx(txn, localSources);
+        OldClientContext ctx(txn, localSources);
         SourceVector old = v;
         v.clear();
 
@@ -251,18 +271,18 @@ namespace repl {
             auto_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(txn,
                                                 localSources,
-                                                ctx.db()->getCollection(txn, localSources)));
+                                                ctx.db()->getCollection(localSources)));
             BSONObj obj;
             PlanExecutor::ExecState state;
             while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
                 n++;
                 ReplSource tmp(txn, obj);
                 if (tmp.hostName != replSettings.source) {
-                    log() << "repl: --source " << replSettings.source << " != " << tmp.hostName
+                    log() << "--source " << replSettings.source << " != " << tmp.hostName
                           << " from local.sources collection" << endl;
-                    log() << "repl: for instructions on changing this slave's source, see:" << endl;
+                    log() << "for instructions on changing this slave's source, see:" << endl;
                     log() << "http://dochub.mongodb.org/core/masterslave" << endl;
-                    log() << "repl: terminating mongod after 30 seconds" << endl;
+                    log() << "terminating mongod after 30 seconds" << endl;
                     sleepsecs(30);
                     dbexit( EXIT_REPLICATION_ERROR );
                 }
@@ -296,18 +316,16 @@ namespace repl {
         auto_ptr<PlanExecutor> exec(
             InternalPlanner::collectionScan(txn,
                                             localSources,
-                                            ctx.db()->getCollection(txn, localSources)));
+                                            ctx.db()->getCollection(localSources)));
         BSONObj obj;
         PlanExecutor::ExecState state;
         while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
             ReplSource tmp(txn, obj);
             if ( tmp.syncedTo.isNull() ) {
                 DBDirectClient c(txn);
-                if ( c.exists( "local.oplog.$main" ) ) {
-                    BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
-                    if ( !op.isEmpty() ) {
-                        tmp.syncedTo = op[ "ts" ].date();
-                    }
+                BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
+                if ( !op.isEmpty() ) {
+                    tmp.syncedTo = op[ "ts" ].date();
                 }
             }
             addSourceToList(txn, v, tmp, old);
@@ -336,6 +354,43 @@ namespace repl {
         replAllDead = 0;
     }
 
+    class HandshakeCmd : public Command {
+    public:
+        void help(stringstream& h) const { h << "internal"; }
+        HandshakeCmd() : Command("handshake") {}
+        virtual bool isWriteCommandForConfigServer() const { return false; }
+        virtual bool slaveOk() const { return true; }
+        virtual bool adminOnly() const { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+            const BSONObj& cmdObj,
+            std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::internal);
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+        }
+
+        virtual bool run(OperationContext* txn,
+                         const string& ns,
+                         BSONObj& cmdObj,
+                         int options,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+
+            HandshakeArgs handshake;
+            Status status = handshake.initialize(cmdObj);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
+
+            ReplClientInfo::forClient(txn->getClient()).setRemoteID(handshake.getRid());
+
+            status = getGlobalReplicationCoordinator()->processHandshake(txn, handshake);
+            return appendCommandStatus(result, status);
+        }
+
+    } handshakeCmd;
+
     bool replHandshake(DBClientConnection *conn, const OID& myRID) {
         string myname = getHostName();
 
@@ -345,7 +400,7 @@ namespace repl {
         BSONObj res;
         bool ok = conn->runCommand( "admin" , cmd.obj() , res );
         // ignoring for now on purpose for older versions
-        LOG( ok ? 1 : 0 ) << "replHandshake res not: " << ok << " res: " << res << endl;
+        LOG( ok ? 1 : 0 ) << "replHandshake result: " << res << endl;
         return true;
     }
 
@@ -378,11 +433,12 @@ namespace repl {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
             /* todo use getDatabaseNames() method here */
-            bool ok = oplogReader.conn()->runCommand( "admin", BSON( "listDatabases" << 1 ), info );
+            bool ok = oplogReader.conn()->runCommand("admin",
+                                                     BSON("listDatabases" << 1),
+                                                     info,
+                                                     QueryOption_SlaveOk);
             massert( 10385 ,  "Unable to get database list", ok );
         }
-
-        WriteUnitOfWork wunit(txn);
 
         BSONObjIterator i( info.getField( "databases" ).embeddedObject() );
         while( i.moreWithEOO() ) {
@@ -398,16 +454,14 @@ namespace repl {
                 }
             }
         }
-        syncedTo = OpTime();
+        syncedTo = Timestamp();
         addDbNextPass.clear();
         save(txn);
-
-        wunit.commit();
     }
 
     void ReplSource::resyncDrop( OperationContext* txn, const string& db ) {
         log() << "resync: dropping database " << db;
-        Client::Context ctx(txn, db);
+        OldClientContext ctx(txn, db);
         dropDatabase(txn, ctx.db());
     }
 
@@ -459,13 +513,13 @@ namespace repl {
     
     static DatabaseIgnorer ___databaseIgnorer;
     
-    void DatabaseIgnorer::doIgnoreUntilAfter( const string &db, const OpTime &futureOplogTime ) {
+    void DatabaseIgnorer::doIgnoreUntilAfter( const string &db, const Timestamp &futureOplogTime ) {
         if ( futureOplogTime > _ignores[ db ] ) {
             _ignores[ db ] = futureOplogTime;   
         }
     }
 
-    bool DatabaseIgnorer::ignoreAt( const string &db, const OpTime &currentOplogTime ) {
+    bool DatabaseIgnorer::ignoreAt( const string &db, const Timestamp &currentOplogTime ) {
         if ( _ignores[ db ].isNull() ) {
             return false;
         }
@@ -488,7 +542,7 @@ namespace repl {
             return true;   
         }
         BSONElement ts = op.getField( "ts" );
-        if ( ( ts.type() == Date || ts.type() == Timestamp ) && ___databaseIgnorer.ignoreAt( db, ts.date() ) ) {
+        if ( ( ts.type() == Date || ts.type() == bsonTimestamp ) && ___databaseIgnorer.ignoreAt( db, ts.date() ) ) {
             // Database is ignored due to a previous indication that it is
             // missing from master after optime "ts".
             return false;   
@@ -498,7 +552,7 @@ namespace repl {
             return true;
         }
         
-        OpTime lastTime;
+        Timestamp lastTime;
         bool dbOk = false;
         {
             // This is always a GlobalWrite lock (so no ns/db used from the context)
@@ -511,9 +565,10 @@ namespace repl {
             
             BSONObj last = oplogReader.findOne( this->ns().c_str(), Query().sort( BSON( "$natural" << -1 ) ) );
             if ( !last.isEmpty() ) {
-	            BSONElement ts = last.getField( "ts" );
-	            massert( 14032, "Invalid 'ts' in remote log", ts.type() == Date || ts.type() == Timestamp );
-	            lastTime = OpTime( ts.date() );
+                    BSONElement ts = last.getField( "ts" );
+                    massert(14032, "Invalid 'ts' in remote log",
+                            ts.type() == Date || ts.type() == bsonTimestamp);
+	            lastTime = Timestamp( ts.date() );
             }
 
             BSONObj info;
@@ -557,7 +612,7 @@ namespace repl {
             incompleteCloneDbs.erase(*i);
             addDbNextPass.erase(*i);
 
-            Client::Context ctx(txn, *i);
+            OldClientContext ctx(txn, *i);
             dropDatabase(txn, ctx.db());
         }
         
@@ -568,13 +623,13 @@ namespace repl {
 
     void ReplSource::applyOperation(OperationContext* txn, Database* db, const BSONObj& op) {
         try {
-            bool failedUpdate = applyOperation_inlock( txn, db, op );
-            if (failedUpdate) {
+            Status status = applyOperation_inlock( txn, db, op );
+            if (!status.isOK()) {
                 Sync sync(hostName);
                 if (sync.shouldRetry(txn, op)) {
                     uassert(15914,
                             "Failure retrying initial sync update",
-                            !applyOperation_inlock(txn, db, op));
+                            applyOperation_inlock(txn, db, op).isOK());
                 }
             }
         }
@@ -621,6 +676,7 @@ namespace repl {
         if ( !only.empty() && only != clientName )
             return;
 
+        txn->setReplicatedWrites(false);
         const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (replSettings.pretouch &&
             !alreadyLocked/*doesn't make sense if in write lock already*/) {
@@ -675,10 +731,10 @@ namespace repl {
         // This code executes on the slaves only, so it doesn't need to be sharding-aware since
         // mongos will not send requests there. That's why the last argument is false (do not do
         // version checking).
-        Client::Context ctx(txn, ns, false);
-        ctx.getClient()->curop()->reset();
+        OldClientContext ctx(txn, ns, false);
+        txn->getCurOp()->reset();
 
-        bool empty = ctx.db()->getDatabaseCatalogEntry()->isEmpty();
+        bool empty = !ctx.db()->getDatabaseCatalogEntry()->hasUserData();
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;
 
         LOG(6) << "ns: " << ns << ", justCreated: " << ctx.justCreated() << ", empty: " << empty << ", incompleteClone: " << incompleteClone << endl;
@@ -706,7 +762,7 @@ namespace repl {
                     log() << "An earlier initial clone of '" << clientName << "' did not complete, now resyncing." << endl;
                 }
                 save(txn);
-                Client::Context ctx(txn, ns);
+                OldClientContext ctx(txn, ns);
                 nClonedThisPass++;
                 resync(txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
@@ -729,8 +785,9 @@ namespace repl {
         BSONObj last = oplogReader.findOne( _ns.c_str(), Query( b.done() ).sort( BSON( "$natural" << -1 ) ) );
         if ( !last.isEmpty() ) {
             BSONElement ts = last.getField( "ts" );
-            massert( 10386 ,  "non Date ts found: " + last.toString(), ts.type() == Date || ts.type() == Timestamp );
-            syncedTo = OpTime( ts.date() );
+            massert(10386, "non Date ts found: " + last.toString(),
+                    ts.type() == Date || ts.type() == bsonTimestamp);
+            syncedTo = Timestamp( ts.date() );
         }
     }
 
@@ -788,7 +845,7 @@ namespace repl {
     int ReplSource::_sync_pullOpLog(OperationContext* txn, int& nApplied) {
         int okResultCode = 1;
         string ns = string("local.oplog.$") + sourceName();
-        LOG(2) << "repl: sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
+        LOG(2) << "sync_pullOpLog " << ns << " syncedTo:" << syncedTo.toStringLong() << '\n';
 
         bool tailing = true;
         oplogReader.tailCheck();
@@ -819,12 +876,13 @@ namespace repl {
                 }
                 // obviously global isn't ideal, but non-repl set is old so 
                 // keeping it simple
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lk(txn->lockState());
                 save(txn);
             }
 
             BSONObjBuilder gte;
-            gte.appendTimestamp("$gte", syncedTo.asDate());
+            gte.append("$gte", syncedTo);
             BSONObjBuilder query;
             query.append("ts", gte.done());
             if ( !only.empty() ) {
@@ -839,11 +897,11 @@ namespace repl {
             tailing = false;
         }
         else {
-            LOG(2) << "repl: tailing=true\n";
+            LOG(2) << "tailing=true\n";
         }
 
         if( !oplogReader.haveCursor() ) {
-            log() << "repl: dbclient::query returns null (conn closed?)" << endl;
+            log() << "dbclient::query returns null (conn closed?)" << endl;
             oplogReader.resetConnection();
             return -1;
         }
@@ -862,25 +920,26 @@ namespace repl {
 
         if ( !oplogReader.more() ) {
             if ( tailing ) {
-                LOG(2) << "repl: tailing & no new activity\n";
+                LOG(2) << "tailing & no new activity\n";
                 okResultCode = 0; // don't sleep
 
             }
             else {
-                log() << "repl:   " << ns << " oplog is empty" << endl;
+                log() << ns << " oplog is empty" << endl;
             }
             {
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lk(txn->lockState());
                 save(txn);
             }
             return okResultCode;
         }
 
-        OpTime nextOpTime;
+        Timestamp nextOpTime;
         {
             BSONObj op = oplogReader.next();
             BSONElement ts = op.getField("ts");
-            if ( ts.type() != Date && ts.type() != Timestamp ) {
+            if ( ts.type() != Date && ts.type() != bsonTimestamp ) {
                 string err = op.getStringField("$err");
                 if ( !err.empty() ) {
                     // 13051 is "tailable cursor requested on non capped collection"
@@ -889,40 +948,40 @@ namespace repl {
                         massert( 13344 ,  "trying to slave off of a non-master", false );
                     }
                     else {
-                        log() << "repl: $err reading remote oplog: " + err << '\n';
+                        error() << "$err reading remote oplog: " + err << '\n';
                         massert( 10390 ,  "got $err reading remote oplog", false );
                     }
                 }
                 else {
-                    log() << "repl: bad object read from remote oplog: " << op.toString() << '\n';
-                    massert( 10391 , "repl: bad object read from remote oplog", false);
+                    error() << "bad object read from remote oplog: " << op.toString() << '\n';
+                    massert( 10391 , "bad object read from remote oplog", false);
                 }
             }
 
-            nextOpTime = OpTime( ts.date() );
-            LOG(2) << "repl: first op time received: " << nextOpTime.toString() << '\n';
+            nextOpTime = Timestamp( ts.date() );
+            LOG(2) << "first op time received: " << nextOpTime.toString() << '\n';
             if ( initial ) {
-                LOG(1) << "repl:   initial run\n";
+                LOG(1) << "initial run\n";
             }
             if( tailing ) {
                 if( !( syncedTo < nextOpTime ) ) {
-                    log() << "repl ASSERTION failed : syncedTo < nextOpTime" << endl;
-                    log() << "repl syncTo:     " << syncedTo.toStringLong() << endl;
-                    log() << "repl nextOpTime: " << nextOpTime.toStringLong() << endl;
+                    warning() << "ASSERTION failed : syncedTo < nextOpTime" << endl;
+                    log() << "syncTo:     " << syncedTo.toStringLong() << endl;
+                    log() << "nextOpTime: " << nextOpTime.toStringLong() << endl;
                     verify(false);
                 }
                 oplogReader.putBack( op ); // op will be processed in the loop below
-                nextOpTime = OpTime(); // will reread the op below
+                nextOpTime = Timestamp(); // will reread the op below
             }
             else if ( nextOpTime != syncedTo ) { // didn't get what we queried for - error
                 log()
-                    << "repl:   nextOpTime " << nextOpTime.toStringLong() << ' '
+                    << "nextOpTime " << nextOpTime.toStringLong() << ' '
                     << ((nextOpTime < syncedTo) ? "<??" : ">")
                     << " syncedTo " << syncedTo.toStringLong() << '\n'
-                    << "repl:   time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs())
+                    << "time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs())
                     << "sec\n"
-                    << "repl:   tailing: " << tailing << '\n'
-                    << "repl:   data too stale, halting replication" << endl;
+                    << "tailing: " << tailing << '\n'
+                    << "data too stale, halting replication" << endl;
                 replInfo = replAllDead = "data too stale halted replication";
                 verify( syncedTo < nextOpTime );
                 throw SyncException();
@@ -942,6 +1001,7 @@ namespace repl {
                 const bool moreInitialSyncsPending = !addDbNextPass.empty() && n;
 
                 if ( moreInitialSyncsPending || !oplogReader.more() ) {
+                    ScopedTransaction transaction(txn, MODE_X);
                     Lock::GlobalWrite lk(txn->lockState());
                     
                     if (tailing) {
@@ -950,20 +1010,21 @@ namespace repl {
 
                     syncedTo = nextOpTime;
                     save(txn); // note how far we are synced up to now
-                    log() << "repl:   applied " << n << " operations" << endl;
+                    log() << "applied " << n << " operations" << endl;
                     nApplied = n;
-                    log() << "repl:  end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
+                    log() << "end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
                     break;
                 }
 
                 OCCASIONALLY if( n > 0 && ( n > 100000 || time(0) - saveLast > 60 ) ) {
                     // periodically note our progress, in case we are doing a lot of work and crash
+                    ScopedTransaction transaction(txn, MODE_X);
                     Lock::GlobalWrite lk(txn->lockState());
                     syncedTo = nextOpTime;
                     // can't update local log ts since there are pending operations from our peer
                     save(txn);
-                    log() << "repl:   checkpoint applied " << n << " operations" << endl;
-                    log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
+                    log() << "checkpoint applied " << n << " operations" << endl;
+                    log() << "syncedTo: " << syncedTo.toStringLong() << endl;
                     saveLast = time(0);
                     n = 0;
                 }
@@ -976,15 +1037,15 @@ namespace repl {
                 while( 1 ) {
 
                     BSONElement ts = op.getField("ts");
-                    if( !( ts.type() == Date || ts.type() == Timestamp ) ) {
+                    if( !( ts.type() == Date || ts.type() == bsonTimestamp ) ) {
                         log() << "sync error: problem querying remote oplog record" << endl;
                         log() << "op: " << op.toString() << endl;
                         log() << "halting replication" << endl;
                         replInfo = replAllDead = "sync error: no ts found querying remote oplog record";
                         throw SyncException();
                     }
-                    OpTime last = nextOpTime;
-                    nextOpTime = OpTime( ts.date() );
+                    Timestamp last = nextOpTime;
+                    nextOpTime = Timestamp( ts.date() );
                     if ( !( last < nextOpTime ) ) {
                         log() << "sync error: last applied optime at slave >= nextOpTime from master" << endl;
                         log() << " last:       " << last.toStringLong() << endl;
@@ -999,13 +1060,14 @@ namespace repl {
                         verify( justOne );
                         oplogReader.putBack( op );
                         _sleepAdviceTime = nextOpTime.getSecs() + replSettings.slavedelay + 1;
+                        ScopedTransaction transaction(txn, MODE_X);
                         Lock::GlobalWrite lk(txn->lockState());
                         if ( n > 0 ) {
                             syncedTo = last;
                             save(txn);
                         }
-                        log() << "repl:   applied " << n << " operations" << endl;
-                        log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
+                        log() << "applied " << n << " operations" << endl;
+                        log() << "syncedTo: " << syncedTo.toStringLong() << endl;
                         log() << "waiting until: " << _sleepAdviceTime << " to continue" << endl;
                         return okResultCode;
                     }
@@ -1038,7 +1100,7 @@ namespace repl {
         ReplInfo r("sync");
         if (!serverGlobalParams.quiet) {
             LogstreamBuilder l = log();
-            l << "repl: syncing from ";
+            l << "syncing from ";
             if( sourceName() != "main" ) {
                 l << "source:" << sourceName() << ' ';
             }
@@ -1049,7 +1111,7 @@ namespace repl {
         // FIXME Handle cases where this db isn't on default port, or default port is spec'd in hostName.
         if ((string("localhost") == hostName || string("127.0.0.1") == hostName) &&
             serverGlobalParams.port == ServerGlobalParams::DefaultDBPort) {
-            log() << "repl:   can't sync from self (localhost). sources configuration may be wrong." << endl;
+            log() << "can't sync from self (localhost). sources configuration may be wrong." << endl;
             sleepsecs(5);
             return -1;
         }
@@ -1057,7 +1119,7 @@ namespace repl {
         if ( !_connect(&oplogReader, 
                        HostAndPort(hostName), 
                        getGlobalReplicationCoordinator()->getMyRID()) ) {
-            LOG(4) << "repl:  can't connect to sync source" << endl;
+            LOG(4) << "can't connect to sync source" << endl;
             return -1;
         }
 
@@ -1081,6 +1143,7 @@ namespace repl {
     int _replMain(OperationContext* txn, ReplSource::SourceVector& sources, int& nApplied) {
         {
             ReplInfo r("replMain load sources");
+            ScopedTransaction transaction(txn, MODE_X);
             Lock::GlobalWrite lk(txn->lockState());
             ReplSource::loadAll(txn, sources);
 
@@ -1125,16 +1188,16 @@ namespace repl {
                     return 60;
                 }
                 else {
-                    log() << "repl: AssertionException " << e.what() << endl;
+                    log() << "AssertionException " << e.what() << endl;
                 }
                 replInfo = "replMain caught AssertionException";
             }
             catch ( const DBException& e ) {
-                log() << "repl: DBException " << e.what() << endl;
+                log() << "DBException " << e.what() << endl;
                 replInfo = "replMain caught DBException";
             }
             catch ( const std::exception &e ) {
-                log() << "repl: std::exception " << e.what() << endl;
+                log() << "std::exception " << e.what() << endl;
                 replInfo = "replMain caught std::exception";
             }
             catch ( ... ) {
@@ -1152,6 +1215,7 @@ namespace repl {
         while ( 1 ) {
             int s = 0;
             {
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lk(txn->lockState());
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
@@ -1183,6 +1247,7 @@ namespace repl {
             }
 
             {
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lk(txn->lockState());
                 verify( syncing == 1 );
                 syncing--;
@@ -1195,7 +1260,7 @@ namespace repl {
 
             if ( s ) {
                 stringstream ss;
-                ss << "repl: sleep " << s << " sec before next pass";
+                ss << "sleep " << s << " sec before next pass";
                 string msg = ss.str();
                 if (!serverGlobalParams.quiet)
                     log() << msg << endl;
@@ -1210,31 +1275,30 @@ namespace repl {
         Client::initThread("replmaster");
         int toSleep = 10;
         while( 1 ) {
+            sleepsecs(toSleep);
 
-            sleepsecs( toSleep );
-            /* write a keep-alive like entry to the log.  this will make things like
-               printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date
-               even when things are idle.
-            */
-            {
-                OperationContextImpl txn;
-                writelocktry lk(txn.lockState(), 1);
-                if ( lk.got() ) {
-                    toSleep = 10;
+            // Write a keep-alive like entry to the log. This will make things like
+            // printReplicationStatus() and printSlaveReplicationStatus() stay up-to-date even
+            // when things are idle.
+            OperationContextImpl txn;
+            txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
-                    replLocalAuth();
+            Lock::GlobalWrite globalWrite(txn.lockState(), 1);
+            if (globalWrite.isLocked()) {
+                toSleep = 10;
 
-                    try {
-                        logKeepalive(&txn);
-                    }
-                    catch(...) {
-                        log() << "caught exception in replMasterThread()" << endl;
-                    }
+                try {
+                    WriteUnitOfWork wuow(&txn);
+                    getGlobalServiceContext()->getOpObserver()->onOpMessage(&txn, BSONObj());
+                    wuow.commit();
                 }
-                else {
-                    LOG(5) << "couldn't logKeepalive" << endl;
-                    toSleep = 1;
+                catch (...) {
+                    log() << "caught exception in replMasterThread()" << endl;
                 }
+            }
+            else {
+                LOG(5) << "couldn't logKeepalive" << endl;
+                toSleep = 1;
             }
         }
     }
@@ -1244,11 +1308,7 @@ namespace repl {
         Client::initThread("replslave");
 
         OperationContextImpl txn;
-
-        {
-            Lock::GlobalWrite lk(txn.lockState());
-            replLocalAuth();
-        }
+        txn.getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
         while ( 1 ) {
             try {
@@ -1272,22 +1332,16 @@ namespace repl {
         }
     }
 
-    void startMasterSlave() {
-        OperationContextImpl txn;
-
-        oldRepl();
+    void startMasterSlave(OperationContext* txn) {
 
         const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if( !replSettings.slave && !replSettings.master )
             return;
 
-        {
-            Lock::GlobalWrite lk(txn.lockState());
-            replLocalAuth();
-        }
+        txn->getClient()->getAuthorizationSession()->grantInternalAuthorization();
 
         {
-            ReplSource temp(&txn); // Ensures local.me is populated
+            ReplSource temp(txn); // Ensures local.me is populated
         }
 
         if ( replSettings.slave ) {
@@ -1298,7 +1352,7 @@ namespace repl {
 
         if ( replSettings.master ) {
             LOG(1) << "master=true" << endl;
-            createOplog(&txn);
+            createOplog(txn);
             boost::thread t(replMasterThread);
         }
 
@@ -1317,6 +1371,7 @@ namespace repl {
         }
 
         OperationContextImpl txn; // XXX
+        ScopedTransaction transaction(&txn, MODE_S);
         Lock::GlobalRead lk(txn.lockState());
 
         for( unsigned i = a; i <= b; i++ ) {
@@ -1339,7 +1394,7 @@ namespace repl {
                     BSONObjBuilder b;
                     b.append(_id);
                     BSONObj result;
-                    Client::Context ctx(&txn, ns);
+                    OldClientContext ctx(&txn, ns);
                     if( Helpers::findById(&txn, ctx.db(), ns, b.done(), result) )
                         _dummy_z += result.objsize(); // touch
                 }

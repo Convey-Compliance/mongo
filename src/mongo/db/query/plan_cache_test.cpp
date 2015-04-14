@@ -33,11 +33,12 @@
 #include "mongo/db/query/plan_cache.h"
 
 #include <algorithm>
+#include <boost/scoped_ptr.hpp>
 #include <ostream>
 #include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
@@ -50,7 +51,10 @@ using namespace mongo;
 
 namespace {
 
+    using boost::scoped_ptr;
     using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     static const char* ns = "somebogusns";
 
@@ -140,7 +144,7 @@ namespace {
         if (!status.isOK()) {
             mongoutils::str::stream ss;
             ss << "failed to parse query: " << obj.toString()
-               << ". Reason: " << status.toString();
+               << ". Reason: " << status.getStatus().toString();
             FAIL(ss);
         }
         MatchExpression* expr(status.getValue());
@@ -465,6 +469,7 @@ namespace {
             params.indices.push_back(IndexEntry(keyPattern,
                                                 multikey,
                                                 false,
+                                                false,
                                                 "hari_king_of_the_stove",
                                                 BSONObj()));
         }
@@ -473,6 +478,7 @@ namespace {
             params.indices.push_back(IndexEntry(keyPattern,
                                                 multikey,
                                                 sparse,
+                                                false,
                                                 "note_to_self_dont_break_build",
                                                 BSONObj()));
         }

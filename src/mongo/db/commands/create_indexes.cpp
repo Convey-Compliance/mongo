@@ -36,16 +36,23 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/ops/insert.h"
-#include "mongo/db/repl/oplog.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/op_observer.h"
+#include "mongo/db/ops/insert.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
+
+    using std::string;
 
     /**
      * { createIndexes : "bar", indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ] }
@@ -79,6 +86,7 @@ namespace mongo {
         virtual bool run(OperationContext* txn,  const string& dbname, BSONObj& cmdObj, int options,
                           string& errmsg, BSONObjBuilder& result,
                           bool fromRepl = false ) {
+            invariant(!fromRepl == txn->writesAreReplicated());
 
             // ---  parse
 
@@ -134,23 +142,32 @@ namespace mongo {
 
             // now we know we have to create index(es)
             // Note: createIndexes command does not currently respect shard versioning.
-            Lock::DBLock lk(txn->lockState(), ns.db(), MODE_X);
-            Client::Context ctx(txn, ns.ns(), false /* doVersion */ );
-            Database* db = ctx.db();
-
-            Collection* collection = db->getCollection( txn, ns.ns() );
-            result.appendBool( "createdCollectionAutomatically", collection == NULL );
-            if ( !collection ) {
-                WriteUnitOfWork wunit(txn);
-                collection = db->createCollection( txn, ns.ns() );
-                invariant( collection );
-                if (!fromRepl) {
-                    repl::logOp(txn, "c", (dbname + ".$cmd").c_str(), BSON("create" << ns.coll()));
-                }
-                wunit.commit();
+            ScopedTransaction transaction(txn, MODE_IX);
+            Lock::DBLock dbLock(txn->lockState(), ns.db(), MODE_X);
+            if (!fromRepl &&
+                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+                return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
+                    << "Not primary while creating indexes in " << ns.ns()));
             }
 
-            result.append( "numIndexesBefore", collection->getIndexCatalog()->numIndexesTotal(txn) );
+            Database* db = dbHolder().get(txn, ns.db());
+            if (!db) {
+                db = dbHolder().openDb(txn, ns.db());
+            }
+
+            Collection* collection = db->getCollection( ns.ns() );
+            result.appendBool( "createdCollectionAutomatically", collection == NULL );
+            if ( !collection ) {
+                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                    WriteUnitOfWork wunit(txn);
+                    collection = db->createCollection(txn, ns.ns(), CollectionOptions());
+                    invariant( collection );
+                    wunit.commit();
+                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
+            }
+
+            const int numIndexesBefore = collection->getIndexCatalog()->numIndexesTotal(txn);
+            result.append("numIndexesBefore", numIndexesBefore);
 
             MultiIndexBlock indexer(txn, collection);
             indexer.allowBackgroundBuilding();
@@ -160,6 +177,7 @@ namespace mongo {
             indexer.removeExistingIndexes(&specs);
 
             if (specs.size() == 0) {
+                result.append("numIndexesAfter", numIndexesBefore);
                 result.append( "note", "all indexes already exist" );
                 return true;
             }
@@ -180,10 +198,70 @@ namespace mongo {
                 }
             }
 
-            uassertStatusOK(indexer.init(specs));
-            uassertStatusOK(indexer.insertAllDocumentsInCollection());
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+                uassertStatusOK(indexer.init(specs));
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
 
-            {
+            // If we're a background index, replace exclusive db lock with an intent lock, so that
+            // other readers and writers can proceed during this phase.  
+            if (indexer.getBuildInBackground()) {
+                txn->recoveryUnit()->commitAndRestart();
+                dbLock.relockWithMode(MODE_IX);
+                if (!fromRepl &&
+                    !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+                    return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
+                        << "Not primary while creating background indexes in " << ns.ns()));
+                }
+            }
+
+            try {
+                Lock::CollectionLock colLock(txn->lockState(), ns.ns(), MODE_IX);
+                uassertStatusOK(indexer.insertAllDocumentsInCollection());
+            }
+            catch (const DBException& e) {
+                invariant(e.getCode() != ErrorCodes::WriteConflict);
+                // Must have exclusive DB lock before we clean up the index build via the
+                // destructor of 'indexer'.
+                if (indexer.getBuildInBackground()) {
+                    try {
+                        // This function cannot throw today, but we will preemptively prepare for
+                        // that day, to avoid data corruption due to lack of index cleanup.
+                        txn->recoveryUnit()->commitAndRestart();
+                        dbLock.relockWithMode(MODE_X);
+                        if (!fromRepl &&
+                            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                                dbname)) {
+                            return appendCommandStatus(
+                                result,
+                                Status(ErrorCodes::NotMaster, str::stream()
+                                    << "Not primary while creating background indexes in "
+                                    << ns.ns() << ": cleaning up index build failure due to "
+                                    << e.toString()));
+                        }
+                    }
+                    catch (...) {
+                        std::terminate();
+                    }
+                }
+                throw;
+            }
+            // Need to return db lock back to exclusive, to complete the index build.
+            if (indexer.getBuildInBackground()) {
+                txn->recoveryUnit()->commitAndRestart();
+                dbLock.relockWithMode(MODE_X);
+                uassert(ErrorCodes::NotMaster,
+                        str::stream() << "Not primary while completing index build in " << dbname,
+                        fromRepl ||
+                        repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
+                            dbname));
+
+                Database* db = dbHolder().get(txn, ns.db());
+                uassert(28551, "database dropped during index build", db);
+                uassert(28552, "collection dropped during index build",
+                        db->getCollection(ns.ns()));
+            }
+
+            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
                 WriteUnitOfWork wunit(txn);
 
                 indexer.commit();
@@ -191,12 +269,14 @@ namespace mongo {
                 if ( !fromRepl ) {
                     for ( size_t i = 0; i < specs.size(); i++ ) {
                         std::string systemIndexes = ns.getSystemIndexesCollection();
-                        repl::logOp(txn, "i", systemIndexes.c_str(), specs[i]);
+                        getGlobalServiceContext()->getOpObserver()->onCreateIndex(txn,
+                                                                               systemIndexes,
+                                                                               specs[i]);
                     }
                 }
 
                 wunit.commit();
-            }
+            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "createIndexes", ns.ns());
 
             result.append( "numIndexesAfter", collection->getIndexCatalog()->numIndexesTotal(txn) );
 
@@ -205,9 +285,10 @@ namespace mongo {
 
     private:
         static Status checkUniqueIndexConstraints(OperationContext* txn,
-                                                  const StringData& ns,
+                                                  StringData ns,
                                                   const BSONObj& newIdxKey) {
-            txn->lockState()->assertWriteLocked( ns );
+
+            invariant(txn->lockState()->isCollectionLockedForMode(ns, MODE_X));
 
             if ( shardingState.enabled() ) {
                 CollectionMetadataPtr metadata(

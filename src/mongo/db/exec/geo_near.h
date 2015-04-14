@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/near.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/plan_stats.h"
@@ -45,7 +47,7 @@ namespace mongo {
     struct GeoNearParams {
 
         GeoNearParams() :
-            filter(NULL), addPointMeta(false), addDistMeta(false) {
+            filter(NULL), nearQuery(NULL), addPointMeta(false), addDistMeta(false) {
         }
 
         // MatchExpression to apply to the index keys and fetched documents
@@ -82,7 +84,20 @@ namespace mongo {
 
         virtual StatusWith<double> computeDistance(WorkingSetMember* member);
 
+        virtual PlanStage::StageState initialize(OperationContext* txn,
+                                                 WorkingSet* workingSet,
+                                                 Collection* collection,
+                                                 WorkingSetID* out);
+
     private:
+
+        virtual void finishSaveState();
+
+        virtual void finishRestoreState(OperationContext* txn);
+
+        virtual void finishInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type);
 
         const GeoNearParams _nearParams;
 
@@ -98,6 +113,9 @@ namespace mongo {
 
         // Amount to increment the next bounds by
         double _boundsIncrement;
+
+        class DensityEstimator;
+        boost::scoped_ptr<DensityEstimator> _densityEstimator;
     };
 
     /**
@@ -122,7 +140,20 @@ namespace mongo {
 
         virtual StatusWith<double> computeDistance(WorkingSetMember* member);
 
+        virtual PlanStage::StageState initialize(OperationContext* txn,
+                                                 WorkingSet* workingSet,
+                                                 Collection* collection,
+                                                 WorkingSetID* out);
+
     private:
+
+        virtual void finishSaveState();
+
+        virtual void finishRestoreState(OperationContext* txn);
+
+        virtual void finishInvalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type);
 
         const GeoNearParams _nearParams;
 
@@ -138,6 +169,9 @@ namespace mongo {
 
         // Amount to increment the next bounds by
         double _boundsIncrement;
+
+        class DensityEstimator;
+        boost::scoped_ptr<DensityEstimator> _densityEstimator;
     };
 
 } // namespace mongo

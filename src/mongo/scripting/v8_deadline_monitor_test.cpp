@@ -28,27 +28,33 @@
 
 // DeadlineMonitor unit tests
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/scripting/v8_deadline_monitor.h"
+
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::vector;
+
     class TaskGroup {
     public:
-        TaskGroup() : _m("TestGroup"), _c(), _killCount(0), _targetKillCount(0) { }
+        TaskGroup() : _c(), _killCount(0), _targetKillCount(0) { }
         void noteKill() {
-            scoped_lock lk(_m);
+            boost::lock_guard<boost::mutex> lk(_m);
             ++_killCount;
             if (_killCount >= _targetKillCount)
                 _c.notify_one();
         }
         void waitForKillCount(uint64_t target) {
-            scoped_lock lk(_m);
+            boost::unique_lock<boost::mutex> lk(_m);
             _targetKillCount = target;
             while (_killCount < _targetKillCount)
-                _c.wait(lk.boost());
+                _c.wait(lk);
         }
     private:
         mongo::mutex _m;

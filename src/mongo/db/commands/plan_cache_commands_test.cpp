@@ -33,6 +33,8 @@
 #include "mongo/db/commands/plan_cache_commands.h"
 
 #include <algorithm>
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/json.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/query/plan_ranker.h"
@@ -44,6 +46,8 @@ using namespace mongo;
 
 namespace {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
     using std::string;
     using std::vector;
 
@@ -201,9 +205,21 @@ namespace {
 
         // Sort query should generate different key from unsorted query.
         ASSERT_OK(PlanCacheCommand::canonicalize(&txn, ns,
-            fromjson("{query: {a: 1, b: 1}, sort: {a: 1}}"), &cqRaw));
-        scoped_ptr<CanonicalQuery> sortQuery(cqRaw);
-        ASSERT_NOT_EQUALS(query->getPlanCacheKey(), sortQuery->getPlanCacheKey());
+            fromjson("{query: {a: 1, b: 1}, sort: {a: 1, b: 1}}"), &cqRaw));
+        scoped_ptr<CanonicalQuery> sortQuery1(cqRaw);
+        ASSERT_NOT_EQUALS(query->getPlanCacheKey(), sortQuery1->getPlanCacheKey());
+
+        // Confirm sort arguments are properly delimited (SERVER-17158)
+        ASSERT_OK(PlanCacheCommand::canonicalize(&txn, ns,
+            fromjson("{query: {a: 1, b: 1}, sort: {aab: 1}}"), &cqRaw));
+        scoped_ptr<CanonicalQuery> sortQuery2(cqRaw);
+        ASSERT_NOT_EQUALS(sortQuery1->getPlanCacheKey(), sortQuery2->getPlanCacheKey());
+
+        // Changing order and/or value of predicates should not change key
+        ASSERT_OK(PlanCacheCommand::canonicalize(&txn, ns,
+            fromjson("{query: {b: 3, a: 3}, sort: {a: 1, b: 1}}"), &cqRaw));
+        scoped_ptr<CanonicalQuery> sortQuery3(cqRaw);
+        ASSERT_EQUALS(sortQuery1->getPlanCacheKey(), sortQuery3->getPlanCacheKey());
 
         // Projected query should generate different key from unprojected query.
         ASSERT_OK(PlanCacheCommand::canonicalize(&txn, ns,

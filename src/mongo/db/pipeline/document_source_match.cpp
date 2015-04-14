@@ -26,7 +26,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <cctype>
 
@@ -38,6 +38,10 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     const char DocumentSourceMatch::matchName[] = "$match";
 
@@ -101,7 +105,7 @@ namespace {
     // the Match expression has been successfully parsed so they can assume that
     // input is well formed.
 
-    bool isAllDigits(const StringData& str) {
+    bool isAllDigits(StringData str) {
         if (str.empty())
             return false;
 
@@ -112,7 +116,7 @@ namespace {
         return true;
     }
 
-    bool isFieldnameRedactSafe(const StringData& fieldName) {
+    bool isFieldnameRedactSafe(StringData fieldName) {
         // Can't have numeric elements in the dotted path since redacting elements from an array
         // would change the indexes.
 

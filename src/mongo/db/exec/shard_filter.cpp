@@ -38,6 +38,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
@@ -94,7 +97,8 @@ namespace mongo {
 
                     // Skip this document with a warning - no shard key should not be possible
                     // unless manually inserting data into a shard
-                    warning() << "no shard key found in document " << member->obj.toString() << " "
+                    warning() << "no shard key found in document "
+                              << member->obj.value().toString() << " "
                               << "for shard key pattern " << _metadata->getKeyPattern() << ", "
                               << "document may have been inserted manually into shard";
                 }
@@ -111,12 +115,14 @@ namespace mongo {
             ++_commonStats.advanced;
             return status;
         }
-        else {
-            if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
+        }
+
+        return status;
     }
 
     void ShardFilterStage::saveState() {
@@ -129,9 +135,11 @@ namespace mongo {
         _child->restoreState(opCtx);
     }
 
-    void ShardFilterStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void ShardFilterStage::invalidate(OperationContext* txn,
+                                      const RecordId& dl,
+                                      InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
     }
 
     vector<PlanStage*> ShardFilterStage::getChildren() const {

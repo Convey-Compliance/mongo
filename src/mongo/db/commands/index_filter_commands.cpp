@@ -28,20 +28,22 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <sstream>
 
-#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/base/init.h"
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
-#include "mongo/db/client.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/jsobj.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/index_filter_commands.h"
 #include "mongo/db/commands/plan_cache_commands.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/matcher/expression_parser.h"
 
 
 namespace {
@@ -142,6 +144,10 @@ namespace mongo {
 
     bool IndexFilterCommand::slaveOk() const {
         return false;
+    }
+
+    bool IndexFilterCommand::slaveOverrideOk() const {
+        return true;
     }
 
     void IndexFilterCommand::help(stringstream& ss) const {

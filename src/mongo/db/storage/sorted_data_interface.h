@@ -26,17 +26,20 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/ordering.h"
-#include "mongo/db/catalog/head_manager.h"
-#include "mongo/db/diskloc.h"
+#include <boost/optional/optional.hpp>
+#include <boost/optional/optional_io.hpp>
+#include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/record_store.h"
+#include "mongo/db/record_id.h"
+#include "mongo/db/storage/index_entry_comparison.h"
 
 #pragma once
 
 namespace mongo {
 
+    class BSONObjBuilder;
     class BucketDeletionNotification;
     class SortedDataBuilderInterface;
 
@@ -66,125 +69,273 @@ namespace mongo {
         //
 
         /**
-         * Caller owns returned pointer.
-         * 'this' must outlive the returned pointer.
+         * Return a bulk builder for 'this' index.
+         *
+         * Implementations can assume that 'this' index outlives its bulk
+         * builder.
+         *
+         * @param txn the transaction under which keys are added to 'this' index
+         * @param dupsAllowed true if duplicate keys are allowed, and false
+         *        otherwise
+         *
+         * @return caller takes ownership
          */
         virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn,
                                                            bool dupsAllowed) = 0;
 
+        /**
+         * Insert an entry into the index with the specified key and RecordId.
+         *
+         * @param txn the transaction under which the insert takes place
+         * @param dupsAllowed true if duplicate keys are allowed, and false
+         *        otherwise
+         *
+         * @return Status::OK() if the insert succeeded,
+         *
+         *         ErrorCodes::DuplicateKey if 'key' already exists in 'this' index
+         *         at a RecordId other than 'loc' and duplicates were not allowed
+         */
         virtual Status insert(OperationContext* txn,
                               const BSONObj& key,
-                              const DiskLoc& loc,
+                              const RecordId& loc,
                               bool dupsAllowed) = 0;
 
+        /**
+         * Remove the entry from the index with the specified key and RecordId.
+         *
+         * @param txn the transaction under which the remove takes place
+         * @param dupsAllowed true if duplicate keys are allowed, and false
+         *        otherwise
+         */
         virtual void unindex(OperationContext* txn,
                              const BSONObj& key,
-                             const DiskLoc& loc,
+                             const RecordId& loc,
                              bool dupsAllowed) = 0;
 
-        // TODO: Hide this by exposing an update method?
+        /**
+         * Return ErrorCodes::DuplicateKey if 'key' already exists in 'this'
+         * index at a RecordId other than 'loc', and Status::OK() otherwise.
+         *
+         * @param txn the transaction under which this operation takes place
+         *
+         * TODO: Hide this by exposing an update method?
+         */
         virtual Status dupKeyCheck(OperationContext* txn,
                                    const BSONObj& key,
-                                   const DiskLoc& loc) = 0;
+                                   const RecordId& loc) = 0;
 
         //
         // Information about the tree
         //
 
-        // TODO: expose full set of args for testing?
-        virtual void fullValidate(OperationContext* txn, long long* numKeysOut) const = 0;
+        /**
+         * 'output' is used to store results of validate when 'full' is true.
+         * If 'full' is false, 'output' may be NULL.
+         *
+         * TODO: expose full set of args for testing?
+         */
+        virtual void fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
+                                  BSONObjBuilder* output) const = 0;
+
+        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
+            const = 0;
+
 
         /**
+         * Return the number of bytes consumed by 'this' index.
+         *
+         * @param txn the transaction under which this operation takes place
+         *
          * @see IndexAccessMethod::getSpaceUsedBytes
          */
         virtual long long getSpaceUsedBytes( OperationContext* txn ) const = 0;
 
-        virtual bool isEmpty(OperationContext* txn) = 0;
-        
         /**
-         * Attempt to bring whole index into memory. No-op is ok if not supported.
+         * Return true if 'this' index is empty, and false otherwise.
          */
-        virtual Status touch(OperationContext* txn) const = 0;
+        virtual bool isEmpty(OperationContext* txn) = 0;
 
         /**
-         * Implementors SHOULD override this with an efficient representation if at all possible.
-         * @return the number of entries in the index.
+         * Attempt to bring the entirety of 'this' index into memory.
+         *
+         * If the underlying storage engine does not support the operation,
+         * returns ErrorCodes::CommandNotSupported
+         *
+         * @return Status::OK()
+         */
+        virtual Status touch(OperationContext* txn) const {
+            return Status(ErrorCodes::CommandNotSupported,
+                          "this storage engine does not support touch");
+        }
+
+        /**
+         * Return the number of entries in 'this' index.
+         *
+         * The default implementation should be overridden with a more
+         * efficient one if at all possible.
          */
         virtual long long numEntries( OperationContext* txn ) const {
             long long x = -1;
-            fullValidate( txn, &x );
+            fullValidate(txn, false, &x, NULL);
             return x;
         }
 
         /**
-         * Navigation
+         * Navigates over the sorted data.
+         *
+         * A cursor is constructed with a direction flag with the following effects:
+         *      - The direction that next() moves.
+         *      - If a seek method hits an exact match on key, forward cursors will be positioned on
+         *        the first value for that key, reverse cursors on the last.
+         *      - If a seek method or restore does not hit an exact match, cursors will be
+         *        positioned on the closest position *after* the query in the direction of the
+         *        search.
+         *      - The end position is on the "far" side of the query. In a forward cursor that means
+         *        that it is the lowest value for the key if the end is exclusive or the first entry
+         *        past the key if the end is inclusive or there are no exact matches.
          *
          * A cursor is tied to a transaction, such as the OperationContext or a WriteUnitOfWork
          * inside that context. Any cursor acquired inside a transaction is invalid outside
-         * of that transaction, instead use the savePosition() and restorePosition() methods
-         * reestablish the cursor.
+         * of that transaction, instead use the save and restore methods to reestablish the cursor.
+         *
+         * Any method other than the save methods may throw WriteConflict exception. If that
+         * happens, the cursor may not be used again until it has been saved and successfully
+         * restored. If next() or restore() throw a WCE the cursor's position will be the same as
+         * before the call (strong exception guarantee). All other methods leave the cursor in a
+         * valid state but with an unspecified position (basic exception guarantee). All methods
+         * only provide the basic guarantee for exceptions other than WCE.
+         *
+         * Any returned unowned BSON is only valid until the next call to any method on this
+         * interface. The implementations must assume that passed-in unowned BSON is only valid for
+         * the duration of the call.
+         *
+         * Implementations may override any default implementation if they can provide a more
+         * efficient implementation.
          */
         class Cursor {
         public:
-            virtual ~Cursor() {}
-
-            virtual int getDirection() const = 0;
-
-            virtual bool isEOF() const = 0;
 
             /**
-             * Will only be called with other from same index as this.
-             * All EOF locs should be considered equal.
+             * Tells methods that return an IndexKeyEntry what part of the data the caller is
+             * interested in.
+             *
+             * Methods returning an engaged optional<T> will only return null RecordIds or empty
+             * BSONObjs if they have been explicitly left out of the request.
+             *
+             * Implementations are allowed to return more data than requested, but not less.
              */
-             virtual bool pointsToSamePlaceAs(const Cursor& other) const = 0;
+            enum RequestedInfo {
+                // Only usable part of the return is whether it is engaged or not.
+                kJustExistance = 0,
+                // Key must be filled in.
+                kWantKey = 1,
+                // Loc must be fulled in.
+                kWantLoc = 2,
+                // Both must be returned.
+                kKeyAndLoc = kWantKey | kWantLoc,
+            };
+
+            virtual ~Cursor() = default;
+
 
             /**
-             * If the SortedDataInterface impl calls the BucketNotificationCallback, the argument must
-             * be forwarded to all Cursors over that SortedData.
-             * TODO something better.
+             * Sets the position to stop scanning. An empty key unsets the end position.
+             *
+             * If next() hits this position, or a seek method attempts to seek past it they
+             * unposition the cursor and return boost::none.
+             *
+             * Setting the end position should be done before seeking since the current position, if
+             * any, isn't checked.
              */
-            virtual void aboutToDeleteBucket(const DiskLoc& bucket) = 0;
-
-            virtual bool locate(const BSONObj& key, const DiskLoc& loc) = 0;
-
-            virtual void advanceTo(const BSONObj &keyBegin,
-                                   int keyBeginLen,
-                                   bool afterKey,
-                                   const vector<const BSONElement*>& keyEnd,
-                                   const vector<bool>& keyEndInclusive) = 0;
+            virtual void setEndPosition(const BSONObj& key, bool inclusive) = 0;
 
             /**
-             * Locate a key with fields comprised of a combination of keyBegin fields and keyEnd
-             * fields.
+             * Moves forward and returns the new data or boost::none if there is no more data.
+             * If not positioned, returns boost::none.
              */
-            virtual void customLocate(const BSONObj& keyBegin,
-                                      int keyBeginLen,
-                                      bool afterVersion,
-                                      const vector<const BSONElement*>& keyEnd,
-                                      const vector<bool>& keyEndInclusive) = 0;
+            virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) = 0;
+
+            //
+            // Seeking
+            //
 
             /**
-             * Return OK if it's not
-             * Otherwise return a status that can be displayed 
+             * Seeks to the provided key and returns current position.
+             *
+             * TODO consider removing once IndexSeekPoint has been cleaned up a bit. In particular,
+             * need a way to specify use whole keyPrefix and nothing else and to support the
+             * combination of empty and exclusive. Should also make it easier to construct for the
+             * common cases.
              */
-            virtual BSONObj getKey() const = 0;
+            virtual boost::optional<IndexKeyEntry> seek(const BSONObj& key,
+                                                        bool inclusive,
+                                                        RequestedInfo parts = kKeyAndLoc) = 0;
 
-            virtual DiskLoc getDiskLoc() const = 0;
+            /**
+             * Seeks to the position described by seekPoint and returns the current position.
+             *
+             * NOTE: most implementations should just pass seekPoint to
+             * IndexEntryComparison::makeQueryObject().
+             */
+            virtual boost::optional<IndexKeyEntry> seek(const IndexSeekPoint& seekPoint,
+                                                        RequestedInfo parts = kKeyAndLoc) = 0;
 
-            virtual void advance() = 0;
+            /**
+             * Seeks to a key with a hint to the implementation that you only want exact matches. If
+             * an exact match can't be found, boost::none will be returned and the resulting
+             * position of the cursor is unspecified.
+             */
+            virtual boost::optional<IndexKeyEntry> seekExact(const BSONObj& key,
+                                                             RequestedInfo parts = kKeyAndLoc) {
+                auto kv = seek(key, true, kKeyAndLoc);
+                if (kv && kv->key.woCompare(key, BSONObj(), /*considerFieldNames*/false) == 0)
+                    return kv;
+                return {};
+            }
 
             //
             // Saving and restoring state
             //
-            virtual void savePosition() = 0;
 
-            virtual void restorePosition(OperationContext* txn) = 0;
+            /**
+             * Prepares for state changes in underlying data in a way that allows the cursor's
+             * current position to be restored.
+             *
+             * It is safe to call savePositioned multiple times in a row.
+             * No other method (excluding destructor) may be called until successfully restored.
+             */
+            virtual void savePositioned() = 0;
+
+            /**
+             * Prepares for state changes in underlying data without necessarily saving the current
+             * state.
+             *
+             * The cursor's position when restored is unspecified. Caller is expected to seek
+             * following the restore.
+             *
+             * It is safe to call saveUnpositioned multiple times in a row.
+             * No other method (excluding destructor) may be called until successfully restored.
+             */
+            virtual void saveUnpositioned() { savePositioned(); }
+
+            /**
+             * Recovers from potential state changes in underlying data.
+             *
+             * If the former position no longer exists, a following call to next() will return the
+             * next closest position in the direction of the scan, if any.
+             *
+             * This handles restoring after either savePositioned() or saveUnpositioned().
+             */
+            virtual void restore(OperationContext* txn) = 0;
         };
 
         /**
-         * Caller takes ownership. SortedDataInterface must outlive all Cursors it produces.
+         * Returns an unpositioned cursor over 'this' index.
+         *
+         * Implementations can assume that 'this' index outlives all cursors it produces.
          */
-        virtual Cursor* newCursor(OperationContext* txn, int direction) const = 0;
+        virtual std::unique_ptr<Cursor> newCursor(OperationContext* txn,
+                                                  bool isForward = true) const = 0;
 
         //
         // Index creation
@@ -206,7 +357,7 @@ namespace mongo {
          * 'key' must be > or >= the last key passed to this function (depends on _dupsAllowed).  If
          * this is violated an error Status (ErrorCodes::InternalError) will be returned.
          */
-        virtual Status addKey(const BSONObj& key, const DiskLoc& loc) = 0;
+        virtual Status addKey(const BSONObj& key, const RecordId& loc) = 0;
 
         /**
          * Do any necessary work to finish building the tree.

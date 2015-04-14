@@ -33,7 +33,9 @@
 #include "mongo/db/query/get_executor.h"
 
 #include <limits>
+#include <memory>
 
+#include "mongo/base/error_codes.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/exec/cached_plan.h"
@@ -43,32 +45,42 @@
 #include "mongo/db/exec/group.h"
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/index_bounds_builder.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/planner_access.h"
-#include "mongo/db/query/qlog.h"
+#include "mongo/db/query/planner_analysis.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
-#include "mongo/db/index_names.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/oplog_hack.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     // static
     void filterAllowedIndexEntries(const AllowedIndices& allowedIndices,
@@ -100,6 +112,20 @@ namespace mongo {
     namespace {
         // The body is below in the "count hack" section but getExecutor calls it.
         bool turnIxscanIntoCount(QuerySolution* soln);
+
+        bool filteredIndexBad(const MatchExpression* filter, CanonicalQuery* query) {
+            if (!filter)
+                return false;
+
+            MatchExpression* queryPredicates = query->root();
+            if (!queryPredicates) {
+                // Index is filtered, but query has none.
+                // Impossible to use index.
+                return true;
+            }
+
+            return !expression::isClauseRedundant(queryPredicates, filter);
+        }
     }  // namespace
 
 
@@ -112,10 +138,17 @@ namespace mongo {
                                                                                          false);
         while (ii.more()) {
             const IndexDescriptor* desc = ii.next();
+
+            IndexCatalogEntry* ice = ii.catalogEntry(desc);
+            if (filteredIndexBad(ice->getFilterExpression(), canonicalQuery)) {
+                continue;
+            }
+
             plannerParams->indices.push_back(IndexEntry(desc->keyPattern(),
                                                         desc->getAccessMethodName(),
                                                         desc->isMultikey(txn),
                                                         desc->isSparse(),
+                                                        desc->unique(),
                                                         desc->indexName(),
                                                         desc->infoObj()));
         }
@@ -165,8 +198,19 @@ namespace mongo {
             plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
         }
 
-        plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
         plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
+
+        // Doc-level locking storage engines cannot answer predicates implicitly via exact index
+        // bounds for index intersection plans, as this can lead to spurious matches.
+        //
+        // Such storage engines do not use the invalidation framework, and therefore
+        // have no need for KEEP_MUTATIONS.
+        if (supportsDocLocking()) {
+            plannerParams->options |= QueryPlannerParams::CANNOT_TRIM_IXISECT;
+        }
+        else {
+            plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
+        }
     }
 
     namespace {
@@ -246,7 +290,7 @@ namespace mongo {
             }
 
             // Tailable: If the query requests tailable the collection must be capped.
-            if (canonicalQuery->getParsed().getOptions().tailable) {
+            if (canonicalQuery->getParsed().isTailable()) {
                 if (!collection->isCapped()) {
                     return Status(ErrorCodes::BadValue,
                                   "error processing query: " + canonicalQuery->toString() +
@@ -300,7 +344,6 @@ namespace mongo {
             if (internalQueryPlanOrChildrenIndependently
                 && SubplanStage::canUseSubplanning(*canonicalQuery)) {
 
-                QLOG() << "Running query as sub-queries: " << canonicalQuery->toStringShort();
                 LOG(2) << "Running query as sub-queries: " << canonicalQuery->toStringShort();
 
                 *rootOut = new SubplanStage(opCtx, collection, ws, plannerParams, canonicalQuery);
@@ -452,182 +495,381 @@ namespace mongo {
     }
 
     //
+    // Find
+    //
+
+namespace {
+
+    /**
+     * Returns true if 'me' is a GTE or GE predicate over the "ts" field.
+     * Such predicates can be used for the oplog start hack.
+     */
+    bool isOplogTsPred(const mongo::MatchExpression* me) {
+        if (mongo::MatchExpression::GT != me->matchType()
+            && mongo::MatchExpression::GTE != me->matchType()) {
+            return false;
+        }
+
+        return mongoutils::str::equals(me->path().rawData(), "ts");
+    }
+
+    mongo::BSONElement extractOplogTsOptime(const mongo::MatchExpression* me) {
+        invariant(isOplogTsPred(me));
+        return static_cast<const mongo::ComparisonMatchExpression*>(me)->getData();
+    }
+
+    Status getOplogStartHack(OperationContext* txn,
+                             Collection* collection,
+                             CanonicalQuery* cq,
+                             PlanExecutor** execOut) {
+        invariant(collection);
+        invariant(cq);
+        auto_ptr<CanonicalQuery> autoCq(cq);
+
+        // A query can only do oplog start finding if it has a top-level $gt or $gte predicate over
+        // the "ts" field (the operation's timestamp). Find that predicate and pass it to
+        // the OplogStart stage.
+        MatchExpression* tsExpr = NULL;
+        if (MatchExpression::AND == cq->root()->matchType()) {
+            // The query has an AND at the top-level. See if any of the children
+            // of the AND are $gt or $gte predicates over 'ts'.
+            for (size_t i = 0; i < cq->root()->numChildren(); ++i) {
+                MatchExpression* me = cq->root()->getChild(i);
+                if (isOplogTsPred(me)) {
+                    tsExpr = me;
+                    break;
+                }
+            }
+        }
+        else if (isOplogTsPred(cq->root())) {
+            // The root of the tree is a $gt or $gte predicate over 'ts'.
+            tsExpr = cq->root();
+        }
+
+        if (NULL == tsExpr) {
+            return Status(ErrorCodes::OplogOperationUnsupported,
+                          "OplogReplay query does not contain top-level "
+                          "$gt or $gte over the 'ts' field.");
+        }
+
+        boost::optional<RecordId> startLoc = boost::none;
+
+        // See if the RecordStore supports the oplogStartHack
+        const BSONElement tsElem = extractOplogTsOptime(tsExpr);
+        if (tsElem.type() == bsonTimestamp) {
+            StatusWith<RecordId> goal = oploghack::keyForOptime(tsElem.timestamp());
+            if (goal.isOK()) {
+                startLoc = collection->getRecordStore()->oplogStartHack(txn, goal.getValue());
+            }
+        }
+
+        if (startLoc) {
+            LOG(3) << "Using direct oplog seek";
+        }
+        else {
+            LOG(3) << "Using OplogStart stage";
+
+            // Fallback to trying the OplogStart stage.
+            WorkingSet* oplogws = new WorkingSet();
+            OplogStart* stage = new OplogStart(txn, collection, tsExpr, oplogws);
+            PlanExecutor* rawExec;
+
+            // Takes ownership of oplogws and stage.
+            Status execStatus = PlanExecutor::make(txn, oplogws, stage, collection,
+                                                   PlanExecutor::YIELD_AUTO, &rawExec);
+            invariant(execStatus.isOK());
+            std::unique_ptr<PlanExecutor> exec(rawExec);
+
+            // The stage returns a RecordId of where to start.
+            startLoc = RecordId();
+            PlanExecutor::ExecState state = exec->getNext(NULL, startLoc.get_ptr());
+
+            // This is normal.  The start of the oplog is the beginning of the collection.
+            if (PlanExecutor::IS_EOF == state) {
+                return getExecutor(txn, collection, autoCq.release(), PlanExecutor::YIELD_AUTO,
+                                   execOut);
+            }
+
+            // This is not normal.  An error was encountered.
+            if (PlanExecutor::ADVANCED != state) {
+                return Status(ErrorCodes::InternalError,
+                              "quick oplog start location had error...?");
+            }
+        }
+
+        // Build our collection scan...
+        CollectionScanParams params;
+        params.collection = collection;
+        params.start = *startLoc;
+        params.direction = CollectionScanParams::FORWARD;
+        params.tailable = cq->getParsed().isTailable();
+
+        WorkingSet* ws = new WorkingSet();
+        CollectionScan* cs = new CollectionScan(txn, params, ws, cq->root());
+        // Takes ownership of 'ws', 'cs', and 'cq'.
+        return PlanExecutor::make(txn, ws, cs, autoCq.release(), collection,
+                                  PlanExecutor::YIELD_AUTO, execOut);
+    }
+
+} // namespace
+
+    Status getExecutorFind(OperationContext* txn,
+                           Collection* collection,
+                           const NamespaceString& nss,
+                           CanonicalQuery* rawCanonicalQuery,
+                           PlanExecutor::YieldPolicy yieldPolicy,
+                           PlanExecutor** out) {
+        std::unique_ptr<CanonicalQuery> cq(rawCanonicalQuery);
+        if (NULL != collection && cq->getParsed().isOplogReplay()) {
+            return getOplogStartHack(txn, collection, cq.release(), out);
+        }
+
+        size_t options = QueryPlannerParams::DEFAULT;
+        if (shardingState.needCollectionMetadata(nss.ns())) {
+            options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+        }
+        return getExecutor(txn, collection, cq.release(), PlanExecutor::YIELD_AUTO, out, options);
+    }
+
+    //
     // Delete
     //
 
     Status getExecutorDelete(OperationContext* txn,
                              Collection* collection,
-                             CanonicalQuery* rawCanonicalQuery,
-                             bool isMulti,
-                             bool shouldCallLogOp,
-                             bool fromMigrate,
-                             bool isExplain,
-                             PlanExecutor::YieldPolicy yieldPolicy,
-                             PlanExecutor** out) {
-        auto_ptr<CanonicalQuery> canonicalQuery(rawCanonicalQuery);
+                             ParsedDelete* parsedDelete,
+                             PlanExecutor** execOut) {
+        const DeleteRequest* request = parsedDelete->getRequest();
+
+        const NamespaceString& nss(request->getNamespaceString());
+        if (!request->isGod()) {
+            if (nss.isSystem()) {
+                uassert(12050,
+                        "cannot delete from system namespace",
+                        legalClientSystemNS(nss.ns(), true));
+            }
+            if (nss.ns().find('$') != string::npos) {
+                log() << "cannot delete from collection with reserved $ in name: " << nss << endl;
+                uasserted(10100, "cannot delete from collection with reserved $ in name");
+            }
+        }
+
+        if (collection && collection->isCapped()) {
+            return Status(ErrorCodes::IllegalOperation,
+                          str::stream() << "cannot remove from a capped collection: " <<  nss.ns());
+        }
+
+        bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(nss.db());
+
+        if (userInitiatedWritesAndNotPrimary) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while removing from " << nss.ns());
+        }
+
+        DeleteStageParams deleteStageParams;
+        deleteStageParams.isMulti = request->isMulti();
+        deleteStageParams.fromMigrate = request->isFromMigrate();
+        deleteStageParams.isExplain = request->isExplain();
+
         auto_ptr<WorkingSet> ws(new WorkingSet());
+        PlanExecutor::YieldPolicy policy = parsedDelete->canYield() ? PlanExecutor::YIELD_AUTO :
+                                                                      PlanExecutor::YIELD_MANUAL;
+
+        if (!parsedDelete->hasParsedQuery()) {
+            // This is the idhack fast-path for getting a PlanExecutor without doing the work
+            // to create a CanonicalQuery.
+            const BSONObj& unparsedQuery = request->getQuery();
+
+            if (!collection) {
+                // Treat collections that do not exist as empty collections.  Note that the explain
+                // reporting machinery always assumes that the root stage for a delete operation is
+                // a DeleteStage, so in this case we put a DeleteStage on top of an EOFStage.
+                LOG(2) << "Collection " << nss.ns() << " does not exist."
+                       << " Using EOF stage: " << unparsedQuery.toString();
+                DeleteStage* deleteStage = new DeleteStage(txn, deleteStageParams, ws.get(), NULL,
+                                                           new EOFStage());
+                return PlanExecutor::make(txn, ws.release(), deleteStage, nss.ns(), policy,
+                                          execOut);
+
+            }
+
+            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
+                collection->getIndexCatalog()->findIdIndex(txn)) {
+                LOG(2) << "Using idhack: " << unparsedQuery.toString();
+
+                PlanStage* idHackStage = new IDHackStage(txn,
+                                                         collection,
+                                                         unparsedQuery["_id"].wrap(),
+                                                         ws.get());
+                DeleteStage* root = new DeleteStage(txn, deleteStageParams, ws.get(), collection,
+                                                    idHackStage);
+                return PlanExecutor::make(txn, ws.release(), root, collection, policy, execOut);
+            }
+
+            // If we're here then we don't have a parsed query, but we're also not eligible for
+            // the idhack fast path. We need to force canonicalization now.
+            Status cqStatus = parsedDelete->parseQueryToCQ();
+            if (!cqStatus.isOK()) {
+                return cqStatus;
+            }
+        }
+
+        // This is the regular path for when we have a CanonicalQuery.
+        std::auto_ptr<CanonicalQuery> cq(parsedDelete->releaseParsedQuery());
+
         PlanStage* root;
         QuerySolution* querySolution;
         const size_t defaultPlannerOptions = 0;
-        Status status = prepareExecution(txn, collection, ws.get(), canonicalQuery.get(),
+        Status status = prepareExecution(txn, collection, ws.get(), cq.get(),
                                          defaultPlannerOptions, &root, &querySolution);
         if (!status.isOK()) {
             return status;
         }
         invariant(root);
-        DeleteStageParams deleteStageParams;
-        deleteStageParams.isMulti = isMulti;
-        deleteStageParams.shouldCallLogOp = shouldCallLogOp;
-        deleteStageParams.fromMigrate = fromMigrate;
-        deleteStageParams.isExplain = isExplain;
+        deleteStageParams.canonicalQuery = cq.get();
+
         root = new DeleteStage(txn, deleteStageParams, ws.get(), collection, root);
         // We must have a tree of stages in order to have a valid plan executor, but the query
         // solution may be null.
-        return PlanExecutor::make(txn, ws.release(), root, querySolution, canonicalQuery.release(),
-                                  collection, yieldPolicy, out);
-    }
-
-    Status getExecutorDelete(OperationContext* txn,
-                             Collection* collection,
-                             const std::string& ns,
-                             const BSONObj& unparsedQuery,
-                             bool isMulti,
-                             bool shouldCallLogOp,
-                             bool fromMigrate,
-                             bool isExplain,
-                             PlanExecutor::YieldPolicy yieldPolicy,
-                             PlanExecutor** out) {
-        auto_ptr<WorkingSet> ws(new WorkingSet());
-        DeleteStageParams deleteStageParams;
-        deleteStageParams.isMulti = isMulti;
-        deleteStageParams.shouldCallLogOp = shouldCallLogOp;
-        deleteStageParams.fromMigrate = fromMigrate;
-        deleteStageParams.isExplain = isExplain;
-        if (!collection) {
-            // Treat collections that do not exist as empty collections.  Note that the explain
-            // reporting machinery always assumes that the root stage for a delete operation is a
-            // DeleteStage, so in this case we put a DeleteStage on top of an EOFStage.
-            LOG(2) << "Collection " << ns << " does not exist."
-                   << " Using EOF stage: " << unparsedQuery.toString();
-            DeleteStage* deleteStage = new DeleteStage(txn, deleteStageParams, ws.get(), NULL,
-                                                       new EOFStage());
-            return PlanExecutor::make(txn, ws.release(), deleteStage, ns, yieldPolicy, out);
-        }
-
-        if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
-            collection->getIndexCatalog()->findIdIndex(txn)) {
-            LOG(2) << "Using idhack: " << unparsedQuery.toString();
-
-            PlanStage* idHackStage = new IDHackStage(txn, collection, unparsedQuery["_id"].wrap(),
-                                                     ws.get());
-            DeleteStage* root = new DeleteStage(txn, deleteStageParams, ws.get(), collection,
-                                                idHackStage);
-            return PlanExecutor::make(txn, ws.release(), root, collection, yieldPolicy, out);
-        }
-
-        const WhereCallbackReal whereCallback(txn, collection->ns().db());
-        CanonicalQuery* cq;
-        Status status = CanonicalQuery::canonicalize(collection->ns(),
-                                                     unparsedQuery,
-                                                     deleteStageParams.isExplain,
-                                                     &cq,
-                                                     whereCallback);
-        if (!status.isOK())
-            return status;
-
-        // Takes ownership of 'cq'.
-        return getExecutorDelete(txn, collection, cq, isMulti, shouldCallLogOp,
-                                 fromMigrate, isExplain, yieldPolicy, out);
+        return PlanExecutor::make(txn, ws.release(), root, querySolution, cq.release(),
+                                  collection, policy, execOut);
     }
 
     //
     // Update
     //
 
+    namespace {
+
+        // TODO: Make this a function on NamespaceString, or make it cleaner.
+        inline void validateUpdate(const char* ns ,
+                                   const BSONObj& updateobj,
+                                   const BSONObj& patternOrig) {
+            uassert(10155 , "cannot update reserved $ collection", strchr(ns, '$') == 0);
+            if (strstr(ns, ".system.")) {
+                /* dm: it's very important that system.indexes is never updated as IndexDetails
+                   has pointers into it */
+                uassert(10156,
+                         str::stream() << "cannot update system collection: "
+                         << ns << " q: " << patternOrig << " u: " << updateobj,
+                         legalClientSystemNS(ns , true));
+            }
+        }
+
+    } // namespace
+
     Status getExecutorUpdate(OperationContext* txn,
-                             Database* db,
-                             CanonicalQuery* rawCanonicalQuery,
-                             const UpdateRequest* request,
-                             UpdateDriver* driver,
+                             Collection* collection,
+                             ParsedUpdate* parsedUpdate,
                              OpDebug* opDebug,
-                             PlanExecutor::YieldPolicy yieldPolicy,
                              PlanExecutor** execOut) {
-        auto_ptr<CanonicalQuery> canonicalQuery(rawCanonicalQuery);
+        const UpdateRequest* request = parsedUpdate->getRequest();
+        UpdateDriver* driver = parsedUpdate->getDriver();
+
+        const NamespaceString& nsString = request->getNamespaceString();
+        UpdateLifecycle* lifecycle = request->getLifecycle();
+
+        validateUpdate(nsString.ns().c_str(), request->getUpdates(), request->getQuery());
+
+        // If there is no collection and this is an upsert, callers are supposed to create
+        // the collection prior to calling this method. Explain, however, will never do
+        // collection or database creation.
+        if (!collection && request->isUpsert()) {
+            invariant(request->isExplain());
+        }
+
+        // TODO: This seems a bit circuitious.
+        opDebug->updateobj = request->getUpdates();
+
+        // If this is a user-issued update, then we want to return an error: you cannot perform
+        // writes on a secondary. If this is an update to a secondary from the replication system,
+        // however, then we make an exception and let the write proceed. In this case,
+        // shouldCallLogOp() will be false.
+        bool userInitiatedWritesAndNotPrimary = txn->writesAreReplicated() &&
+            !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(nsString.db());
+
+        if (userInitiatedWritesAndNotPrimary) {
+            return Status(ErrorCodes::NotMaster,
+                          str::stream() << "Not primary while performing update on "
+                                        << nsString.ns());
+        }
+
+        if (lifecycle) {
+            lifecycle->setCollection(collection);
+            driver->refreshIndexKeys(lifecycle->getIndexKeys(txn));
+        }
+
+        PlanExecutor::YieldPolicy policy = parsedUpdate->canYield() ? PlanExecutor::YIELD_AUTO :
+                                                                      PlanExecutor::YIELD_MANUAL;
+
         auto_ptr<WorkingSet> ws(new WorkingSet());
-        Collection* collection = db->getCollection(request->getOpCtx(),
-                                                   request->getNamespaceString().ns());
+        UpdateStageParams updateStageParams(request, driver, opDebug);
+
+        if (!parsedUpdate->hasParsedQuery()) {
+            // This is the idhack fast-path for getting a PlanExecutor without doing the work
+            // to create a CanonicalQuery.
+            const BSONObj& unparsedQuery = request->getQuery();
+
+            if (!collection) {
+                // Treat collections that do not exist as empty collections. Note that the explain
+                // reporting machinery always assumes that the root stage for an update operation is
+                // an UpdateStage, so in this case we put an UpdateStage on top of an EOFStage.
+                LOG(2) << "Collection " << nsString.ns() << " does not exist."
+                       << " Using EOF stage: " << unparsedQuery.toString();
+                UpdateStage* updateStage = new UpdateStage(txn, updateStageParams, ws.get(),
+                                                           collection, new EOFStage());
+                return PlanExecutor::make(txn, ws.release(), updateStage, nsString.ns(),
+                                          policy, execOut);
+            }
+
+            if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
+                collection->getIndexCatalog()->findIdIndex(txn)) {
+
+                LOG(2) << "Using idhack: " << unparsedQuery.toString();
+
+                PlanStage* idHackStage = new IDHackStage(txn,
+                                                         collection,
+                                                         unparsedQuery["_id"].wrap(),
+                                                         ws.get());
+                UpdateStage* root = new UpdateStage(txn, updateStageParams, ws.get(), collection,
+                                                    idHackStage);
+                return PlanExecutor::make(txn, ws.release(), root, collection, policy, execOut);
+            }
+
+            // If we're here then we don't have a parsed query, but we're also not eligible for
+            // the idhack fast path. We need to force canonicalization now.
+            Status cqStatus = parsedUpdate->parseQueryToCQ();
+            if (!cqStatus.isOK()) {
+                return cqStatus;
+            }
+        }
+
+        // This is the regular path for when we have a CanonicalQuery.
+        std::auto_ptr<CanonicalQuery> cq(parsedUpdate->releaseParsedQuery());
 
         PlanStage* root;
         QuerySolution* querySolution;
         const size_t defaultPlannerOptions = 0;
-        Status status = prepareExecution(txn, collection, ws.get(), canonicalQuery.get(),
+        Status status = prepareExecution(txn, collection, ws.get(), cq.get(),
                                          defaultPlannerOptions, &root, &querySolution);
         if (!status.isOK()) {
             return status;
         }
         invariant(root);
-        UpdateStageParams updateStageParams(request, driver, opDebug);
-        updateStageParams.canonicalQuery = rawCanonicalQuery;
-        root = new UpdateStage(updateStageParams, ws.get(), db, root);
+        updateStageParams.canonicalQuery = cq.get();
+
+        root = new UpdateStage(txn, updateStageParams, ws.get(), collection, root);
         // We must have a tree of stages in order to have a valid plan executor, but the query
         // solution may be null. Takes ownership of all args other than 'collection' and 'txn'
         return PlanExecutor::make(txn,
                                   ws.release(),
                                   root,
                                   querySolution,
-                                  canonicalQuery.release(),
+                                  cq.release(),
                                   collection,
-                                  yieldPolicy,
+                                  policy,
                                   execOut);
-    }
-
-    Status getExecutorUpdate(OperationContext* txn,
-                             Database* db,
-                             const std::string& ns,
-                             const UpdateRequest* request,
-                             UpdateDriver* driver,
-                             OpDebug* opDebug,
-                             PlanExecutor::YieldPolicy yieldPolicy,
-                             PlanExecutor** execOut) {
-        auto_ptr<WorkingSet> ws(new WorkingSet());
-        Collection* collection = db->getCollection(request->getOpCtx(),
-                                                   request->getNamespaceString().ns());
-        const BSONObj& unparsedQuery = request->getQuery();
-
-        UpdateStageParams updateStageParams(request, driver, opDebug);
-        if (!collection) {
-            // Treat collections that do not exist as empty collections.  Note that the explain
-            // reporting machinery always assumes that the root stage for an update operation is an
-            // UpdateStage, so in this case we put an UpdateStage on top of an EOFStage.
-            LOG(2) << "Collection " << ns << " does not exist."
-                   << " Using EOF stage: " << unparsedQuery.toString();
-            UpdateStage* updateStage = new UpdateStage(updateStageParams, ws.get(), db,
-                                                       new EOFStage());
-            return PlanExecutor::make(txn, ws.release(), updateStage, ns, yieldPolicy, execOut);
-        }
-
-        if (CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
-            collection->getIndexCatalog()->findIdIndex(txn)) {
-            LOG(2) << "Using idhack: " << unparsedQuery.toString();
-
-            PlanStage* idHackStage = new IDHackStage(txn, collection, unparsedQuery["_id"].wrap(),
-                                                     ws.get());
-            UpdateStage* root = new UpdateStage(updateStageParams, ws.get(), db, idHackStage);
-            return PlanExecutor::make(txn, ws.release(), root, collection, yieldPolicy, execOut);
-        }
-
-        const WhereCallbackReal whereCallback(txn, collection->ns().db());
-        CanonicalQuery* cq;
-        Status status = CanonicalQuery::canonicalize(collection->ns(),
-                                                     unparsedQuery,
-                                                     request->isExplain(),
-                                                     &cq,
-                                                     whereCallback);
-        if (!status.isOK())
-            return status;
-
-        // Takes ownership of 'cq'.
-        return getExecutorUpdate(txn, db, cq, request, driver, opDebug, yieldPolicy, execOut);
     }
 
     //
@@ -874,6 +1116,45 @@ namespace mongo {
         PlanStage* root;
         QuerySolution* querySolution;
 
+        // If collection exists and the query is empty, no additional canonicalization is needed.
+        // If the query is empty, then we can determine the count by just asking the collection
+        // for its number of records. This is implemented by the CountStage, and we don't need
+        // to create a child for the count stage in this case.
+        //
+        // If there is a hint, then we can't use a trival count plan as described above.
+        if (collection && request.query.isEmpty() && request.hint.isEmpty()) {
+            root = new CountStage(txn, collection, request, ws.get(), NULL);
+            return PlanExecutor::make(txn, ws.release(), root, request.ns, yieldPolicy, execOut);
+        }
+
+        auto_ptr<CanonicalQuery> cq;
+        if (!request.query.isEmpty() || !request.hint.isEmpty()) {
+            // If query or hint is not empty, canonicalize the query before working with collection.
+            typedef MatchExpressionParser::WhereCallback WhereCallback;
+            CanonicalQuery* rawCq = NULL;
+            Status canonStatus = CanonicalQuery::canonicalize(
+                request.ns,
+                request.query,
+                BSONObj(), // sort
+                BSONObj(), // projection
+                0, // skip
+                0, // limit
+                request.hint,
+                BSONObj(), // min
+                BSONObj(), // max
+                false, // snapshot
+                request.explain,
+                &rawCq,
+                collection ?
+                    static_cast<const WhereCallback&>(WhereCallbackReal(txn,
+                                                                        collection->ns().db())) :
+                    static_cast<const WhereCallback&>(WhereCallbackNoop()));
+            if (!canonStatus.isOK()) {
+                return canonStatus;
+            }
+            cq.reset(rawCq);
+        }
+
         if (!collection) {
             // Treat collections that do not exist as empty collections. Note that the explain
             // reporting machinery always assumes that the root stage for a count operation is
@@ -882,35 +1163,7 @@ namespace mongo {
             return PlanExecutor::make(txn, ws.release(), root, request.ns, yieldPolicy, execOut);
         }
 
-        if (request.query.isEmpty()) {
-            // If the query is empty, then we can determine the count by just asking the collection
-            // for its number of records. This is implemented by the CountStage, and we don't need
-            // to create a child for the count stage in this case.
-            root = new CountStage(txn, collection, request, ws.get(), NULL);
-            return PlanExecutor::make(txn, ws.release(), root, request.ns, yieldPolicy, execOut);
-        }
-
-        const WhereCallbackReal whereCallback(txn, collection->ns().db());
-
-        CanonicalQuery* rawCq;
-        Status canonStatus = CanonicalQuery::canonicalize(collection->ns().ns(),
-                                                          request.query,
-                                                          BSONObj(), // sort
-                                                          BSONObj(), // projection
-                                                          0, // skip
-                                                          0, // limit
-                                                          request.hint,
-                                                          BSONObj(), // min
-                                                          BSONObj(), // max
-                                                          false, // snapshot
-                                                          request.explain,
-                                                          &rawCq,
-                                                          whereCallback);
-        if (!canonStatus.isOK()) {
-            return canonStatus;
-        }
-
-        auto_ptr<CanonicalQuery> cq(rawCq);
+        invariant(cq.get());
 
         const size_t plannerOptions = QueryPlannerParams::PRIVATE_IS_COUNT;
         Status prepStatus = prepareExecution(txn, collection, ws.get(), cq.get(), plannerOptions,
@@ -1020,6 +1273,7 @@ namespace mongo {
                                                            desc->getAccessMethodName(),
                                                            desc->isMultikey(txn),
                                                            desc->isSparse(),
+                                                           desc->unique(),
                                                            desc->indexName(),
                                                            desc->infoObj()));
             }

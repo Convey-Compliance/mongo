@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -231,10 +232,10 @@ namespace mongo {
          * Associates indices with predicates.
          */
         struct NodeAssignment {
-            scoped_ptr<PredicateAssignment> pred;
-            scoped_ptr<OrAssignment> orAssignment;
-            scoped_ptr<AndAssignment> andAssignment;
-            scoped_ptr<ArrayAssignment> arrayAssignment;
+            boost::scoped_ptr<PredicateAssignment> pred;
+            boost::scoped_ptr<OrAssignment> orAssignment;
+            boost::scoped_ptr<AndAssignment> andAssignment;
+            boost::scoped_ptr<ArrayAssignment> arrayAssignment;
             std::string toString() const;
         };
 
@@ -388,11 +389,14 @@ namespace mongo {
          * Generate single-index assignments for queries which contain mandatory
          * predicates (TEXT and GEO_NEAR, which are required to use a compatible index).
          * Outputs these assignments into 'andAssignment'.
+         *
+         * Returns true if it generated at least one assignment, and false if no assignment
+         * of 'mandatoryPred' is possible.
          */
-        void enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
+        bool enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                                      const IndexToPredMap& idxToNotFirst,
                                      MatchExpression* mandatoryPred,
-                                     const set<IndexID>& mandatoryIndices,
+                                     const std::set<IndexID>& mandatoryIndices,
                                      AndAssignment* andAssignment);
 
         /**

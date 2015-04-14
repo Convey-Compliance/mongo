@@ -30,7 +30,8 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 #include "mongo/db/storage/mmap_v1/record_store_v1_base.h"
 
 namespace mongo {
@@ -41,7 +42,7 @@ namespace mongo {
     class SimpleRecordStoreV1 : public RecordStoreV1Base {
     public:
         SimpleRecordStoreV1( OperationContext* txn,
-                             const StringData& ns,
+                             StringData ns,
                              RecordStoreV1MetaData* details,
                              ExtentManager* em,
                              bool isSystemIndexes );
@@ -50,18 +51,19 @@ namespace mongo {
 
         const char* name() const { return "SimpleRecordStoreV1"; }
 
-        virtual RecordIterator* getIterator( OperationContext* txn, const DiskLoc& start,
+        virtual RecordIterator* getIterator( OperationContext* txn, const RecordId& start,
                                              const CollectionScanParams::Direction& dir) const;
 
         virtual std::vector<RecordIterator*> getManyIterators(OperationContext* txn) const;
 
         virtual Status truncate(OperationContext* txn);
 
-        virtual void temp_cappedTruncateAfter(OperationContext* txn, DiskLoc end, bool inclusive) {
+        virtual void temp_cappedTruncateAfter(OperationContext* txn, RecordId end, bool inclusive) {
             invariant(!"cappedTruncateAfter not supported");
         }
 
         virtual bool compactSupported() const { return true; }
+        virtual bool compactsInPlace() const { return false; }
         virtual Status compact( OperationContext* txn,
                                 RecordStoreCompactAdaptor* adaptor,
                                 const CompactOptions* options,
@@ -69,7 +71,9 @@ namespace mongo {
 
     protected:
         virtual bool isCapped() const { return false; }
-        virtual bool shouldPadInserts() const { return !_details->isUserFlagSet(Flag_NoPadding); }
+        virtual bool shouldPadInserts() const {
+            return !_details->isUserFlagSet(CollectionOptions::Flag_NoPadding);
+        }
 
         virtual StatusWith<DiskLoc> allocRecord( OperationContext* txn,
                                                  int lengthWithHeaders,

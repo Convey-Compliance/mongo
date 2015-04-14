@@ -28,27 +28,53 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
 
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/ops/update.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/util/log.h"
 #include "mongo/util/startup_test.h"
 
 namespace mongo {
-    NamespaceDetailsCollectionCatalogEntry::NamespaceDetailsCollectionCatalogEntry( const StringData& ns,
-                                                                                    NamespaceDetails* details,
-                                                                                    RecordStore* indexRecordStore,
-                                                                                    MMAPV1DatabaseCatalogEntry* db )
+
+    using std::string;
+
+    NamespaceDetailsCollectionCatalogEntry::NamespaceDetailsCollectionCatalogEntry(
+            StringData ns,
+            NamespaceDetails* details,
+            RecordStore* namespacesRecordStore,
+            RecordStore* indexRecordStore,
+            MMAPV1DatabaseCatalogEntry* db )
         : CollectionCatalogEntry( ns ),
           _details( details ),
+          _namespacesRecordStore(namespacesRecordStore),
           _indexRecordStore( indexRecordStore ),
           _db( db ) {
     }
 
     CollectionOptions NamespaceDetailsCollectionCatalogEntry::getCollectionOptions(OperationContext* txn) const {
-        return _db->getCollectionOptions( txn, ns().ns() );
+        CollectionOptions options = _db->getCollectionOptions( txn, ns().ns() );
+
+        if (options.flagsSet) {
+            if (options.flags != _details->userFlags) {
+                warning() << "system.namespaces and NamespaceDetails disagree about userFlags."
+                          << " system.namespaces: " << options.flags
+                          << " NamespaceDetails: " << _details->userFlags;
+                dassert(options.flags == _details->userFlags);
+            }
+        }
+
+        // Fill in the actual flags from the NamespaceDetails.
+        // Leaving flagsSet alone since it indicates whether the user actively set the flags.
+        options.flags = _details->userFlags;
+
+        return options;
     }
 
     int NamespaceDetailsCollectionCatalogEntry::getTotalIndexCount( OperationContext* txn ) const {
@@ -68,13 +94,13 @@ namespace mongo {
         NamespaceDetails::IndexIterator i = _details->ii( true );
         while ( i.more() ) {
             const IndexDetails& id = i.next();
-            const BSONObj obj = _indexRecordStore->dataFor( txn, id.info ).toBson();
+            const BSONObj obj = _indexRecordStore->dataFor( txn, id.info.toRecordId() ).toBson();
             names->push_back( obj.getStringField("name") );
         }
     }
 
     bool NamespaceDetailsCollectionCatalogEntry::isIndexMultikey(OperationContext* txn,
-                                                                 const StringData& idxName) const {
+                                                                 StringData idxName) const {
         int idxNo = _findIndexNumber( txn, idxName );
         invariant( idxNo >= 0 );
         return isIndexMultikey( idxNo );
@@ -85,7 +111,7 @@ namespace mongo {
     }
 
     bool NamespaceDetailsCollectionCatalogEntry::setIndexIsMultikey(OperationContext* txn,
-                                                                    const StringData& indexName,
+                                                                    StringData indexName,
                                                                     bool multikey ) {
 
         int idxNo = _findIndexNumber( txn, indexName );
@@ -120,43 +146,43 @@ namespace mongo {
         return true;
     }
 
-    DiskLoc NamespaceDetailsCollectionCatalogEntry::getIndexHead( OperationContext* txn,
-                                                                  const StringData& idxName ) const {
+    RecordId NamespaceDetailsCollectionCatalogEntry::getIndexHead(OperationContext* txn,
+                                                                  StringData idxName) const {
         int idxNo = _findIndexNumber( txn, idxName );
         invariant( idxNo >= 0 );
-        return _details->idx( idxNo ).head;
+        return _details->idx( idxNo ).head.toRecordId();
     }
 
     BSONObj NamespaceDetailsCollectionCatalogEntry::getIndexSpec( OperationContext* txn,
-                                                                  const StringData& idxName ) const {
+                                                                  StringData idxName ) const {
         int idxNo = _findIndexNumber( txn, idxName );
         invariant( idxNo >= 0 );
         const IndexDetails& id = _details->idx( idxNo );
-        return _indexRecordStore->dataFor( txn, id.info ).toBson();
+        return _indexRecordStore->dataFor( txn, id.info.toRecordId() ).toBson();
     }
 
     void NamespaceDetailsCollectionCatalogEntry::setIndexHead( OperationContext* txn,
-                                                               const StringData& idxName,
-                                                               const DiskLoc& newHead ) {
+                                                               StringData idxName,
+                                                               const RecordId& newHead ) {
         int idxNo = _findIndexNumber( txn, idxName );
         invariant( idxNo >= 0 );
-        *txn->recoveryUnit()->writing( &_details->idx( idxNo ).head) = newHead;
+        *txn->recoveryUnit()->writing(&_details->idx(idxNo).head) = DiskLoc::fromRecordId(newHead);
     }
 
     bool NamespaceDetailsCollectionCatalogEntry::isIndexReady( OperationContext* txn,
-                                                               const StringData& idxName ) const {
+                                                               StringData idxName ) const {
         int idxNo = _findIndexNumber( txn, idxName );
         invariant( idxNo >= 0 );
         return idxNo < getCompletedIndexCount( txn );
     }
 
     int NamespaceDetailsCollectionCatalogEntry::_findIndexNumber( OperationContext* txn,
-                                                                  const StringData& idxName ) const {
+                                                                  StringData idxName ) const {
         NamespaceDetails::IndexIterator i = _details->ii( true );
         while ( i.more() ) {
             const IndexDetails& id = i.next();
             int idxNo = i.pos() - 1;
-            const BSONObj obj = _indexRecordStore->dataFor( txn, id.info ).toBson();
+            const BSONObj obj = _indexRecordStore->dataFor( txn, id.info.toRecordId() ).toBson();
             if ( idxName == obj.getStringField("name") )
                 return idxNo;
         }
@@ -188,12 +214,12 @@ namespace mongo {
     } iu_unittest;
 
     Status NamespaceDetailsCollectionCatalogEntry::removeIndex( OperationContext* txn,
-                                                                const StringData& indexName ) {
+                                                                StringData indexName ) {
         int idxNo = _findIndexNumber( txn, indexName );
         if ( idxNo < 0 )
             return Status( ErrorCodes::NamespaceNotFound, "index not found to remove" );
 
-        DiskLoc infoLocation = _details->idx( idxNo ).info;
+        RecordId infoLocation = _details->idx( idxNo ).info.toRecordId();
 
         { // sanity check
             BSONObj info = _indexRecordStore->dataFor( txn, infoLocation ).toBson();
@@ -235,10 +261,10 @@ namespace mongo {
                                                                          const IndexDescriptor* desc ) {
         BSONObj spec = desc->infoObj();
         // 1) entry in system.indexs
-        StatusWith<DiskLoc> systemIndexesEntry = _indexRecordStore->insertRecord( txn,
-                                                                                  spec.objdata(),
-                                                                                  spec.objsize(),
-                                                                                  false );
+        StatusWith<RecordId> systemIndexesEntry = _indexRecordStore->insertRecord( txn,
+                                                                                   spec.objdata(),
+                                                                                   spec.objsize(),
+                                                                                   false );
         if ( !systemIndexesEntry.isOK() )
             return systemIndexesEntry.getStatus();
 
@@ -255,7 +281,8 @@ namespace mongo {
             id = &_details->idx(getTotalIndexCount( txn ), false);
         }
 
-        *txn->recoveryUnit()->writing( &id->info ) = systemIndexesEntry.getValue();
+        const DiskLoc infoLoc = DiskLoc::fromRecordId(systemIndexesEntry.getValue());
+        *txn->recoveryUnit()->writing( &id->info ) = infoLoc;
         *txn->recoveryUnit()->writing( &id->head ) = DiskLoc();
 
         txn->recoveryUnit()->writingInt( _details->indexBuildsInProgress ) += 1;
@@ -267,7 +294,7 @@ namespace mongo {
     }
 
     void NamespaceDetailsCollectionCatalogEntry::indexBuildSuccess( OperationContext* txn,
-                                                                    const StringData& indexName ) {
+                                                                    StringData indexName ) {
         int idxNo = _findIndexNumber( txn, indexName );
         fassert( 17202, idxNo >= 0 );
 
@@ -298,14 +325,14 @@ namespace mongo {
     }
 
     void NamespaceDetailsCollectionCatalogEntry::updateTTLSetting( OperationContext* txn,
-                                                                   const StringData& idxName,
+                                                                   StringData idxName,
                                                                    long long newExpireSeconds ) {
         int idx = _findIndexNumber( txn, idxName );
         invariant( idx >= 0 );
 
         IndexDetails& indexDetails = _details->idx( idx );
 
-        BSONObj obj = _indexRecordStore->dataFor( txn, indexDetails.info ).toBson();
+        BSONObj obj = _indexRecordStore->dataFor( txn, indexDetails.info.toRecordId() ).toBson();
         const BSONElement oldExpireSecs = obj.getField("expireAfterSeconds");
 
         // Important that we set the new value in-place.  We are writing directly to the
@@ -330,5 +357,40 @@ namespace mongo {
         }
     }
 
+    void NamespaceDetailsCollectionCatalogEntry::updateFlags(OperationContext* txn, int newValue) {
+        NamespaceDetailsRSV1MetaData md(ns().ns(), _details);
+        md.replaceUserFlags(txn, newValue);
+
+        if ( !_namespacesRecordStore )
+            return;
+
+        boost::scoped_ptr<RecordIterator> iterator( _namespacesRecordStore->getIterator(txn) );
+        while ( !iterator->isEOF() ) {
+            RecordId loc = iterator->getNext();
+
+            BSONObj oldEntry = iterator->dataFor( loc ).toBson();
+            BSONElement e = oldEntry["name"];
+            if ( e.type() != String )
+                continue;
+
+            if ( e.String() != ns().ns() )
+                continue;
+
+            BSONObj newEntry =
+                applyUpdateOperators( oldEntry,
+                                      BSON( "$set" << BSON( "options.flags" << newValue) ) );
+
+            StatusWith<RecordId> result = _namespacesRecordStore->updateRecord(txn,
+                                                                               loc,
+                                                                               newEntry.objdata(),
+                                                                               newEntry.objsize(),
+                                                                               false,
+                                                                               NULL);
+            fassert( 17486, result.isOK() );
+            return;
+        }
+
+        fassertFailed( 17488 );
+    }
 
 }

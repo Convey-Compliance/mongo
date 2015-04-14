@@ -30,11 +30,12 @@
 
 #include <boost/thread/thread.hpp>
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/json.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/operation_context_impl.h"
 
 #include "mongo/dbtests/dbtests.h"
@@ -43,13 +44,18 @@ namespace CountTests {
 
     class Base {
     public:
-        Base() : _lk(_txn.lockState(), nsToDatabaseSubstring(ns()), MODE_X),
+        Base() : _txn(),
+                 _scopedXact(&_txn, MODE_IX),
+                 _lk(_txn.lockState(),
+                 nsToDatabaseSubstring(ns()), MODE_X),
                  _context(&_txn, ns()),
                  _client(&_txn) {
+
             _database = _context.db();
+
             {
                 WriteUnitOfWork wunit(&_txn);
-                _collection = _database->getCollection( &_txn, ns() );
+                _collection = _database->getCollection( ns() );
                 if ( _collection ) {
                     _database->dropCollection( &_txn, ns() );
                 }
@@ -104,9 +110,10 @@ namespace CountTests {
 
 
         OperationContextImpl _txn;
+        ScopedTransaction _scopedXact;
         Lock::DBLock _lk;
 
-        Client::Context _context;
+        OldClientContext _context;
 
         Database* _database;
         Collection* _collection;
@@ -166,6 +173,8 @@ namespace CountTests {
             add<QueryFields>();
             add<IndexedRegex>();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace CountTests

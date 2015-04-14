@@ -30,12 +30,12 @@
 
 #pragma once
 
-#include <boost/shared_array.hpp>
-
 #include "mongo/bson/bsonobj.h"
+#include "mongo/util/shared_buffer.h"
 
 namespace mongo {
 
+    // TODO: Does this need to have move support?
     /**
      * A replacement for the Record class. This class represents data in a record store.
      * The _dataPtr attribute is used to manage memory ownership. If _dataPtr is NULL, then
@@ -45,10 +45,11 @@ namespace mongo {
     class RecordData {
     public:
         RecordData() : _data( NULL ), _size( 0 ) {}
-        RecordData(const char* data, int size): _data(data), _size(size), _dataPtr() { }
+        RecordData(const char* data, int size): _data(data), _size(size) { }
 
-        RecordData(const char* data, int size, const boost::shared_array<char>& dataPtr)
-            : _data(data), _size(size), _dataPtr(dataPtr) { }
+        RecordData(SharedBuffer ownedData, int size)
+            : _data(ownedData.get()), _size(size), _ownedData(std::move(ownedData)) {
+        }
 
         const char* data() const { return _data; }
 
@@ -57,15 +58,23 @@ namespace mongo {
         /**
          * Returns true if this owns its own memory, and false otherwise
          */
-        bool isOwned() const { return _dataPtr.get(); }
+        bool isOwned() const { return _ownedData.get(); }
 
-        // TODO eliminate double-copying
-        BSONObj toBson() const { return isOwned() ? BSONObj(_data).getOwned() : BSONObj(_data); }
+        SharedBuffer releaseBuffer() {
+            return std::move(_ownedData);
+        }
+
+        BSONObj toBson() const { return isOwned() ? BSONObj(_ownedData) : BSONObj(_data); }
+
+        BSONObj releaseToBson() { return isOwned() ? BSONObj(releaseBuffer()) : BSONObj(_data); }
+
+        // TODO uncomment once we require compilers that support overloading for rvalue this.
+        // BSONObj toBson() && { return releaseToBson(); }
 
     private:
         const char* _data;
         int _size;
-        boost::shared_array<char> _dataPtr;
+        SharedBuffer _ownedData;
     };
 
 } // namespace mongo

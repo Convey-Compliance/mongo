@@ -87,8 +87,8 @@ namespace mongo {
         CodeWScope=15,
         /** 32 bit signed integer */
         NumberInt = 16,
-        /** Updated to a Date with value next OpTime on insert */
-        Timestamp = 17,
+        /** Two 32 bit signed integers */
+        bsonTimestamp = 17,
         /** 64 bit integer */
         NumberLong = 18,
         /** max type that is not MaxKey */
@@ -149,8 +149,9 @@ namespace mongo {
         case mongo::Bool:
             return 40;
         case mongo::Date:
-        case Timestamp:
             return 45;
+        case bsonTimestamp:
+            return 47;
         case RegEx:
             return 50;
         case DBRef:

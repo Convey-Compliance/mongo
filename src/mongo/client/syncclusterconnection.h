@@ -30,11 +30,12 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/client/dbclientinterface.h"
-#include "mongo/client/export_macros.h"
+#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 
@@ -52,7 +53,7 @@ namespace mongo {
      * The class checks if a command is read or write style, and sends to a single
      * node if a read lock command and to all in two phases with a write style command.
      */
-    class MONGO_CLIENT_API SyncClusterConnection : public DBClientBase {
+    class SyncClusterConnection : public DBClientBase {
     public:
 
         using DBClientBase::query;
@@ -76,11 +77,6 @@ namespace mongo {
          * @return true if all servers are up and ready for writes
          */
         bool prepare( std::string& errmsg );
-
-        /**
-         * runs fsync on all servers
-         */
-        bool fsync( std::string& errmsg );
 
         // --- from DBClientInterface
 
@@ -157,10 +153,10 @@ namespace mongo {
         std::vector<BSONObj> _lastErrors;
 
         // Optionally attached by user
-        scoped_ptr<QueryHandler> _customQueryHandler;
+        boost::scoped_ptr<QueryHandler> _customQueryHandler;
 
         mongo::mutex _mutex;
-        map<string,int> _lockTypes;
+        std::map<std::string,int> _lockTypes;
         // End mutex
 
         double _socketTimeout;
@@ -178,23 +174,23 @@ namespace mongo {
         /**
          * Returns true if the query can be processed using this handler.
          */
-        virtual bool canHandleQuery( const string& ns, Query query ) = 0;
+        virtual bool canHandleQuery( const std::string& ns, Query query ) = 0;
 
         /**
          * Returns a cursor on one of the hosts with the desired results for the query.
          * May throw or return an empty auto_ptr on failure.
          */
-        virtual auto_ptr<DBClientCursor> handleQuery( const vector<string>& hosts,
-                                                      const string &ns,
-                                                      Query query,
-                                                      int nToReturn,
-                                                      int nToSkip,
-                                                      const BSONObj *fieldsToReturn,
-                                                      int queryOptions,
-                                                      int batchSize ) = 0;
+        virtual std::auto_ptr<DBClientCursor> handleQuery( const std::vector<std::string>& hosts,
+                                                           const std::string &ns,
+                                                           Query query,
+                                                           int nToReturn,
+                                                           int nToSkip,
+                                                           const BSONObj *fieldsToReturn,
+                                                           int queryOptions,
+                                                           int batchSize ) = 0;
     };
 
-    class MONGO_CLIENT_API UpdateNotTheSame : public UserException {
+    class UpdateNotTheSame : public UserException {
     public:
         UpdateNotTheSame( int code , const std::string& msg , const std::vector<std::string>& addrs , const std::vector<BSONObj>& lastErrors )
             : UserException( code , msg ) , _addrs( addrs ) , _lastErrors( lastErrors ) {

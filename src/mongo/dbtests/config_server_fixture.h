@@ -37,11 +37,9 @@
 
 namespace mongo {
 
-    class OperationContext;
-
     class CustomDirectClient: public DBDirectClient {
     public:
-        CustomDirectClient() : DBDirectClient(&_txn) {
+        CustomDirectClient(OperationContext* txn) : DBDirectClient(txn) {
             setWireVersions(minWireVersion, maxWireVersion);
         }
 
@@ -71,19 +69,22 @@ namespace mongo {
 
             return true;
         }
-
-        OperationContextImpl _txn;
     };
 
-    class CustomConnectHook: public ConnectionString::ConnectionHook {
+    class CustomConnectHook : public ConnectionString::ConnectionHook {
     public:
+        CustomConnectHook(OperationContext* txn) : _txn(txn) { }
+
         virtual DBClientBase* connect(const ConnectionString& connStr,
                                       std::string& errmsg,
                                       double socketTimeout)
         {
             // Note - must be new, since it gets owned elsewhere
-            return new CustomDirectClient();
+            return new CustomDirectClient(_txn);
         }
+
+    private:
+        OperationContext* const _txn;
     };
 
     /**
@@ -95,19 +96,17 @@ namespace mongo {
     class ConfigServerFixture: public mongo::unittest::Test {
     public:
 
-        /**
-         * Returns a client connection to the virtual config server.
-         */
-        DBClientBase& client() {
-            return _client;
-        }
+        ConfigServerFixture();
 
         /**
-         * Returns a connection std::string to the virtual config server.
+         * Returns a uniform config server connection string to use throughout the tests.
          */
-        ConnectionString configSvr() const {
-            return ConnectionString(HostAndPort("$dummy:10000"));
-        }
+        static ConnectionString configSvr();
+
+        /**
+         * Returns a uniform shard name to use throughout the tests.
+         */
+        static std::string shardName();
 
         /**
          * Clears all data on the server
@@ -115,12 +114,6 @@ namespace mongo {
         void clearServer();
 
         void clearVersion();
-        void clearShards();
-        void clearDatabases();
-        void clearCollections();
-        void clearChunks();
-        void clearPings();
-        void clearChangelog();
 
         /**
          * Dumps the contents of the config server to the log.
@@ -128,15 +121,13 @@ namespace mongo {
         void dumpServer();
 
     protected:
-
-        virtual void setUp();
-
-        virtual void tearDown();
+        OperationContextImpl _txn;
+        CustomDirectClient _client;
+        CustomConnectHook* _connectHook;
 
     private:
-
-        CustomConnectHook* _connectHook;
-        CustomDirectClient _client;
+        virtual void setUp();
+        virtual void tearDown();
     };
 
 }

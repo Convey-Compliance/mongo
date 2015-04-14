@@ -33,13 +33,14 @@
 
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
+#include <iostream>
 #include <pcrecpp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "mongo/base/initializer.h"
 #include "mongo/base/status.h"
-#include "mongo/client/clientOnly-private.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/client.h"
@@ -181,9 +182,9 @@ namespace mongo {
     void Client::initThread(const char *desc, mongo::AbstractMessagingPort *mp) {}
     void logProcessDetailsForLogRotate() {}
 
-    void exitCleanly( ExitCode code, OperationContext* txn ) {
+    void exitCleanly(ExitCode code) {
         {
-            mongo::mutex::scoped_lock lk(mongo::shell_utils::mongoProgramOutputMutex);
+            boost::lock_guard<boost::mutex> lk(mongo::shell_utils::mongoProgramOutputMutex);
             mongo::dbexitCalled = true;
         }
 
@@ -415,7 +416,7 @@ string finishCode( string code ) {
             return "";
 
         char * linePtr = line;
-        while ( startsWith( linePtr, "... " ) )
+        while ( str::startsWith( linePtr, "... " ) )
             linePtr += 4;
 
         code += linePtr;
@@ -830,7 +831,7 @@ int _main( int argc, char* argv[], char **envp ) {
                 continue;
             }
 
-            if ( startsWith( linePtr, "edit " ) ) {
+            if ( str::startsWith( linePtr, "edit " ) ) {
                 shellHistoryAdd( linePtr );
 
                 const char* s = linePtr + 5; // skip "edit "
@@ -894,7 +895,7 @@ int _main( int argc, char* argv[], char **envp ) {
     }
 
     {
-        mongo::mutex::scoped_lock lk(mongo::shell_utils::mongoProgramOutputMutex);
+        boost::lock_guard<boost::mutex> lk(mongo::shell_utils::mongoProgramOutputMutex);
         mongo::dbexitCalled = true;
     }
     return 0;

@@ -1,4 +1,4 @@
-var myShardingTest = new ShardingTest("sharding_passthrough", 2, 0, 1);
+var myShardingTest = new ShardingTest("sharding_passthrough", 1, 0, 1);
 myShardingTest.adminCommand({ enablesharding : "test" });
 
 var db = myShardingTest.getDB("test");
@@ -60,7 +60,6 @@ files.forEach(function(x) {
      * copydbgetnonce
      * dbhash
      * medianKey
-     * clean (apitest_dbcollection)
      * logout and getnonce
      */
 
@@ -74,7 +73,6 @@ files.forEach(function(x) {
         'dbhash|' +
         'dbhash2|' +
         'median|' +
-        'apitest_dbcollection|' +
         'evalb|' +
         'evald|' +
         'eval_nolock|' +
@@ -107,6 +105,7 @@ files.forEach(function(x) {
         'fsync2|' +
         'geo.*|' +
         'indexh|' +
+        'index_bigkeys_nofail|' +
         'remove5|' +
         'update4|' +
         'loglong|' +
@@ -122,10 +121,11 @@ files.forEach(function(x) {
         'indexStatsCommand|' +
         'storageDetailsCommand|' +
         'reversecursor|' +
-        'block_check_supported|' +
         'stages.*|' +
         'top|' +
+        'repair_cursor1|' +
         'touch1|' +
+        'query_oplogreplay|' + // no local db on mongos
         'dbcase|' + // undo after fixing SERVER-11735
         'dbcase2|' + // undo after fixing SERVER-11735
         'stats' + // tests db.stats().dataFileVersion, which doesn't appear in sharded db.stats()

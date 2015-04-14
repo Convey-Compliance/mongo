@@ -27,16 +27,17 @@
  */
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/merge_sort.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/plan_executor.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -45,6 +46,10 @@
 
 namespace QueryStageMergeSortTests {
 
+    using std::auto_ptr;
+    using std::set;
+    using std::string;
+
     class QueryStageMergeSortTestBase {
     public:
         QueryStageMergeSortTestBase() : _client(&_txn) {
@@ -52,12 +57,12 @@ namespace QueryStageMergeSortTests {
         }
 
         virtual ~QueryStageMergeSortTestBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         IndexDescriptor* getIndex(const BSONObj& obj, Collection* coll) {
@@ -72,10 +77,10 @@ namespace QueryStageMergeSortTests {
             _client.remove(ns(), obj);
         }
 
-        void getLocs(set<DiskLoc>* out, Collection* coll) {
+        void getLocs(set<RecordId>* out, Collection* coll) {
             RecordIterator* it = coll->getIterator(&_txn);
             while (!it->isEOF()) {
-                DiskLoc nextLoc = it->getNext();
+                RecordId nextLoc = it->getNext();
                 out->insert(nextLoc);
             }
             delete it;
@@ -109,9 +114,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortPrefixIndex : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -135,7 +140,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -178,9 +183,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortDups : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -204,7 +209,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -246,9 +251,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortDupsNoDedup : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -272,7 +277,7 @@ namespace QueryStageMergeSortTests {
             MergeSortStageParams msparams;
             msparams.dedup = false;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -315,9 +320,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortPrefixIndexReverse : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -342,7 +347,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:-1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << -1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -385,9 +390,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortOneStageEOF : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -411,7 +416,7 @@ namespace QueryStageMergeSortTests {
             // Sort by c:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("c" << 1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             // a:1
             IndexScanParams params;
@@ -453,9 +458,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortManyShort : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -466,7 +471,7 @@ namespace QueryStageMergeSortTests {
             // Sort by foo:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("foo" << 1);
-            MergeSortStage* ms = new MergeSortStage(&_txn, msparams, ws, coll);
+            MergeSortStage* ms = new MergeSortStage(msparams, ws, coll);
 
             IndexScanParams params;
             params.bounds.isSimpleRange = true;
@@ -511,9 +516,9 @@ namespace QueryStageMergeSortTests {
     class QueryStageMergeSortInvalidation : public QueryStageMergeSortTestBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
-            Database* db = ctx.ctx().db();
-            Collection* coll = db->getCollection(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
+            Database* db = ctx.db();
+            Collection* coll = db->getCollection(ns());
             if (!coll) {
                 WriteUnitOfWork wuow(&_txn);
                 coll = db->createCollection(&_txn, ns());
@@ -524,7 +529,7 @@ namespace QueryStageMergeSortTests {
             // Sort by foo:1
             MergeSortStageParams msparams;
             msparams.pattern = BSON("foo" << 1);
-            auto_ptr<MergeSortStage> ms(new MergeSortStage(&_txn, msparams, &ws, coll));
+            auto_ptr<MergeSortStage> ms(new MergeSortStage(msparams, &ws, coll));
 
             IndexScanParams params;
             params.bounds.isSimpleRange = true;
@@ -547,10 +552,10 @@ namespace QueryStageMergeSortTests {
                 ms->addChild(new IndexScan(&_txn, params, &ws, NULL));
             }
 
-            set<DiskLoc> locs;
+            set<RecordId> locs;
             getLocs(&locs, coll);
 
-            set<DiskLoc>::iterator it = locs.begin();
+            set<RecordId>::iterator it = locs.begin();
 
             // Get 10 results.  Should be getting results in order of 'locs'.
             int count = 0;
@@ -573,7 +578,7 @@ namespace QueryStageMergeSortTests {
 
             // Invalidate locs[11].  Should force a fetch.  We don't get it back.
             ms->saveState();
-            ms->invalidate(*it, INVALIDATION_DELETION);
+            ms->invalidate(&_txn, *it, INVALIDATION_DELETION);
             ms->restoreState(&_txn);
 
             // Make sure locs[11] was fetched for us.
@@ -634,7 +639,9 @@ namespace QueryStageMergeSortTests {
             add<QueryStageMergeSortManyShort>();
             add<QueryStageMergeSortInvalidation>();
         }
-    }  queryStageMergeSortTest;
+    };
+
+    SuiteInstance<All> queryStageMergeSortTest;
 
 }  // namespace
 

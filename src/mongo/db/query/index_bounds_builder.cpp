@@ -30,13 +30,15 @@
 
 #include "mongo/db/query/index_bounds_builder.h"
 
+#include <cmath>
 #include <limits>
+
+#include "mongo/base/string_data.h"
 #include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/db/query/expression_index_knobs.h"
 #include "mongo/db/query/indexability.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -64,6 +66,11 @@ namespace mongo {
             return r;
         }
 
+        // A regex with the "|" character is never considered a simple regular expression.
+        if (StringData(regex).find('|') != std::string::npos) {
+            return "";
+        }
+
         bool extended = false;
         while (*flags) {
             switch (*(flags++)) {
@@ -72,6 +79,10 @@ namespace mongo {
                     continue;
                 else
                     return r;
+            case 's':
+                // Single-line mode specified. This just changes the behavior of the '.'
+                // character to match every character instead of every character except '\n'.
+                continue;
             case 'x': // extended
                 extended = true;
                 break;
@@ -84,15 +95,15 @@ namespace mongo {
 
         while(*regex) {
             char c = *(regex++);
+
+            // We should have bailed out early above if '|' is in the regex.
+            invariant(c != '|');
+
             if ( c == '*' || c == '?' ) {
                 // These are the only two symbols that make the last char optional
                 r = ss;
                 r = r.substr( 0 , r.size() - 1 );
                 return r; //breaking here fails with /^a?/
-            }
-            else if (c == '|') {
-                // whole match so far is optional. Nothing we can do here.
-                return string();
             }
             else if (c == '\\') {
                 c = *(regex++);
@@ -352,7 +363,7 @@ namespace mongo {
             }
 
             // Only NaN is <= NaN.
-            if (isNaN(dataElt.numberDouble())) {
+            if (std::isnan(dataElt.numberDouble())) {
                 double nan = dataElt.numberDouble();
                 oilOut->intervals.push_back(makePointInterval(nan));
                 *tightnessOut = IndexBoundsBuilder::EXACT;
@@ -391,7 +402,7 @@ namespace mongo {
             }
 
             // Nothing is < NaN.
-            if (isNaN(dataElt.numberDouble())) {
+            if (std::isnan(dataElt.numberDouble())) {
                 *tightnessOut = IndexBoundsBuilder::EXACT;
                 return;
             }
@@ -434,7 +445,7 @@ namespace mongo {
             }
 
             // Nothing is > NaN.
-            if (isNaN(dataElt.numberDouble())) {
+            if (std::isnan(dataElt.numberDouble())) {
                 *tightnessOut = IndexBoundsBuilder::EXACT;
                 return;
             }
@@ -476,7 +487,7 @@ namespace mongo {
             }
 
             // Only NaN is >= NaN.
-            if (isNaN(dataElt.numberDouble())) {
+            if (std::isnan(dataElt.numberDouble())) {
                 double nan = dataElt.numberDouble();
                 oilOut->intervals.push_back(makePointInterval(nan));
                 *tightnessOut = IndexBoundsBuilder::EXACT;

@@ -28,9 +28,9 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <time.h>
 
@@ -53,17 +53,22 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/server.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
+#include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/version_reporting.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
 #if 0
     namespace cloud {
@@ -263,7 +268,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {} // No auth required
         virtual bool run(OperationContext* txn, const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             BSONObjBuilder b( result.subobjStart( "commands" ) );
-            for ( map<string,Command*>::iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
+            for ( CommandMap::const_iterator i=_commands->begin(); i!=_commands->end(); ++i ) {
                 Command * c = i->second;
 
                 // don't show oldnames
@@ -304,7 +309,7 @@ namespace mongo {
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    bool CmdShutdown::shutdownHelper(OperationContext* txn) {
+    void CmdShutdown::shutdownHelper() {
         MONGO_FAIL_POINT_BLOCK(crashOnShutdown, crashBlock) {
             const std::string crashHow = crashBlock.getData()["how"].str();
             if (crashHow == "fault") {
@@ -319,8 +324,23 @@ namespace mongo {
 
         log() << "terminating, shutdown command received" << endl;
 
-        exitCleanly( EXIT_CLEAN, txn ); // this never returns
-        invariant(false);
+#if defined(_WIN32)
+        // Signal the ServiceMain thread to shutdown.
+        if(ntservice::shouldStartService()) {
+            signalShutdown();
+
+            // Client expects us to abruptly close the socket as part of exiting
+            // so this function is not allowed to return.
+            // The ServiceMain thread will quit for us so just sleep until it does.
+            while (true)
+                sleepsecs(60); // Loop forever
+        }
+        else
+#endif
+        {
+            exitCleanly(EXIT_CLEAN); // this never returns
+            invariant(false);
+        }
     }
 
     /* for testing purposes only */
@@ -343,20 +363,6 @@ namespace mongo {
         }
     } cmdForceError;
 
-    class AvailableQueryOptions : public Command {
-    public:
-        AvailableQueryOptions() : Command( "availableQueryOptions" , false , "availablequeryoptions" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {} // No auth required
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            result << "options" << QueryOption_AllSupported;
-            return true;
-        }
-    } availableQueryOptionsCmd;
-
     class GetLogCmd : public Command {
     public:
         GetLogCmd() : Command( "getLog" ){}
@@ -376,7 +382,14 @@ namespace mongo {
         }
 
         virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-            string p = cmdObj.firstElement().String();
+            BSONElement val = cmdObj.firstElement();
+            if (val.type() != String) {
+                return appendCommandStatus(result, Status(ErrorCodes::TypeMismatch, str::stream()
+                    << "Argument to getLog must be of type String; found "
+                    << val.toString(false) << " of type " << typeName(val.type())));
+            }
+
+            string p = val.String();
             if ( p == "*" ) {
                 vector<string> names;
                 RamLog::getNames( names );

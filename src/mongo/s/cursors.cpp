@@ -33,6 +33,7 @@
 
 #include "mongo/s/cursors.h"
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <vector>
 
@@ -43,17 +44,47 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/client/connpool.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/max_time.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::string;
+    using std::stringstream;
+
     const int ShardedClientCursor::INIT_REPLY_BUFFER_SIZE = 32768;
+
+    // Note: There is no counter for shardedEver from cursorInfo since it is deprecated
+    static Counter64 cursorStatsMultiTarget;
+    static Counter64 cursorStatsSingleTarget;
+
+    // Simple class to report the sum total open cursors = sharded + refs
+    class CursorStatsSum {
+    public:
+        operator long long() const {
+            return get();
+        }
+        long long get() const {
+            return cursorStatsMultiTarget.get() + cursorStatsSingleTarget.get();
+        }
+    };
+
+    static CursorStatsSum cursorStatsTotalOpen;
+
+    static ServerStatusMetricField<Counter64> dCursorStatsMultiTarget( "cursor.open.multiTarget",
+                                                                       &cursorStatsMultiTarget);
+    static ServerStatusMetricField<Counter64> dCursorStatsSingleTarget( "cursor.open.singleTarget",
+                                                                        &cursorStatsSingleTarget);
+    static ServerStatusMetricField<CursorStatsSum> dCursorStatsTotalOpen( "cursor.open.total",
+                                                                          &cursorStatsTotalOpen);
+
 
     // --------  ShardedCursor -----------
 
@@ -75,12 +106,15 @@ namespace mongo {
         }
         else
             _lastAccessMillis = Listener::getElapsedTimeMillis();
+
+        cursorStatsMultiTarget.increment();
     }
 
     ShardedClientCursor::~ShardedClientCursor() {
         verify( _cursor );
         delete _cursor;
         _cursor = 0;
+        cursorStatsMultiTarget.decrement();
     }
 
     long long ShardedClientCursor::getId() {
@@ -106,18 +140,7 @@ namespace mongo {
         return now - _lastAccessMillis;
     }
 
-    bool ShardedClientCursor::sendNextBatchAndReply( Request& r ){
-        BufBuilder buffer( INIT_REPLY_BUFFER_SIZE );
-        int docCount = 0;
-        bool hasMore = sendNextBatch( r, _ntoreturn, buffer, docCount );
-        replyToQuery( 0, r.p(), r.m(), buffer.buf(), buffer.len(), docCount,
-                _totalSent, hasMore ? getId() : 0 );
-
-        return hasMore;
-    }
-
-    bool ShardedClientCursor::sendNextBatch( Request& r , int ntoreturn ,
-            BufBuilder& buffer, int& docCount ) {
+    bool ShardedClientCursor::sendNextBatch(int ntoreturn, BufBuilder& buffer, int& docCount) {
         uassert( 10191 ,  "cursor already done" , ! _done );
 
         int maxSize = 1024 * 1024;
@@ -140,6 +163,11 @@ namespace mongo {
 
             buffer.appendBuf( (void*)o.objdata() , o.objsize() );
             docCount++;
+            // Ensure that the next batch will never wind up requesting more docs from the shard
+            // than are remaining to satisfy the initial ntoreturn.
+            if (ntoreturn != 0) {
+                _cursor->setBatchSize(ntoreturn - docCount);
+            }
 
             if ( buffer.len() > maxSize ) {
                 break;
@@ -191,7 +219,11 @@ namespace mongo {
 
     // ---- CursorCache -----
 
-    long long CursorCache::TIMEOUT = 600000;
+    long long CursorCache::TIMEOUT = 10 * 60 * 1000 /* 10 minutes */;
+    ExportedServerParameter<long long> cursorCacheTimeoutConfig(ServerParameterSet::getGlobal(),
+                                                                "cursorTimeoutMillis",
+                                                                &CursorCache::TIMEOUT,
+                                                                true, true);
 
     unsigned getCCRandomSeed() {
         scoped_ptr<SecureRandom> sr( SecureRandom::create() );
@@ -199,14 +231,13 @@ namespace mongo {
     }
 
     CursorCache::CursorCache()
-        :_mutex( "CursorCache" ),
-         _random( getCCRandomSeed() ),
-         _shardedTotal(0) {
+        : _random( getCCRandomSeed() ),
+          _shardedTotal(0) {
     }
 
     CursorCache::~CursorCache() {
         // TODO: delete old cursors?
-        bool print = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1));
+        bool print = shouldLog(logger::LogSeverity::Debug(1));
         if ( _cursors.size() || _refs.size() )
             print = true;
         verify(_refs.size() == _refsNS.size());
@@ -220,7 +251,7 @@ namespace mongo {
 
     ShardedClientCursorPtr CursorCache::get( long long id ) const {
         LOG(_myLogLevel) << "CursorCache::get id: " << id << endl;
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         MapSharded::const_iterator i = _cursors.find( id );
         if ( i == _cursors.end() ) {
             return ShardedClientCursorPtr();
@@ -231,7 +262,7 @@ namespace mongo {
 
     int CursorCache::getMaxTimeMS( long long id ) const {
         verify( id );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         MapShardedInt::const_iterator i = _cursorsMaxTimeMS.find( id );
         return ( i != _cursorsMaxTimeMS.end() ) ? i->second : 0;
     }
@@ -245,7 +276,7 @@ namespace mongo {
         verify( maxTimeMS == kMaxTimeCursorTimeLimitExpired
                 || maxTimeMS == kMaxTimeCursorNoTimeLimit
                 || maxTimeMS > 0 );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         _cursorsMaxTimeMS[cursor->getId()] = maxTimeMS;
         _cursors[cursor->getId()] = cursor;
         _shardedTotal++;
@@ -256,35 +287,37 @@ namespace mongo {
         verify( maxTimeMS == kMaxTimeCursorTimeLimitExpired
                 || maxTimeMS == kMaxTimeCursorNoTimeLimit
                 || maxTimeMS > 0 );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         _cursorsMaxTimeMS[id] = maxTimeMS;
     }
 
     void CursorCache::remove( long long id ) {
         verify( id );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         _cursorsMaxTimeMS.erase( id );
         _cursors.erase( id );
     }
     
     void CursorCache::removeRef( long long id ) {
         verify( id );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         _refs.erase( id );
         _refsNS.erase( id );
+        cursorStatsSingleTarget.decrement();
     }
 
     void CursorCache::storeRef(const std::string& server, long long id, const std::string& ns) {
         LOG(_myLogLevel) << "CursorCache::storeRef server: " << server << " id: " << id << endl;
         verify( id );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         _refs[id] = server;
         _refsNS[id] = ns;
+        cursorStatsSingleTarget.increment();
     }
 
     string CursorCache::getRef( long long id ) const {
         verify( id );
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         MapNormal::const_iterator i = _refs.find( id );
 
         LOG(_myLogLevel) << "CursorCache::getRef id: " << id << " out: " << ( i == _refs.end() ? " NONE " : i->second ) << endl;
@@ -296,7 +329,7 @@ namespace mongo {
 
     std::string CursorCache::getRefNS(long long id) const {
         verify(id);
-        scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         MapNormal::const_iterator i = _refsNS.find(id);
 
         LOG(_myLogLevel) << "CursorCache::getRefNs id: " << id
@@ -310,7 +343,7 @@ namespace mongo {
 
     long long CursorCache::genId() {
         while ( true ) {
-            scoped_lock lk( _mutex );
+            boost::lock_guard<boost::mutex> lk( _mutex );
 
             long long x = Listener::getElapsedTimeMillis() << 32;
             x |= _random.nextInt32();
@@ -362,18 +395,18 @@ namespace mongo {
 
             string server;
             {
-                scoped_lock lk( _mutex );
+                boost::lock_guard<boost::mutex> lk( _mutex );
 
                 MapSharded::iterator i = _cursors.find( id );
                 if ( i != _cursors.end() ) {
-                    const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
-                            NamespaceString(i->second->getNS()), ActionType::killCursors);
+                    Status authorizationStatus = authSession->checkAuthForKillCursors(
+                            NamespaceString(i->second->getNS()), id);
                     audit::logKillCursorsAuthzCheck(
                             client,
                             NamespaceString(i->second->getNS()),
                             id,
-                            isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
-                    if (isAuthorized) {
+                            authorizationStatus.isOK() ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                    if (authorizationStatus.isOK()) {
                         _cursorsMaxTimeMS.erase( i->second->getId() );
                         _cursors.erase( i );
                     }
@@ -387,19 +420,20 @@ namespace mongo {
                     continue;
                 }
                 verify(refsNSIt != _refsNS.end());
-                const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
-                        NamespaceString(refsNSIt->second), ActionType::killCursors);
+                Status authorizationStatus = authSession->checkAuthForKillCursors(
+                        NamespaceString(refsNSIt->second), id);
                 audit::logKillCursorsAuthzCheck(
                         client,
                         NamespaceString(refsNSIt->second),
                         id,
-                        isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
-                if (!isAuthorized) {
+                        authorizationStatus.isOK() ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                if (!authorizationStatus.isOK()) {
                     continue;
                 }
                 server = refsIt->second;
                 _refs.erase(refsIt);
                 _refsNS.erase(refsNSIt);
+                cursorStatsSingleTarget.decrement();
             }
 
             LOG(_myLogLevel) << "CursorCache::found gotKillCursors id: " << id << " server: " << server << endl;
@@ -412,16 +446,16 @@ namespace mongo {
     }
 
     void CursorCache::appendInfo( BSONObjBuilder& result ) const {
-        scoped_lock lk( _mutex );
-        result.append( "sharded" , (int)_cursors.size() );
+        boost::lock_guard<boost::mutex> lk( _mutex );
+        result.append( "sharded", static_cast<int>(cursorStatsMultiTarget.get()));
         result.appendNumber( "shardedEver" , _shardedTotal );
-        result.append( "refs" , (int)_refs.size() );
-        result.append( "totalOpen" , (int)(_cursors.size() + _refs.size() ) );
+        result.append( "refs", static_cast<int>(cursorStatsSingleTarget.get()));
+        result.append( "totalOpen", static_cast<int>(cursorStatsTotalOpen.get()));
     }
 
     void CursorCache::doTimeouts() {
         long long now = Listener::getElapsedTimeMillis();
-        scoped_lock lk( _mutex );
+        boost::lock_guard<boost::mutex> lk( _mutex );
         for ( MapSharded::iterator i=_cursors.begin(); i!=_cursors.end(); ++i ) {
             // Note: cursors with no timeout will always have an idleTime of 0
             long long idleFor = i->second->idleTime( now );
@@ -455,7 +489,7 @@ namespace mongo {
 
     class CmdCursorInfo : public Command {
     public:
-        CmdCursorInfo() : Command( "cursorInfo", true ) {}
+        CmdCursorInfo() : Command( "cursorInfo" ) {}
         virtual bool slaveOk() const { return true; }
         virtual void help( stringstream& help ) const {
             help << " example: { cursorInfo : 1 }";

@@ -26,23 +26,81 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/curop.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/base/disallow_copying.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/json.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
-
+#include "mongo/util/log.h"
 
 namespace mongo {
 
-    // Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a valid
-    // non-zero max time to fail immediately.  Any getmore operation on a cursor already created
-    // with a valid non-zero max time will also fail immediately.
+    using std::string;
+
+    /**
+     * This type decorates a Client object with a stack of active CurOp objects.
+     *
+     * It encapsulates the nesting logic for curops attached to a Client, along with
+     * the notion that there is always a root CurOp attached to a Client.
+     *
+     * The stack itself is represented in the _parent pointers of the CurOp class.
+     */
+    class CurOp::ClientCuropStack {
+        MONGO_DISALLOW_COPYING(ClientCuropStack);
+    public:
+        ClientCuropStack() : _base(this) {}
+
+        /**
+         * Returns the top of the CurOp stack.
+         */
+        CurOp* top() const { return _top; }
+
+        /**
+         * Adds "curOp" to the top of the CurOp stack for a client. Called by CurOp's constructor.
+         */
+        void push(CurOp* curOp) {
+            boost::lock_guard<boost::mutex> clientLock(Client::clientsMutex);
+            invariant(!curOp->_parent);
+            curOp->_parent = _top;
+            _top = curOp;
+        }
+
+        /**
+         * Pops the top off the CurOp stack for a Client. Called by CurOp's destructor.
+         */
+        CurOp* pop() {
+            boost::lock_guard<boost::mutex> clientLock(Client::clientsMutex);
+            invariant(_top);
+            CurOp* retval = _top;
+            _top = _top->_parent;
+            return retval;
+        }
+
+    private:
+        // Top of the stack of CurOps for a Client.
+        CurOp* _top = nullptr;
+
+        // The bottom-most CurOp for a client.
+        const CurOp _base;
+    };
+
+    const Client::Decoration<CurOp::ClientCuropStack> CurOp::_curopStack =
+        Client::declareDecoration<CurOp::ClientCuropStack>();
+
+    // Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
+    // valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
+    // created with a valid non-zero max time will also fail immediately.
     //
     // This fail point cannot be used with the maxTimeNeverTimeOut fail point.
     MONGO_FP_DECLARE(maxTimeAlwaysTimeOut);
@@ -53,14 +111,18 @@ namespace mongo {
     // This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
     MONGO_FP_DECLARE(maxTimeNeverTimeOut);
 
-    // todo : move more here
 
-    CurOp::CurOp( Client * client , CurOp * wrapped ) :
-        _client(client),
-        _wrapped(wrapped)
-    {
-        if ( _wrapped )
-            _client->_curOp = this;
+    BSONObj CachedBSONObjBase::_tooBig =
+                                    fromjson("{\"$msg\":\"query not recording (too large)\"}");
+
+
+    CurOp* CurOp::get(const Client* client) { return _curopStack(client).top(); }
+    CurOp* CurOp::get(const Client& client) { return _curopStack(client).top(); }
+
+    CurOp::CurOp(Client* client) : CurOp(&_curopStack(client)) {}
+
+    CurOp::CurOp(ClientCuropStack* stack) : _stack(stack) {
+        _stack->push(this);
         _start = 0;
         _active = false;
         _reset();
@@ -70,7 +132,6 @@ namespace mongo {
     }
 
     void CurOp::_reset() {
-        _suppressFromCurop = false;
         _isCommand = false;
         _dbprofile = 0;
         _end = 0;
@@ -81,13 +142,13 @@ namespace mongo {
         _killPending.store(0);
         _numYields = 0;
         _expectedLatencyMs = 0;
-        _lockStat.reset();
     }
 
     void CurOp::reset() {
         _reset();
         _start = 0;
         _opNum = _nextOpNum.fetchAndAdd(1);
+        _ns = "";
         _debug.reset();
         _query.reset();
         _active = true; // this should be last for ui clarity
@@ -108,7 +169,7 @@ namespace mongo {
                                      int secondsBetween) {
         if ( progressMeterTotal ) {
             if ( _progressMeter.isActive() ) {
-                cout << "about to assert, old _message: " << _message << " new message:" << msg << endl;
+                error() << "old _message: " << _message << " new message:" << msg;
                 verify( ! _progressMeter.isActive() );
             }
             _progressMeter.reset( progressMeterTotal , secondsBetween );
@@ -122,16 +183,15 @@ namespace mongo {
     }
 
     CurOp::~CurOp() {
-        if ( _wrapped ) {
-            scoped_lock bl(Client::clientsMutex);
-            _client->_curOp = _wrapped;
+        if (!inShutdown()) {
+            // TODO(schwerin): See if there's a reason not to clean up during shutdown.
+            invariant(this == _stack->pop());
         }
-        _client = 0;
     }
 
-    void CurOp::setNS( const StringData& ns ) {
+    void CurOp::setNS( StringData ns ) {
         // _ns copies the data in the null-terminated ptr it's given
-        _ns = ns.toString().c_str();
+        _ns = ns;
     }
 
     void CurOp::ensureStarted() {
@@ -208,7 +268,6 @@ namespace mongo {
             builder->append("killPending", true);
 
         builder->append( "numYields" , _numYields );
-        builder->append( "lockStats" , _lockStat.report() );
     }
 
     BSONObj CurOp::description() {
@@ -287,10 +346,13 @@ namespace mongo {
     static Counter64 idhackCounter;
     static Counter64 scanAndOrderCounter;
     static Counter64 fastmodCounter;
+    static Counter64 writeConflictsCounter;
 
     static ServerStatusMetricField<Counter64> displayIdhack( "operation.idhack", &idhackCounter );
     static ServerStatusMetricField<Counter64> displayScanAndOrder( "operation.scanAndOrder", &scanAndOrderCounter );
     static ServerStatusMetricField<Counter64> displayFastMod( "operation.fastmod", &fastmodCounter );
+    static ServerStatusMetricField<Counter64> displayWriteConflicts( "operation.writeConflicts",
+                                                                     &writeConflictsCounter );
 
     void OpDebug::recordStats() {
         if ( nreturned > 0 )
@@ -312,6 +374,8 @@ namespace mongo {
             scanAndOrderCounter.increment();
         if ( fastmod )
             fastmodCounter.increment();
+        if ( writeConflicts )
+            writeConflictsCounter.increment( writeConflicts );
     }
 
     CurOp::MaxTimeTracker::MaxTimeTracker() {

@@ -27,7 +27,9 @@
  */
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -35,7 +37,6 @@
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -44,10 +45,12 @@
 
 namespace QueryStageTests {
 
+    using std::auto_ptr;
+
     class IndexScanBase {
     public:
         IndexScanBase() : _client(&_txn) {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             for (int i = 0; i < numObj(); ++i) {
                 BSONObjBuilder bob;
@@ -62,13 +65,12 @@ namespace QueryStageTests {
         }
 
         virtual ~IndexScanBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
         void addIndex(const BSONObj& obj) {
-            Client::WriteContext ctx(&_txn, ns());
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
@@ -91,7 +93,7 @@ namespace QueryStageTests {
             boost::scoped_ptr<PlanExecutor> exec(rawExec);
 
             int count = 0;
-            for (DiskLoc dl; PlanExecutor::ADVANCED == exec->getNext(NULL, &dl); ) {
+            for (RecordId dl; PlanExecutor::ADVANCED == exec->getNext(NULL, &dl); ) {
                 ++count;
             }
 
@@ -99,7 +101,7 @@ namespace QueryStageTests {
         }
 
         void makeGeoData() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             for (int i = 0; i < numObj(); ++i) {
                 double lat = double(rand()) / RAND_MAX;
@@ -227,6 +229,8 @@ namespace QueryStageTests {
             add<QueryStageIXScanLowerUpperInclFilter>();
             add<QueryStageIXScanCantMatch>();
         }
-    }  queryStageTestsAll;
+    };
+
+    SuiteInstance<All> queryStageTestsAll;
 
 }  // namespace

@@ -26,20 +26,29 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
 #include <vector>
 
-#include "mongo/db/concurrency/lock_mgr_test_help.h"
+#include "mongo/config.h"
+#include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/unittest/unittest.h"
-
+#include "mongo/util/log.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
-    
+namespace {
+    const int NUM_PERF_ITERS = 1000*1000; // numeber of iterations to use for lock perf
+}
+
+
     TEST(LockerImpl, LockNoConflict) {
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockerImpl<true> locker(1);
+        MMAPV1LockerImpl locker;
         locker.lockGlobal(MODE_IX);
 
         ASSERT(LOCK_OK == locker.lock(resId, MODE_X));
@@ -57,7 +66,7 @@ namespace mongo {
     TEST(LockerImpl, ReLockNoConflict) {
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockerImpl<true> locker(1);
+        MMAPV1LockerImpl locker;
         locker.lockGlobal(MODE_IX);
 
         ASSERT(LOCK_OK == locker.lock(resId, MODE_S));
@@ -75,15 +84,15 @@ namespace mongo {
     TEST(LockerImpl, ConflictWithTimeout) {
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockerImpl<true> locker1(1);
+        DefaultLockerImpl locker1;
         ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IX));
         ASSERT(LOCK_OK == locker1.lock(resId, MODE_X));
 
-        LockerImpl<true> locker2(2);
+        DefaultLockerImpl locker2;
         ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IX));
         ASSERT(LOCK_TIMEOUT == locker2.lock(resId, MODE_S, 0));
 
-        ASSERT(locker2.isLockHeldForMode(resId, MODE_NONE));
+        ASSERT(locker2.getLockMode(resId) == MODE_NONE);
 
         ASSERT(locker1.unlock(resId));
 
@@ -94,11 +103,11 @@ namespace mongo {
     TEST(LockerImpl, ConflictUpgradeWithTimeout) {
         const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
-        LockerImpl<true> locker1(1);
+        DefaultLockerImpl locker1;
         ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IS));
         ASSERT(LOCK_OK == locker1.lock(resId, MODE_S));
 
-        LockerImpl<true> locker2(2);
+        DefaultLockerImpl locker2;
         ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IS));
         ASSERT(LOCK_OK == locker2.lock(resId, MODE_S));
 
@@ -110,7 +119,7 @@ namespace mongo {
     }
 
     TEST(LockerImpl, ReadTransaction) {
-        LockerImpl<true> locker(1);
+        DefaultLockerImpl locker;
 
         locker.lockGlobal(MODE_IS);
         locker.unlockAll();
@@ -121,60 +130,16 @@ namespace mongo {
         locker.lockGlobal(MODE_IX);
         locker.lockGlobal(MODE_IS);
         locker.unlockAll();
-        locker.unlockAll();
-    }
-
-    TEST(LockerImpl, WriteTransactionWithCommit) {
-        const ResourceId resIdCollection(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-        const ResourceId resIdRecordS(RESOURCE_DOCUMENT, 1);
-        const ResourceId resIdRecordX(RESOURCE_DOCUMENT, 2);
-
-        LockerImpl<true> locker(1);
-
-        locker.lockGlobal(MODE_IX);
-        {
-            ASSERT(LOCK_OK == locker.lock(resIdCollection, MODE_IX, 0));
-
-            locker.beginWriteUnitOfWork();
-
-            ASSERT(LOCK_OK == locker.lock(resIdRecordS, MODE_S, 0));
-            ASSERT(locker.getLockMode(resIdRecordS) == MODE_S);
-
-            ASSERT(LOCK_OK == locker.lock(resIdRecordX, MODE_X, 0));
-            ASSERT(locker.getLockMode(resIdRecordX) == MODE_X);
-
-            ASSERT(locker.unlock(resIdRecordS));
-            ASSERT(locker.getLockMode(resIdRecordS) == MODE_NONE);
-
-            ASSERT(!locker.unlock(resIdRecordX));
-            ASSERT(locker.getLockMode(resIdRecordX) == MODE_X);
-
-            locker.endWriteUnitOfWork();
-
-            {
-                AutoYieldFlushLockForMMAPV1Commit flushLockYield(&locker);
-
-                // This block simulates the flush/remap thread
-                {
-                    LockerImpl<true> flushLocker(2);
-                    AutoAcquireFlushLockForMMAPV1Commit flushLockAcquire(&flushLocker);
-                }
-            }
-
-            ASSERT(locker.getLockMode(resIdRecordX) == MODE_NONE);
-
-            ASSERT(locker.unlock(resIdCollection));
-        }
         locker.unlockAll();
     }
 
     /**
-     * Test that saveLockerImpl<true> works by examining the output.
+     * Test that saveMMAPV1LockerImpl works by examining the output.
      */
     TEST(LockerImpl, saveAndRestoreGlobal) {
         Locker::LockSnapshot lockInfo;
 
-        LockerImpl<true> locker(1);
+        DefaultLockerImpl locker;
 
         // No lock requests made, no locks held.
         locker.saveLockStateAndUnlock(&lockInfo);
@@ -187,7 +152,6 @@ namespace mongo {
         locker.saveLockStateAndUnlock(&lockInfo);
         ASSERT(!locker.isLocked());
         ASSERT_EQUALS(MODE_IX, lockInfo.globalMode);
-        ASSERT_EQUALS(1U, lockInfo.globalRecursiveCount);
 
         // Restore the lock(s) we had.
         locker.restoreLockState(lockInfo);
@@ -202,7 +166,7 @@ namespace mongo {
     TEST(LockerImpl, saveAndRestoreGlobalAcquiredTwice) {
         Locker::LockSnapshot lockInfo;
 
-        LockerImpl<true> locker(1);
+        DefaultLockerImpl locker;
 
         // No lock requests made, no locks held.
         locker.saveLockStateAndUnlock(&lockInfo);
@@ -223,34 +187,134 @@ namespace mongo {
     }
 
     /**
-     * Tests that restoreLockerImpl<true> works by locking a db and collection and saving + restoring.
+     * Tests that restoreMMAPV1LockerImpl works by locking a db and collection and saving + restoring.
      */
     TEST(LockerImpl, saveAndRestoreDBAndCollection) {
         Locker::LockSnapshot lockInfo;
 
-        LockerImpl<true> locker(1);
+        DefaultLockerImpl locker;
 
         const ResourceId resIdDatabase(RESOURCE_DATABASE, std::string("TestDB"));
         const ResourceId resIdCollection(RESOURCE_COLLECTION, std::string("TestDB.collection"));
 
         // Lock some stuff.
         locker.lockGlobal(MODE_IX);
-        ASSERT(LOCK_OK == locker.lock(resIdDatabase, MODE_IX));
-        ASSERT(LOCK_OK == locker.lock(resIdCollection, MODE_X));
+        ASSERT_EQUALS(LOCK_OK, locker.lock(resIdDatabase, MODE_IX));
+        ASSERT_EQUALS(LOCK_OK, locker.lock(resIdCollection, MODE_X));
         locker.saveLockStateAndUnlock(&lockInfo);
 
         // Things shouldn't be locked anymore.
-        ASSERT(locker.getLockMode(resIdDatabase) == MODE_NONE);
-        ASSERT(locker.getLockMode(resIdCollection) == MODE_NONE);
+        ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+        ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
 
         // Restore lock state.
         locker.restoreLockState(lockInfo);
 
         // Make sure things were re-locked.
-        ASSERT(locker.getLockMode(resIdDatabase) == MODE_IX);
-        ASSERT(locker.getLockMode(resIdCollection) == MODE_X);
+        ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
+        ASSERT_EQUALS(MODE_X, locker.getLockMode(resIdCollection));
 
-        locker.unlockAll();
+        ASSERT(locker.unlockAll());
     }
+
+    TEST(LockerImpl, DefaultLocker) {
+        const ResourceId resId(RESOURCE_DATABASE, std::string("TestDB"));
+
+        DefaultLockerImpl locker;
+        ASSERT_EQUALS(LOCK_OK, locker.lockGlobal(MODE_IX));
+        ASSERT_EQUALS(LOCK_OK, locker.lock(resId, MODE_X));
+
+        // Make sure the flush lock IS NOT held
+        Locker::LockerInfo info;
+        locker.getLockerInfo(&info);
+        ASSERT(!info.waitingResource.isValid());
+        ASSERT_EQUALS(2U, info.locks.size());
+        ASSERT_EQUALS(RESOURCE_GLOBAL, info.locks[0].resourceId.getType());
+        ASSERT_EQUALS(resId, info.locks[1].resourceId);
+
+        ASSERT(locker.unlockAll());
+    }
+
+    TEST(LockerImpl, MMAPV1Locker) {
+        const ResourceId resId(RESOURCE_DATABASE, std::string("TestDB"));
+
+        MMAPV1LockerImpl locker;
+        ASSERT_EQUALS(LOCK_OK, locker.lockGlobal(MODE_IX));
+        ASSERT_EQUALS(LOCK_OK, locker.lock(resId, MODE_X));
+
+        // Make sure the flush lock IS held
+        Locker::LockerInfo info;
+        locker.getLockerInfo(&info);
+        ASSERT(!info.waitingResource.isValid());
+        ASSERT_EQUALS(3U, info.locks.size());
+        ASSERT_EQUALS(RESOURCE_GLOBAL, info.locks[0].resourceId.getType());
+        ASSERT_EQUALS(RESOURCE_MMAPV1_FLUSH, info.locks[1].resourceId.getType());
+        ASSERT_EQUALS(resId, info.locks[2].resourceId);
+
+        ASSERT(locker.unlockAll());
+    }
+
+
+    // These two tests exercise single-threaded performance of uncontended lock acquisition. It
+    // is not practical to run them on debug builds.
+#ifndef MONGO_CONFIG_DEBUG_BUILD
+
+    TEST(Locker, PerformanceBoostSharedMutex) {
+        for (int numLockers = 1; numLockers <= 64; numLockers = numLockers * 2) {
+            boost::mutex mtx;
+
+            // Do some warm-up loops
+            for (int i = 0; i < 1000; i++) {
+                mtx.lock();
+                mtx.unlock();
+            }
+
+            // Measure the number of loops
+            //
+            Timer t;
+
+            for (int i = 0; i < NUM_PERF_ITERS; i++) {
+                mtx.lock();
+                mtx.unlock();
+            }
+
+            log() << numLockers
+                << " locks took: "
+                << static_cast<double>(t.micros()) * 1000.0 / static_cast<double>(NUM_PERF_ITERS)
+                << " ns";
+        }
+    }
+
+    TEST(Locker, PerformanceLocker) {
+        for (int numLockers = 1; numLockers <= 64; numLockers = numLockers * 2) {
+            std::vector<boost::shared_ptr<LockerForTests> > lockers(numLockers);
+            for (int i = 0; i < numLockers; i++) {
+                lockers[i].reset(new LockerForTests(MODE_S));
+            }
+
+            DefaultLockerImpl locker;
+
+            // Do some warm-up loops
+            for (int i = 0; i < 1000; i++) {
+                locker.lockGlobal(MODE_IS);
+                locker.unlockAll();
+            }
+
+            // Measure the number of loops
+            Timer t;
+
+            for (int i = 0; i < NUM_PERF_ITERS; i++) {
+                locker.lockGlobal(MODE_IS);
+                locker.unlockAll();
+            }
+
+            log() << numLockers
+                  << " locks took: "
+                  << static_cast<double>(t.micros()) * 1000.0 / static_cast<double>(NUM_PERF_ITERS)
+                  << " ns";
+        }
+    }
+
+#endif  // MONGO_CONFIG_DEBUG_BUILD
 
 } // namespace mongo

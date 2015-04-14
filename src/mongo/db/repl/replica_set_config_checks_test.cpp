@@ -30,10 +30,10 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/repl/repl_coordinator_external_state.h"
-#include "mongo/db/repl/repl_coordinator_external_state_mock.h"
 #include "mongo/db/repl/replica_set_config.h"
 #include "mongo/db/repl/replica_set_config_checks.h"
+#include "mongo/db/repl/replication_coordinator_external_state.h"
+#include "mongo/db/repl/replication_coordinator_external_state_mock.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -133,6 +133,12 @@ namespace {
                                                 oldConfig,
                                                 oldConfig,
                                                 false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                oldConfig,
+                                                oldConfig,
+                                                true).getStatus());
 
         // Cannot reconfig from new to old (versions must increase).
         ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
@@ -140,6 +146,12 @@ namespace {
                                                 newConfig,
                                                 oldConfig,
                                                 false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                newConfig,
+                                                oldConfig,
+                                                true).getStatus());
     }
 
     TEST(ValidateConfigForReconfig, NewConfigMustNotChangeSetName) {
@@ -173,6 +185,12 @@ namespace {
                                                 oldConfig,
                                                 newConfig,
                                                 false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                newConfig,
+                                                oldConfig,
+                                                true).getStatus());
     }
 
     TEST(ValidateConfigForReconfig, NewConfigMustNotFlipBuildIndexesFlag) {
@@ -227,6 +245,13 @@ namespace {
                                                 oldConfig,
                                                 newConfig,
                                                 false).getStatus());
+
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                oldConfig,
+                                                newConfig,
+                                                true).getStatus());
     }
 
     TEST(ValidateConfigForReconfig, NewConfigMustNotFlipArbiterFlag) {
@@ -278,6 +303,12 @@ namespace {
                                                 oldConfig,
                                                 newConfig,
                                                 false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                oldConfig,
+                                                newConfig,
+                                                true).getStatus());
     }
 
     TEST(ValidateConfigForReconfig, HostAndIdRemappingRestricted) {
@@ -336,6 +367,12 @@ namespace {
                                                 oldConfig,
                                                 illegalNewConfigReusingHost,
                                                 false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                      validateConfigForReconfig(&externalState,
+                                                oldConfig,
+                                                illegalNewConfigReusingHost,
+                                                true).getStatus());
         //
         // Here, the new config is valid, because all we've changed is the name of
         // the host representing _id 2.
@@ -394,6 +431,21 @@ namespace {
                                                                        oldConfig,
                                                                        newConfig,
                                                                        false)));
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::NodeNotFound,
+                      validateConfigForReconfig(&notPresentExternalState,
+                                                oldConfig,
+                                                newConfig,
+                                                true).getStatus());
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey,
+                      validateConfigForReconfig(&presentThriceExternalState,
+                                                oldConfig,
+                                                newConfig,
+                                                true).getStatus());
+        ASSERT_EQUALS(1, unittest::assertGet(validateConfigForReconfig(&presentOnceExternalState,
+                                                                       oldConfig,
+                                                                       newConfig,
+                                                                       true)));
     }
 
     TEST(ValidateConfigForReconfig, SelfMustEndElectable) {
@@ -423,6 +475,11 @@ namespace {
                                                 oldConfig,
                                                 newConfig,
                                                 false).getStatus());
+        // Forced reconfig does not require electability.
+        ASSERT_OK(validateConfigForReconfig(&presentOnceExternalState,
+                                            oldConfig,
+                                            newConfig,
+                                            true).getStatus());
     }
 
     TEST(ValidateConfigForInitiate, NewConfigInvalid) {
@@ -465,6 +522,11 @@ namespace {
                                                                       oldConfig,
                                                                       newConfig,
                                                                       false).getStatus());
+        // Forced reconfigs also do not allow this.
+        ASSERT_EQUALS(ErrorCodes::BadValue, validateConfigForReconfig(&presentOnceExternalState,
+                                                                      oldConfig,
+                                                                      newConfig,
+                                                                      true).getStatus());
     }
 
     TEST(ValidateConfigForStartUp, NewConfigInvalid) {
@@ -631,37 +693,6 @@ namespace {
                                                 oldConfig,
                                                 newConfig,
                                                 true).getStatus());
-    }
-
-    TEST(ValidateForReconfig, ForceOtherwiseIncompatibleConfigs) {
-        // The new config is incompatible with the old  for several reasons:
-        // config version goes down, one member changes _id, and one  member changes to arbiter.
-        // This tests that the reconfig is possible, in spite of all these incompatibles, because 
-        // of the force flag.
-        ReplicaSetConfig oldConfig;
-        ASSERT_OK(oldConfig.initialize(BSON("_id" << "rs0" <<
-                                            "version" << 3 <<
-                                            "members" << BSON_ARRAY(
-                                                    BSON("_id" << 0 << "host" << "h2") <<
-                                                    BSON("_id" << 1 << "host" << "h3") <<
-                                                    BSON("_id" << 2 << "host" << "h4")))));
-
-
-        ReplicaSetConfig newConfig;
-        ASSERT_OK(newConfig.initialize(BSON("_id" << "rs0" <<
-                                            "version" << 2 <<
-                                            "members" << BSON_ARRAY(
-                                                    BSON("_id" << 0 << "host" << "h2") << 
-                                                    BSON("_id" << 2 << "host" << "h4" <<
-                                                         "arbiterOnly" << true) << 
-                                                    BSON("_id" << 3 << "host" << "h3")))));
-
-        ReplicationCoordinatorExternalStateMock presentOnceExternalState;
-        presentOnceExternalState.addSelf(HostAndPort("h2"));
-        ASSERT_OK(validateConfigForReconfig(&presentOnceExternalState,
-                                            oldConfig,
-                                            newConfig,
-                                            true).getStatus());
     }
 
 }  // namespace

@@ -38,6 +38,10 @@
 
 namespace mongo {
 
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     /**
      * Mongod-side command for merging chunks.
      */
@@ -132,14 +136,14 @@ namespace mongo {
                                                                       configField,
                                                                       &config,
                                                                       &errmsg );
-            if ( !extracted ) return false;
-            if ( extracted != FieldParser::FIELD_NONE ) {
-                ShardingState::initialize( config );
-            }
-            else if ( !shardingState.enabled() ) {
-                errmsg =
-                    "sharding state must be enabled or config server specified to merge chunks";
-                return false;
+            if (!shardingState.enabled()) {
+                if (!extracted || extracted == FieldParser::FIELD_NONE) {
+                    errmsg = "sharding state must be enabled or "
+                             "config server specified to merge chunks";
+                    return false;
+                }
+
+                ShardingState::initialize(config);
             }
 
             // ShardName is optional, but might not be set yet

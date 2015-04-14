@@ -32,6 +32,7 @@
 
 #include "mongo/db/concurrency/fast_map_noalloc.h"
 #include "mongo/db/concurrency/locker.h"
+#include "mongo/util/concurrency/spin_lock.h"
 
 namespace mongo {
 
@@ -58,7 +59,7 @@ namespace mongo {
 
     private:
 
-        virtual void notify(const ResourceId& resId, LockResult result);
+        virtual void notify(ResourceId resId, LockResult result);
 
         // These two go together to implement the conditional variable pattern.
         boost::mutex _mutex;
@@ -85,17 +86,20 @@ namespace mongo {
     public:
 
         /**
-         * Instantiates a new lock space with the specified unique identifier used for
-         * disambiguation.
+         * Instantiates new locker. Must be given a unique identifier for disambiguation. Lockers
+         * having the same identifier will not conflict on lock acquisition.
          */
-        LockerImpl(uint64_t id);
         LockerImpl();
 
         virtual ~LockerImpl();
 
-        virtual uint64_t getId() const { return _id; }
+        virtual LockerId getId() const { return _id; }
 
         virtual LockResult lockGlobal(LockMode mode, unsigned timeoutMs = UINT_MAX);
+        virtual LockResult lockGlobalBegin(LockMode mode);
+        virtual LockResult lockGlobalComplete(unsigned timeoutMs);
+        virtual void lockMMAPV1Flush();
+
         virtual void downgradeGlobalXtoSForMMAPV1();
         virtual bool unlockAll();
 
@@ -104,20 +108,68 @@ namespace mongo {
 
         virtual bool inAWriteUnitOfWork() const { return _wuowNestingLevel > 0; }
 
-        virtual LockResult lock(const ResourceId& resId,
+        virtual LockResult lock(ResourceId resId,
                                 LockMode mode, 
-                                unsigned timeoutMs = UINT_MAX);
+                                unsigned timeoutMs = UINT_MAX,
+                                bool checkDeadlock = false);
 
-        virtual bool unlock(const ResourceId& resId);
+        virtual void downgrade(ResourceId resId, LockMode newMode);
 
-        virtual LockMode getLockMode(const ResourceId& resId) const;
-        virtual bool isLockHeldForMode(const ResourceId& resId, LockMode mode) const;
+        virtual bool unlock(ResourceId resId);
+
+        virtual LockMode getLockMode(ResourceId resId) const;
+        virtual bool isLockHeldForMode(ResourceId resId, LockMode mode) const;
+        virtual bool isDbLockedForMode(StringData dbName, LockMode mode) const;
+        virtual bool isCollectionLockedForMode(StringData ns, LockMode mode) const;
+
+        virtual ResourceId getWaitingResource() const;
+
+        virtual void getLockerInfo(LockerInfo* lockerInfo) const;
 
         virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut);
 
         virtual void restoreLockState(const LockSnapshot& stateToRestore);
 
+        /**
+         * Allows for lock requests to be requested in a non-blocking way. There can be only one
+         * outstanding pending lock request per locker object.
+         *
+         * lockBegin posts a request to the lock manager for the specified lock to be acquired,
+         * which either immediately grants the lock, or puts the requestor on the conflict queue
+         * and returns immediately with the result of the acquisition. The result can be one of:
+         *
+         * LOCK_OK - Nothing more needs to be done. The lock is granted.
+         * LOCK_WAITING - The request has been queued up and will be granted as soon as the lock
+         *      is free. If this result is returned, typically lockComplete needs to be called in
+         *      order to wait for the actual grant to occur. If the caller no longer needs to wait
+         *      for the grant to happen, unlock needs to be called with the same resource passed
+         *      to lockBegin.
+         *
+         * In other words for each call to lockBegin, which does not return LOCK_OK, there needs to
+         * be a corresponding call to either lockComplete or unlock.
+         *
+         * NOTE: These methods are not public and should only be used inside the class
+         * implementation and for unit-tests and not called directly.
+         */
+        LockResult lockBegin(ResourceId resId, LockMode mode);
+
+        /**
+         * Waits for the completion of a lock, previously requested through lockBegin or
+         * lockGlobalBegin. Must only be called, if lockBegin returned LOCK_WAITING.
+         *
+         * @param resId Resource id which was passed to an earlier lockBegin call. Must match.
+         * @param mode Mode which was passed to an earlier lockBegin call. Must match.
+         * @param timeoutMs How long to wait for the lock acquisition to complete.
+         * @param checkDeadlock whether to perform deadlock detection while waiting.
+         */
+        LockResult lockComplete(ResourceId resId,
+                                LockMode mode,
+                                unsigned timeoutMs,
+                                bool checkDeadlock);
+
     private:
+
+        friend class AutoYieldFlushLockForMMAPV1Commit;
 
         typedef FastMapNoAlloc<ResourceId, LockRequest, 16> LockRequestsMap;
 
@@ -129,15 +181,15 @@ namespace mongo {
         bool _unlockImpl(LockRequestsMap::Iterator& it);
 
         /**
-         * Temporarily yields the flush lock, if not in a write unit of work so that the commit
-         * thread can take turn. This is called automatically at each lock acquisition point, but
-         * can also be called more frequently than that if need be.
+         * MMAP V1 locking code yields and re-acquires the flush lock occasionally in order to
+         * allow the flush thread proceed. This call returns in what mode the flush lock should be
+         * acquired. It is based on the type of the operation (IS for readers, IX for writers).
          */
-        void _yieldFlushLockForMMAPV1();
+        LockMode _getModeForMMAPV1FlushLock() const;
 
 
         // Used to disambiguate different lockers
-        const uint64_t _id;
+        const LockerId _id;
 
         // The only reason we have this spin lock here is for the diagnostic tools, which could
         // iterate through the LockRequestsMap on a separate thread and need it to be stable.
@@ -150,6 +202,14 @@ namespace mongo {
         // Reuse the notification object across requests so we don't have to create a new mutex
         // and condition variable every time.
         CondVarLockGrantNotification _notify;
+
+        // Timer for measuring duration and timeouts. This value is set when lock acquisition is
+        // about to wait and is sampled at grant time.
+        uint64_t _requestStartTime;
+
+        // Per-locker locking statistics. Reported in the slow-query log message and through
+        // db.currentOp. Complementary to the per-instance locking statistics.
+        SingleThreadedLockStats _stats;
 
         // Delays release of exclusive/intent-exclusive locked resources until the write unit of
         // work completes. Value of 0 means we are not inside a write unit of work.
@@ -167,38 +227,16 @@ namespace mongo {
 
         virtual void dump() const;
 
-        virtual BSONObj reportState();
-        virtual void reportState(BSONObjBuilder* b);
-
-        virtual unsigned recursiveCount() const { return _recursive; }
-
         virtual bool isW() const;
         virtual bool isR() const;
-        virtual bool hasAnyReadLock() const;
 
         virtual bool isLocked() const;
         virtual bool isWriteLocked() const;
-        virtual bool isWriteLocked(const StringData& ns) const;
-        virtual bool isDbLockedForMode(const StringData& dbName, LockMode mode) const;
-        virtual bool isAtLeastReadLocked(const StringData& ns) const;
-        virtual bool isRecursive() const;
+        virtual bool isReadLocked() const;
 
-        virtual void assertWriteLocked(const StringData& ns) const;
+        virtual void assertEmptyAndReset();
 
-        /** 
-         * Pending means we are currently trying to get a lock.
-         */
-        virtual bool hasLockPending() const { return _lockPending || _lockPendingParallelWriter; }
-
-        // ----
-
-        // Those are only used for TempRelease. Eventually they should be removed.
-        virtual void enterScopedLock(Lock::ScopedLock* lock);
-        virtual Lock::ScopedLock* getCurrentScopedLock() const;
-        virtual void leaveScopedLock(Lock::ScopedLock* lock);
-
-        virtual void recordLockTime() { _scopedLk->recordTime(); }
-        virtual void resetLockTime() { _scopedLk->resetTime(); }
+        virtual bool hasLockPending() const { return getWaitingResource().isValid() || _lockPendingParallelWriter; }
 
         virtual void setIsBatchWriter(bool newValue) { _batchWriter = newValue; }
         virtual bool isBatchWriter() const { return _batchWriter; }
@@ -206,34 +244,24 @@ namespace mongo {
             _lockPendingParallelWriter = newValue;
         }
 
+        virtual bool hasStrongLocks() const;
+
     private:
-        /**
-         * Indicates the mode of acquisition of the GlobalLock by this particular thread. The
-         * return values are '0' (no global lock is held), 'r', 'w', 'R', 'W'.
-         */
-        char threadState() const;
 
         bool _batchWriter;
         bool _lockPendingParallelWriter;
-
-        unsigned _recursive;           // we allow recursively asking for a lock; we track that here
-
-        // for temprelease
-        // for the nonrecursive case. otherwise there would be many
-        // the first lock goes here, which is ok since we can't yield recursive locks
-        Lock::ScopedLock* _scopedLk;
-
-        bool _lockPending;
     };
+
+    typedef LockerImpl<false> DefaultLockerImpl;
+    typedef LockerImpl<true> MMAPV1LockerImpl;
 
 
     /**
-     * At the end of a write transaction, we cannot release any of the exclusive locks before the
-     * data which was written as part of the transaction is at least journaled. This is done by the
-     * flush thread (dur.cpp). However, the flush thread cannot take turn while we are holding the
-     * flush lock. This class releases *only* the flush lock, while in scope so that the flush
-     * thread can run. It then re-acquires the flush lock in the original mode in which it was
-     * acquired.
+     * At global synchronization points, such as drop database we are running under a global
+     * exclusive lock and without an active write unit of work, doing changes which require global
+     * commit. This utility allows the flush lock to be temporarily dropped so the flush thread
+     * could run in such circumstances. Should not be used where write units of work are used,
+     * because these have different mechanism of yielding the flush lock.
      */
     class AutoYieldFlushLockForMMAPV1Commit {
     public:
@@ -241,15 +269,14 @@ namespace mongo {
         ~AutoYieldFlushLockForMMAPV1Commit();
 
     private:
-        Locker* _locker;
+        MMAPV1LockerImpl* const _locker;
     };
 
 
     /**
-     * The resourceIdMMAPV1Flush lock is used to implement the MMAP V1 storage engine durability
-     * system synchronization. This is how it works :
+     * This explains how the MMAP V1 durability system is implemented.
      *
-     * Every server operation (OperationContext), which calls lockGlobal as the first locking
+     * Every server operation (OperationContext), must call Locker::lockGlobal as the first lock
      * action (it is illegal to acquire any other locks without calling this first). This action
      * acquires the global and flush locks in the appropriate modes (IS for read operations, IX
      * for write operations). Having the flush lock in one of these modes indicates to the flush
@@ -257,24 +284,37 @@ namespace mongo {
      *
      * Whenever the flush thread(dur.cpp) activates, it goes through the following steps :
      *
-     *  - Acquire the flush lock in S - mode by creating a stack instance of
-     *      AutoAcquireFlushLockForMMAPV1Commit. This waits till all write activity on the system
-     *      completes and does not allow new write operations to start. Readers may still proceed.
+     * Acquire the flush lock in S mode using AutoAcquireFlushLockForMMAPV1Commit. This waits until
+     * all current write activity on the system completes and does not allow any new operations to
+     * start.
      *
-     * - Once the flush lock is granted in S - mode, the flush thread writes the journal entries
-     *      to disk and applies them to the shared view. After that, it upgrades the S - lock to X
-     *      and remaps the private view.
+     * Once the S lock is granted, the flush thread writes the journal entries to disk (it is
+     * guaranteed that there will not be any modifications) and applies them to the shared view.
      *
-     * NOTE: There should be only one usage of this class and this should be in dur.cpp.
+     * After that, it upgrades the S lock to X and remaps the private view.
      *
+     * NOTE: There should be only one usage of this class and this should be in dur.cpp
      */
     class AutoAcquireFlushLockForMMAPV1Commit {
     public:
-        explicit AutoAcquireFlushLockForMMAPV1Commit(Locker* locker);
+        AutoAcquireFlushLockForMMAPV1Commit(Locker* locker);
         ~AutoAcquireFlushLockForMMAPV1Commit();
 
+        /**
+         * We need the exclusive lock in order to do the shared view remap.
+         */
+        void upgradeFlushLockToExclusive();
+
+        /**
+         * Allows the acquired flush lock to be prematurely released. This is helpful for the case
+         * where we know that we won't be doing a remap after gathering the write intents, so the
+         * rest can be done outside of flush lock.
+         */
+        void release();
+
     private:
-        Locker* _locker;
+        Locker* const _locker;
+        bool _released;
     };
 
 

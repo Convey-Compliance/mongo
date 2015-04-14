@@ -28,6 +28,7 @@
 /**
  * Unit tests of the AuthorizationSession type.
  */
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
@@ -45,6 +46,8 @@
 
 namespace mongo {
 namespace {
+
+    using boost::scoped_ptr;
 
     class FailureCapableAuthzManagerExternalStateMock :
         public AuthzManagerExternalStateMock {
@@ -84,7 +87,8 @@ namespace {
             managerState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
             authzManager.reset(new AuthorizationManager(managerState));
             sessionState = new AuthzSessionExternalStateMock(authzManager.get());
-            authzSession.reset(new AuthorizationSession(sessionState));
+            authzSession.reset(new AuthorizationSession(
+                                       std::unique_ptr<AuthzSessionExternalState>(sessionState)));
             authzManager->setAuthEnabled(true);
         }
     };

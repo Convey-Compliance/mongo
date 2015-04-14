@@ -30,11 +30,12 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <set>
 
 #include "mongo/db/fts/fts_index_format.h"
+#include "mongo/db/fts/fts_spec.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/unittest/unittest.h"

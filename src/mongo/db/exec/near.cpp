@@ -30,10 +30,13 @@
 
 #include "mongo/db/exec/near.h"
 
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
+
+    using std::vector;
 
     NearStage::NearStage(OperationContext* txn,
                          WorkingSet* workingSet,
@@ -42,7 +45,7 @@ namespace mongo {
         : _txn(txn),
           _workingSet(workingSet),
           _collection(collection),
-          _searchState(SearchState_Buffering),
+          _searchState(SearchState_Initializing),
           _stats(stats),
           _nextInterval(NULL) {
 
@@ -68,9 +71,26 @@ namespace mongo {
         inclusiveMax(inclusiveMax) {
     }
 
+
+    PlanStage::StageState NearStage::initNext(WorkingSetID* out) {
+        PlanStage::StageState state = initialize(_txn, _workingSet, _collection, out);
+        if (state == PlanStage::IS_EOF) {
+            _searchState = SearchState_Buffering;
+            return PlanStage::NEED_TIME;
+        }
+
+        invariant(state != PlanStage::ADVANCED);
+
+        // Propagate NEED_TIME or errors upward.
+        return state;
+    }
+
     PlanStage::StageState NearStage::work(WorkingSetID* out) {
 
         ++_stats->common.works;
+
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_stats->common.executionTimeMillis);
 
         WorkingSetID toReturn = WorkingSet::INVALID_ID;
         Status error = Status::OK();
@@ -80,8 +100,11 @@ namespace mongo {
         // Work the search
         //
 
-        if (SearchState_Buffering == _searchState) {
-            nextState = bufferNext(&error);
+        if (SearchState_Initializing == _searchState) {
+            nextState = initNext(&toReturn);
+        }
+        else if (SearchState_Buffering == _searchState) {
+            nextState = bufferNext(&toReturn, &error);
         }
         else if (SearchState_Advancing == _searchState) {
             nextState = advanceNext(&toReturn);
@@ -101,6 +124,10 @@ namespace mongo {
         else if (PlanStage::ADVANCED == nextState) {
             *out = toReturn;
             ++_stats->common.advanced;
+        }
+        else if (PlanStage::NEED_YIELD == nextState) {
+            *out = toReturn;
+            ++_stats->common.needYield;
         }
         else if (PlanStage::NEED_TIME == nextState) {
             ++_stats->common.needTime;
@@ -130,7 +157,8 @@ namespace mongo {
         double distance;
     };
 
-    PlanStage::StageState NearStage::bufferNext(Status* error) {
+    // Set "toReturn" when NEED_YIELD.
+    PlanStage::StageState NearStage::bufferNext(WorkingSetID* toReturn, Status* error) {
 
         //
         // Try to retrieve the next covered member
@@ -156,6 +184,9 @@ namespace mongo {
             _childrenIntervals.push_back(intervalStatus.getValue());
             _nextInterval = _childrenIntervals.back();
             _nextIntervalStats.reset(new IntervalStats());
+            _nextIntervalStats->minDistanceAllowed = _nextInterval->minDistance;
+            _nextIntervalStats->maxDistanceAllowed = _nextInterval->maxDistance;
+            _nextIntervalStats->inclusiveMaxDistanceAllowed = _nextInterval->inclusiveMax;
         }
 
         WorkingSetID nextMemberID;
@@ -163,13 +194,15 @@ namespace mongo {
 
         if (PlanStage::IS_EOF == intervalState) {
             _nextInterval = NULL;
-            _nextIntervalSeen.clear();
-
             _searchState = SearchState_Advancing;
             return PlanStage::NEED_TIME;
         }
         else if (PlanStage::FAILURE == intervalState) {
             *error = WorkingSetCommon::getMemberStatus(*_workingSet->get(nextMemberID));
+            return intervalState;
+        }
+        else if (PlanStage::NEED_YIELD == intervalState) {
+            *toReturn = nextMemberID;
             return intervalState;
         }
         else if (PlanStage::ADVANCED != intervalState) {
@@ -184,17 +217,19 @@ namespace mongo {
 
         // The child stage may not dedup so we must dedup them ourselves.
         if (_nextInterval->dedupCovering && nextMember->hasLoc()) {
-            if (_nextIntervalSeen.end() != _nextIntervalSeen.find(nextMember->loc))
+            if (_nextIntervalSeen.end() != _nextIntervalSeen.find(nextMember->loc)) {
+                _workingSet->free(nextMemberID);
                 return PlanStage::NEED_TIME;
+            }
         }
 
         ++_nextIntervalStats->numResultsFound;
 
         StatusWith<double> distanceStatus = computeDistance(nextMember);
 
-        // Store the member's DiskLoc, if available, for quick invalidation
+        // Store the member's RecordId, if available, for quick invalidation
         if (nextMember->hasLoc()) {
-            _nextIntervalSeen.insert(make_pair(nextMember->loc, nextMemberID));
+            _nextIntervalSeen.insert(std::make_pair(nextMember->loc, nextMemberID));
         }
 
         if (!distanceStatus.isOK()) {
@@ -240,6 +275,9 @@ namespace mongo {
         }
         else {
             // We won't pass this WSM up, so deallocate it
+            if (nextMember->hasLoc()) {
+                _nextIntervalSeen.erase(nextMember->loc);
+            }
             _workingSet->free(nextMemberID);
         }
 
@@ -253,12 +291,24 @@ namespace mongo {
             getNearStats()->intervalStats.push_back(*_nextIntervalStats);
             _nextIntervalStats.reset();
 
+            // We're done returning the documents buffered for this annulus, so we can
+            // clear out our buffered RecordIds.
+            _nextIntervalSeen.clear();
+
             _searchState = SearchState_Buffering;
             return PlanStage::NEED_TIME;
         }
 
         *toReturn = _resultBuffer.top().resultID;
         _resultBuffer.pop();
+
+        // If we're returning something, take it out of our RecordId -> WSID map so that future
+        // calls to invalidate don't cause us to take action for a RecordId we're done with.
+        WorkingSetMember* member = _workingSet->get(*toReturn);
+        if (member->hasLoc()) {
+            _nextIntervalSeen.erase(member->loc);
+        }
+
         return PlanStage::ADVANCED;
     }
 
@@ -267,41 +317,53 @@ namespace mongo {
     }
 
     void NearStage::saveState() {
+        _txn = NULL;
         ++_stats->common.yields;
         for (size_t i = 0; i < _childrenIntervals.size(); i++) {
             _childrenIntervals[i]->covering->saveState();
         }
+
+        // Subclass specific saving, e.g. saving the 2d or 2dsphere density estimator.
+        finishSaveState();
     }
 
     void NearStage::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
         _txn = opCtx;
         ++_stats->common.unyields;
         for (size_t i = 0; i < _childrenIntervals.size(); i++) {
             _childrenIntervals[i]->covering->restoreState(opCtx);
         }
+
+        // Subclass specific restoring, e.g. restoring the 2d or 2dsphere density estimator.
+        finishRestoreState(opCtx);
     }
 
-    void NearStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void NearStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_stats->common.invalidates;
         for (size_t i = 0; i < _childrenIntervals.size(); i++) {
-            _childrenIntervals[i]->covering->invalidate(dl, type);
+            _childrenIntervals[i]->covering->invalidate(txn, dl, type);
         }
 
-        // If a result is in _resultBuffer and has a DiskLoc it will be in _nextIntervalSeen as
-        // well. It's safe to return the result w/o the DiskLoc, so just fetch the result.
-        unordered_map<DiskLoc, WorkingSetID, DiskLoc::Hasher>::iterator seenIt = _nextIntervalSeen
+        // If a result is in _resultBuffer and has a RecordId it will be in _nextIntervalSeen as
+        // well. It's safe to return the result w/o the RecordId, so just fetch the result.
+        unordered_map<RecordId, WorkingSetID, RecordId::Hasher>::iterator seenIt = _nextIntervalSeen
             .find(dl);
 
         if (seenIt != _nextIntervalSeen.end()) {
 
             WorkingSetMember* member = _workingSet->get(seenIt->second);
             verify(member->hasLoc());
-            WorkingSetCommon::fetchAndInvalidateLoc(_txn, member, _collection);
+            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
             verify(!member->hasLoc());
 
-            // Don't keep it around in the seen map since there's no valid DiskLoc anymore
+            // Don't keep it around in the seen map since there's no valid RecordId anymore
             _nextIntervalSeen.erase(seenIt);
         }
+
+        // Subclass specific invalidation, e.g. passing the invalidation to the 2d or 2dsphere
+        // density estimator.
+        finishInvalidate(txn, dl, type);
     }
 
     vector<PlanStage*> NearStage::getChildren() const {

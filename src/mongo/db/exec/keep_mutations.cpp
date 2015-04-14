@@ -33,6 +33,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* KeepMutationsStage::kStageType = "KEEP_MUTATIONS";
 
@@ -73,18 +76,27 @@ namespace mongo {
                 else if (PlanStage::NEED_TIME == status) {
                     ++_commonStats.needTime;
                 }
+                else if (PlanStage::NEED_YIELD == status) {
+                    ++_commonStats.needYield;
+                }
 
                 return status;
             }
 
             // Child is EOF.  We want to stream flagged results if there are any.
             _doneReadingChild = true;
-            _flaggedIterator = _workingSet->getFlagged().begin();
+
+            // Read out all of the flagged results from the working set.  We can't iterate through
+            // the working set's flagged result set directly, since it may be modified later if
+            // further documents are invalidated during a yield.
+            std::copy(_workingSet->getFlagged().begin(), _workingSet->getFlagged().end(),
+                      std::back_inserter(_flagged));
+            _flaggedIterator = _flagged.begin();
         }
 
         // We're streaming flagged results.
         invariant(!_doneReturningFlagged);
-        if (_flaggedIterator == _workingSet->getFlagged().end()) {
+        if (_flaggedIterator == _flagged.end()) {
             _doneReturningFlagged = true;
             return PlanStage::IS_EOF;
         }
@@ -115,9 +127,11 @@ namespace mongo {
         _child->restoreState(opCtx);
     }
 
-    void KeepMutationsStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void KeepMutationsStage::invalidate(OperationContext* txn,
+                                        const RecordId& dl,
+                                        InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
     }
 
     vector<PlanStage*> KeepMutationsStage::getChildren() const {

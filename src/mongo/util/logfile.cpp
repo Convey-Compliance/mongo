@@ -28,9 +28,9 @@
 *    then also delete it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/util/logfile.h"
 
@@ -45,33 +45,8 @@
 
 using namespace mongoutils;
 
-namespace mongo {
-    struct LogfileTest : public StartupTest {
-        LogfileTest() { }
-        void run() {
-            if( 0 && debug ) {
-                try {
-                    LogFile f("logfile_test");
-                    void *p = mongoMalloc(16384);
-                    char *buf = (char*) p;
-                    buf += 4095;
-                    buf = (char*) (((size_t)buf)&(~0xfff));
-                    memset(buf, 'z', 8192);
-                    buf[8190] = '\n';
-                    buf[8191] = 'B';
-                    buf[0] = 'A';
-                    f.synchronousAppend(buf, 8192);
-                    f.synchronousAppend(buf, 8192);
-                    free(p);
-                }
-                catch(DBException& e ) {
-                    log() << "logfile.cpp test failed : " << e.what() << endl;
-                    throw;
-                }
-            }
-        }
-    } __test;
-}
+using std::endl;
+using std::string;
 
 #if defined(_WIN32)
 
@@ -137,7 +112,7 @@ namespace mongo {
         const char *buf = (const char *) _buf;
         size_t left = _len;
         while( left ) {
-            size_t toWrite = min(left, BlockSize);
+            size_t toWrite = std::min(left, BlockSize);
             DWORD written;
             if( !WriteFile(_fd, buf, toWrite, &written, NULL) ) {
                 DWORD e = GetLastError();

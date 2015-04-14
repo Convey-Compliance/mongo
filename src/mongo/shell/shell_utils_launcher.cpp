@@ -29,13 +29,15 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/shell/shell_utils_launcher.h"
 
+#include <boost/scoped_array.hpp>
 #include <boost/thread/thread.hpp>
 #include <iostream>
 #include <map>
+#include <signal.h>
 #include <vector>
 
 #ifdef _WIN32
@@ -50,7 +52,6 @@
 # include <sys/wait.h>
 #endif
 
-#include "mongo/client/clientOnly-private.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_utils.h"
@@ -60,6 +61,16 @@
 #include "mongo/util/signal_win32.h"
 
 namespace mongo {
+
+    using boost::scoped_array;
+    using std::cout;
+    using std::endl;
+    using std::make_pair;
+    using std::map;
+    using std::pair;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     extern bool dbexitCalled;
 
@@ -80,18 +91,18 @@ namespace mongo {
         ProgramOutputMultiplexer programOutputLogger;
 
         bool ProgramRegistry::isPortRegistered( int port ) const {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             return _ports.count( port ) == 1;
         }
         
         ProcessId ProgramRegistry::pidForPort( int port ) const {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             verify( isPortRegistered( port ) );
             return _ports.find( port )->second.first;
         }
         
         int ProgramRegistry::portForPid(ProcessId pid) const {
-            boost::recursive_mutex::scoped_lock lk(_mutex);
+            boost::lock_guard<boost::recursive_mutex> lk(_mutex);
             for (map<int, pair<ProcessId, int> >::const_iterator it = _ports.begin();
                     it != _ports.end(); ++it)
             {
@@ -102,13 +113,13 @@ namespace mongo {
         }
 
         void ProgramRegistry::registerPort( int port, ProcessId pid, int output ) {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             verify( !isPortRegistered( port ) );
             _ports.insert( make_pair( port, make_pair( pid, output ) ) );
         }
         
         void ProgramRegistry::deletePort( int port ) {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             if ( !isPortRegistered( port ) ) {
                 return;
             }
@@ -117,7 +128,7 @@ namespace mongo {
         }
         
         void ProgramRegistry::getRegisteredPorts( vector<int> &ports ) {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             for( map<int,pair<ProcessId,int> >::const_iterator i = _ports.begin(); i != _ports.end();
                 ++i ) {
                 ports.push_back( i->first );
@@ -125,18 +136,18 @@ namespace mongo {
         }
         
         bool ProgramRegistry::isPidRegistered( ProcessId pid ) const {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             return _pids.count( pid ) == 1;
         }
         
         void ProgramRegistry::registerPid( ProcessId pid, int output ) {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             verify( !isPidRegistered( pid ) );
             _pids.insert( make_pair( pid, output ) );
         }
         
         void ProgramRegistry::deletePid(ProcessId pid) {
-            boost::recursive_mutex::scoped_lock lk(_mutex);
+            boost::lock_guard<boost::recursive_mutex> lk(_mutex);
             if (!isPidRegistered(pid)) {
                 int port = portForPid(pid);
                 if (port < 0) return;
@@ -148,7 +159,7 @@ namespace mongo {
         }
         
         void ProgramRegistry::getRegisteredPids( vector<ProcessId> &pids ) {
-            boost::recursive_mutex::scoped_lock lk( _mutex );
+            boost::lock_guard<boost::recursive_mutex> lk( _mutex );
             for( map<ProcessId,int>::const_iterator i = _pids.begin(); i != _pids.end(); ++i ) {
                 pids.push_back( i->first );
             }
@@ -157,12 +168,12 @@ namespace mongo {
         ProgramRegistry &registry = *( new ProgramRegistry() );
 
         void goingAwaySoon() {
-            mongo::mutex::scoped_lock lk( mongoProgramOutputMutex );
+            boost::lock_guard<boost::mutex> lk( mongoProgramOutputMutex );
             mongo::dbexitCalled = true;
         }
 
         void ProgramOutputMultiplexer::appendLine( int port, ProcessId pid, const char *line ) {
-            mongo::mutex::scoped_lock lk( mongoProgramOutputMutex );
+            boost::lock_guard<boost::mutex> lk( mongoProgramOutputMutex );
             if( mongo::dbexitCalled ) throw "program is terminating";
             stringstream buf;
             if ( port > 0 )
@@ -175,7 +186,7 @@ namespace mongo {
         }
 
         string ProgramOutputMultiplexer::str() const {
-            mongo::mutex::scoped_lock lk( mongoProgramOutputMutex );
+            boost::lock_guard<boost::mutex> lk( mongoProgramOutputMutex );
             string ret = _buffer.str();
             size_t len = ret.length();
             if ( len > 100000 ) {
@@ -185,7 +196,7 @@ namespace mongo {
         }
         
         void ProgramOutputMultiplexer::clear() {
-            mongo::mutex::scoped_lock lk( mongoProgramOutputMutex );
+            boost::lock_guard<boost::mutex> lk( mongoProgramOutputMutex );
             _buffer.str( "" );            
         }
         
@@ -271,9 +282,10 @@ namespace mongo {
 
             {
                 stringstream ss;
-                ss << "shell: started program";
-                for (unsigned i=0; i < _argv.size(); i++)
+                ss << "shell: started program (sh" << _pid << "): ";
+                for (unsigned i = 0; i < _argv.size(); i++) {
                     ss << " " << _argv[i];
+                }
                 log() << ss.str() << endl;
             }
 
@@ -444,8 +456,6 @@ namespace mongo {
             env[0] = NULL;
             env[1] = NULL;
 
-            bool isMongos = ( _argv[0].find( "mongos" ) != string::npos );
-
             pid_t nativePid = fork();
             _pid = ProcessId::fromNative(nativePid);
             // Async signal unsafe functions should not be called in the child process.
@@ -460,18 +470,6 @@ namespace mongo {
                     // Async signal unsafe code reporting a terminal error condition.
                     cout << "Unable to dup2 child output: " << errnoWithDescription() << endl;
                     quickExit(-1); //do not pass go, do not call atexit handlers
-                }
-
-                // Heap-check for mongos only. 'argv[0]' must be in the path format.
-                if ( isMongos ) {
-#if defined(HEAP_CHECKING)
-                    env[0] = "HEAPCHECK=normal";
-                    env[1] = NULL;
-
-                    // NOTE execve is async signal safe, but it is not clear that execvpe is async
-                    // signal safe.
-                    execvpe( argv[ 0 ], const_cast<char**>(argv) , const_cast<char**>(env) );
-#endif // HEAP_CHECKING
                 }
 
                 // NOTE execve is async signal safe, but it is not clear that execvp is async
@@ -543,9 +541,10 @@ namespace mongo {
 
         BSONObj WaitProgram( const BSONObj& a, void* data ) {
             ProcessId pid = ProcessId::fromNative(singleArg( a ).numberInt());
-            BSONObj x = BSON( "" << wait_for_pid( pid ) );
+            int exit_code = -123456; // sentinel value
+            wait_for_pid( pid, true, &exit_code );
             registry.deletePid( pid );
-            return x;
+            return BSON( string("") << exit_code);
         }
 
         BSONObj StartMongoProgram( const BSONObj &a, void* data ) {
@@ -604,7 +603,7 @@ namespace mongo {
             boost::filesystem::directory_iterator i( from );
             while( i != end ) {
                 boost::filesystem::path p = *i;
-                if ( p.leaf() != "mongod.lock" ) {
+                if ( p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock" ) {
                     if ( boost::filesystem::is_directory( p ) ) {
                         boost::filesystem::path newDir = to / p.leaf();
                         boost::filesystem::create_directory( newDir );
@@ -832,8 +831,7 @@ namespace mongo {
             scope.injectNative( "runProgram", RunProgram );
             scope.injectNative( "run", RunProgram );
             scope.injectNative( "_runMongoProgram", RunMongoProgram );
-            scope.injectNative( "stopMongod", StopMongoProgram );
-            scope.injectNative( "stopMongoProgram", StopMongoProgram );
+            scope.injectNative( "_stopMongoProgram", StopMongoProgram );
             scope.injectNative( "stopMongoProgramByPid", StopMongoProgramByPid );
             scope.injectNative( "rawMongoProgramOutput", RawMongoProgramOutput );
             scope.injectNative( "clearRawMongoProgramOutput", ClearRawMongoProgramOutput );

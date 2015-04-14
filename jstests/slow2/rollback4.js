@@ -8,12 +8,16 @@ var nodes = replTest.nodeList();
 
 var conns = replTest.startSet();
 var r = replTest.initiate({ "_id": "unicomplex",
-                          "members": [
-                                      { "_id": 0, "host": nodes[0], priority: 2 },
-                                      { "_id": 1, "host": nodes[1] },
-                                      { "_id": 2, "host": nodes[2], arbiterOnly: true}]
+                            "settings": {
+                                "heartbeatTimeoutSecs":30
+                            },
+                            "members": [
+                                { "_id": 0, "host": nodes[0], priority: 2 },
+                                { "_id": 1, "host": nodes[1] },
+                                { "_id": 2, "host": nodes[2], arbiterOnly: true}]
                           }, 'replSetInitiate', 600000);
 
+replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
 // Make sure we have a master
 var master = replTest.getMaster();
 var b_conn = conns[1];
@@ -40,8 +44,13 @@ replTest.stop( 0 );
 // Wait for slave to take over
 // This can take a while if the secondary has queued up many writes in its
 // buffer, since it needs to flush those out before it can assume the primaryship.
+//
+// In the legacy replication implementation (through 2.7.7), this waiting takes place before the
+// node reports that it is primary, while in the refactored implementation (2.7.8+) it takes place
+// after the node reports that it is primary via heartbeats, but before ismaster indicates that the
+// node will accept writes.
 replTest.waitForState(conns[1], replTest.PRIMARY, 5 * 60 * 1000);
-master = replTest.getMaster();
+master = replTest.getMaster(5 * 60 * 1000);
 
 // Save to new master, forcing rollback of old master
 master.getDB( 'db' ).c.save( big );

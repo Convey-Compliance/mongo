@@ -28,22 +28,29 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_context.h"
+#include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/repl/oplog.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::stringstream;
 
     /* For testing only, not for general use. Enabled via command-line */
     class GodInsert : public Command {
@@ -66,11 +73,14 @@ namespace mongo {
             string ns = dbname + "." + coll;
             BSONObj obj = cmdObj[ "obj" ].embeddedObjectUserCheck();
 
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), dbname, MODE_X);
-            WriteUnitOfWork wunit(txn);
-            Client::Context ctx(txn,  ns );
+            OldClientContext ctx(txn,  ns );
             Database* db = ctx.db();
-            Collection* collection = db->getCollection( txn, ns );
+
+            WriteUnitOfWork wunit(txn);
+            txn->setReplicatedWrites(false);
+            Collection* collection = db->getCollection( ns );
             if ( !collection ) {
                 collection = db->createCollection( txn, ns );
                 if ( !collection ) {
@@ -78,7 +88,7 @@ namespace mongo {
                     return false;
                 }
             }
-            StatusWith<DiskLoc> res = collection->insertDocument( txn, obj, false );
+            StatusWith<RecordId> res = collection->insertDocument( txn, obj, false );
             Status status = res.getStatus();
             if (status.isOK()) {
                 wunit.commit();
@@ -117,10 +127,12 @@ namespace mongo {
             }
 
             if(cmdObj.getBoolField("w")) {
+                ScopedTransaction transaction(txn, MODE_X);
                 Lock::GlobalWrite lk(txn->lockState());
                 sleepmillis(millis);
             }
             else {
+                ScopedTransaction transaction(txn, MODE_S);
                 Lock::GlobalRead lk(txn->lockState());
                 sleepmillis(millis);
             }
@@ -149,11 +161,11 @@ namespace mongo {
             int n = cmdObj.getIntField( "n" );
             bool inc = cmdObj.getBoolField( "inc" ); // inclusive range?
 
-            Client::WriteContext ctx(txn,  nss.ns() );
+            OldClientWriteContext ctx(txn,  nss.ns() );
             Collection* collection = ctx.getCollection();
             massert( 13417, "captrunc collection not found or empty", collection);
 
-            DiskLoc end;
+            RecordId end;
             {
                 boost::scoped_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn,
                                                                                      nss.ns(),
@@ -184,41 +196,18 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {}
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db, 
-                                                     const BSONObj& cmdObj) {
-            std::string coll = cmdObj[ "emptycapped" ].valuestrsafe();
-            std::string ns = db->name() + '.' + coll;
+        virtual bool run(OperationContext* txn,
+                         const string& dbname,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
 
-            IndexCatalog::IndexKillCriteria criteria;
-            criteria.ns = ns;
-            return IndexBuilder::killMatchingIndexBuilds(db->getCollection(opCtx, ns), criteria);
+            return appendCommandStatus(result, emptyCapped(txn, NamespaceString(ns)));
         }
 
-        virtual bool run(OperationContext* txn, const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            string coll = cmdObj[ "emptycapped" ].valuestrsafe();
-            uassert( 13428, "emptycapped must specify a collection", !coll.empty() );
-            NamespaceString nss( dbname, coll );
-
-            Client::WriteContext ctx(txn,  nss.ns() );
-            WriteUnitOfWork wuow(txn);
-            Database* db = ctx.db();
-            Collection* collection = ctx.getCollection();
-            massert( 13429, "emptycapped no such collection", collection );
-
-            std::vector<BSONObj> indexes = stopIndexBuilds(txn, db, cmdObj);
-
-            Status status = collection->truncate(txn);
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            IndexBuilder::restoreIndexes(indexes);
-
-            if (!fromRepl)
-                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), cmdObj);
-            wuow.commit();
-            return true;
-        }
     };
 
     // ----------------------------

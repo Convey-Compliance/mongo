@@ -34,7 +34,7 @@
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/ordering.h"
-#include "mongo/db/diskloc.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -43,19 +43,20 @@ namespace mongo {
     class HeadManager;
     class IndexAccessMethod;
     class IndexDescriptor;
+    class MatchExpression;
     class OperationContext;
 
     class IndexCatalogEntry {
         MONGO_DISALLOW_COPYING( IndexCatalogEntry );
     public:
-        IndexCatalogEntry( const StringData& ns,
+        IndexCatalogEntry( StringData ns,
                            CollectionCatalogEntry* collection, // not owned
                            IndexDescriptor* descriptor, // ownership passes to me
                            CollectionInfoCache* infoCache ); // not owned, optional
 
         ~IndexCatalogEntry();
 
-        const string& ns() const { return _ns; }
+        const std::string& ns() const { return _ns; }
 
         void init( OperationContext* txn,
                    IndexAccessMethod* accessMethod );
@@ -68,11 +69,13 @@ namespace mongo {
 
         const Ordering& ordering() const { return _ordering; }
 
+        const MatchExpression* getFilterExpression() const { return _filterExpression.get(); }
+
         /// ---------------------
 
-        const DiskLoc& head( OperationContext* txn ) const;
+        const RecordId& head( OperationContext* txn ) const;
 
-        void setHead( OperationContext* txn, DiskLoc newHead );
+        void setHead( OperationContext* txn, RecordId newHead );
 
         void setIsReady( bool newIsReady );
 
@@ -80,7 +83,7 @@ namespace mongo {
 
         // --
 
-        bool isMultikey( OperationContext* txn ) const;
+        bool isMultikey() const;
 
         void setMultikey( OperationContext* txn );
 
@@ -89,13 +92,16 @@ namespace mongo {
 
     private:
 
+        class SetMultikeyChange;
+        class SetHeadChange;
+
         bool _catalogIsReady( OperationContext* txn ) const;
-        DiskLoc _catalogHead( OperationContext* txn ) const;
+        RecordId _catalogHead( OperationContext* txn ) const;
         bool _catalogIsMultikey( OperationContext* txn ) const;
 
         // -----
 
-        string _ns;
+        std::string _ns;
 
         CollectionCatalogEntry* _collection; // not owned here
 
@@ -107,12 +113,13 @@ namespace mongo {
 
         // Owned here.
         HeadManager* _headManager;
+        boost::scoped_ptr<MatchExpression> _filterExpression;
 
         // cached stuff
 
         Ordering _ordering; // TODO: this might be b-tree specific
         bool _isReady; // cache of NamespaceDetails info
-        DiskLoc _head; // cache of IndexDetails
+        RecordId _head; // cache of IndexDetails
         bool _isMultikey; // cache of NamespaceDetails info
     };
 
@@ -139,7 +146,16 @@ namespace mongo {
         unsigned size() const { return _entries.size(); }
         // -----------------
 
-        bool remove( const IndexDescriptor* desc );
+        /**
+         * Removes from _entries and returns the matching entry or NULL if none matches.
+         */
+        IndexCatalogEntry* release( const IndexDescriptor* desc );
+
+        bool remove( const IndexDescriptor* desc ) {
+            IndexCatalogEntry* entry = release(desc);
+            delete entry;
+            return entry;
+        }
 
         // pass ownership to EntryContainer
         void add( IndexCatalogEntry* entry ) { _entries.mutableVector().push_back( entry ); }

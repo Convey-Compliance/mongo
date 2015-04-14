@@ -32,12 +32,17 @@
 
 #include "mongo/s/balance.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_map.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/chunk.h"
+#include "mongo/s/catalog/catalog_manager.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/config.h"
 #include "mongo/s/config_server_checker_service.h"
@@ -46,11 +51,11 @@
 #include "mongo/s/server.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/type_actionlog.h"
-#include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/s/type_mongos.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_tags.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -58,13 +63,26 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::map;
+    using std::set;
+    using std::string;
+    using std::vector;
+
     MONGO_FP_DECLARE(skipBalanceRound);
 
     Balancer balancer;
 
-    Balancer::Balancer() : _balancedLastTime(0), _policy( new BalancerPolicy() ) {}
+    Balancer::Balancer()
+        : _balancedLastTime(0),
+          _policy(new BalancerPolicy()) {
+
+    }
 
     Balancer::~Balancer() {
+
     }
 
     int Balancer::_moveChunks(const vector<CandidateChunkPtr>* candidateChunks,
@@ -74,11 +92,33 @@ namespace mongo {
         int movedCount = 0;
 
         for ( vector<CandidateChunkPtr>::const_iterator it = candidateChunks->begin(); it != candidateChunks->end(); ++it ) {
-            const CandidateChunk& chunkInfo = *it->get();
 
-            // Changes to metadata, borked metadata, and connectivity problems should cause us to
-            // abort this chunk move, but shouldn't cause us to abort the entire round of chunks.
+            // If the balancer was disabled since we started this round, don't start new
+            // chunks moves.
+            SettingsType balancerConfig;
+            std::string errMsg;
+
+            if (!grid.getBalancerSettings(&balancerConfig, &errMsg)) {
+                warning() << errMsg;
+                // No point in continuing the round if the config servers are unreachable.
+                return movedCount;
+            }
+
+            if ((balancerConfig.isKeySet() && // balancer config doc exists
+                    !grid.shouldBalance(balancerConfig)) ||
+                    MONGO_FAIL_POINT(skipBalanceRound)) {
+                LOG(1) << "Stopping balancing round early as balancing was disabled";
+                return movedCount;
+            }
+
+            // Changes to metadata, borked metadata, and connectivity problems between shards should
+            // cause us to abort this chunk move, but shouldn't cause us to abort the entire round
+            // of chunks.
+            // TODO(spencer): We probably *should* abort the whole round on issues communicating
+            // with the config servers, but its impossible to distinguish those types of failures
+            // at the moment.
             // TODO: Handle all these things more cleanly, since they're expected problems
+            const CandidateChunk& chunkInfo = *it->get();
             try {
 
                 DBConfigPtr cfg = grid.getDBConfig( chunkInfo.ns );
@@ -123,10 +163,10 @@ namespace mongo {
                     verify( cm );
                     c = cm->findIntersectingChunk( chunkInfo.chunk.min );
 
-                    log() << "forcing a split because migrate failed for size reasons" << endl;
+                    log() << "performing a split because migrate failed for size reasons";
 
-                    Status status = c->split(true /* atMedian */, NULL, NULL);
-                    log() << "forced split results: " << status << endl;
+                    Status status = c->split(Chunk::normal, NULL, NULL);
+                    log() << "split results: " << status << endl;
 
                     if ( !status.isOK() ) {
                         log() << "marking chunk as jumbo: " << c->toString() << endl;
@@ -146,17 +186,17 @@ namespace mongo {
         return movedCount;
     }
 
-    void Balancer::_ping( bool waiting ) {
-        clusterUpdate( MongosType::ConfigNS,
-                       BSON( MongosType::name( _myid )),
-                       BSON( "$set" << BSON( MongosType::ping(jsTime()) <<
-                                             MongosType::up(static_cast<int>(time(0)-_started)) <<
-                                             MongosType::waiting(waiting) <<
-                                             MongosType::mongoVersion(versionString) )),
-                       true, // upsert
-                       false, // multi
-                       WriteConcernOptions::Unacknowledged,
-                       NULL );
+    void Balancer::_ping(bool waiting) {
+        grid.catalogManager()->update(
+                        MongosType::ConfigNS,
+                        BSON(MongosType::name(_myid)),
+                        BSON("$set" << BSON(MongosType::ping(jsTime()) <<
+                                            MongosType::up(static_cast<int>(time(0) - _started)) <<
+                                            MongosType::waiting(waiting) <<
+                                            MongosType::mongoVersion(versionString))),
+                        true,
+                        false,
+                        NULL);
     }
 
      /* 
@@ -229,11 +269,9 @@ namespace mongo {
                 createActionlog = true;
             }
 
-            Status result = clusterInsert( ActionLogType::ConfigNS,
-                                           actionLog.toBSON(),
-                                           WriteConcernOptions::AllConfigs,
-                                           NULL );
-
+            Status result = grid.catalogManager()->insert(ActionLogType::ConfigNS,
+                                                          actionLog.toBSON(),
+                                                          NULL);
             if ( !result.isOK() ) {
                 log() << "Error encountered while logging action from balancer "
                       << result.reason();
@@ -345,16 +383,19 @@ namespace mongo {
         // TODO: skip unresponsive shards and mark information as stale.
         //
 
-        vector<Shard> allShards;
-        Shard::getAllShards( allShards );
-        if ( allShards.size() < 2) {
-            LOG(1) << "can't balance without more active shards" << endl;
+        ShardInfoMap shardInfo;
+        Status loadStatus = DistributionStatus::populateShardInfoMap(&shardInfo);
+
+        if (!loadStatus.isOK()) {
+            warning() << "failed to load shard metadata" << causedBy(loadStatus);
+            return;
+        }
+
+        if (shardInfo.size() < 2) {
+            LOG(1) << "can't balance without more active shards";
             return;
         }
         
-        ShardInfoMap shardInfo;
-        DistributionStatus::populateShardInfoMap(allShards, &shardInfo);
-
         OCCASIONALLY warnOnMultiVersion( shardInfo );
 
         //
@@ -373,13 +414,14 @@ namespace mongo {
             while ( cursor->more() ) {
                 BSONObj chunkDoc = cursor->nextSafe().getOwned();
 
-                auto_ptr<ChunkType> chunk(new ChunkType());
-                string errmsg;
-                if (!chunk->parseBSON(chunkDoc, &errmsg)) {
+                StatusWith<ChunkType> chunkRes = ChunkType::fromBSON(chunkDoc);
+                if (!chunkRes.isOK()) {
                     error() << "bad chunk format for " << chunkDoc
-                            << ": " << errmsg << endl;
+                            << ": " << chunkRes.getStatus().reason();
                     return;
                 }
+                auto_ptr<ChunkType> chunk(new ChunkType());
+                chunkRes.getValue().cloneTo(chunk.get());
 
                 allChunkMinimums.insert(chunk->getMin().getOwned());
                 OwnedPointerVector<ChunkType>*& chunkList =
@@ -398,11 +440,10 @@ namespace mongo {
                 continue;
             }
 
-            for ( vector<Shard>::iterator i=allShards.begin(); i!=allShards.end(); ++i ) {
+            for (ShardInfoMap::const_iterator i = shardInfo.begin(); i != shardInfo.end(); ++i) {
                 // this just makes sure there is an entry in shardToChunksMap for every shard
-                Shard s = *i;
                 OwnedPointerVector<ChunkType>*& chunkList =
-                        shardToChunksMap.mutableMap()[s.getName()];
+                        shardToChunksMap.mutableMap()[i->first];
 
                 if (chunkList == NULL) {
                     chunkList = new OwnedPointerVector<ChunkType>();
@@ -410,18 +451,6 @@ namespace mongo {
             }
 
             DistributionStatus status(shardInfo, shardToChunksMap.map());
-
-            // load tags
-            Status result = clusterCreateIndex(TagsType::ConfigNS,
-                                               BSON(TagsType::ns() << 1 << TagsType::min() << 1),
-                                               true, // unique
-                                               WriteConcernOptions::AllConfigs,
-                                               NULL);
-
-            if ( !result.isOK() ) {
-                warning() << "could not create index tags_1_min_1: " << result.reason() << endl;
-                continue;
-            }
 
             cursor = conn.query(TagsType::ConfigNS,
                                 QUERY(TagsType::ns(ns)).sort(TagsType::min()));
@@ -545,7 +574,6 @@ namespace mongo {
         // getConnectioString and dist lock constructor does not throw, which is what we expect on while
         // on the balancer thread
         ConnectionString config = configServer.getConnectionString();
-        DistributedLock balanceLock( config , "balancer" );
 
         while ( ! inShutdown() ) {
 
@@ -597,9 +625,12 @@ namespace mongo {
                 uassert( 13258 , "oids broken after resetting!" , _checkOIDs() );
 
                 {
-                    dist_lock_try lk( &balanceLock , "doing balance round" );
-                    if ( ! lk.got() ) {
-                        LOG(1) << "skipping balancing round because another balancer is active" << endl;
+                    ScopedDistributedLock balancerLock(config, "balancer");
+                    balancerLock.setLockMessage("doing balance round");
+
+                    Status lockStatus = balancerLock.tryAcquire();
+                    if (!lockStatus.isOK()) {
+                        LOG(1) << "skipping balancing round" << causedBy(lockStatus);
 
                         // Ping again so scripts can determine if we're active without waiting
                         _ping( true );
@@ -629,7 +660,7 @@ namespace mongo {
                             writeConcern.reset(extractStatus.getValue());
                         }
                         else {
-                            warning() << extractStatus.toString();
+                            warning() << extractStatus.getStatus().toString();
                         }
                     }
 

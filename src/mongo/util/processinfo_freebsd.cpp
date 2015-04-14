@@ -25,7 +25,7 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include <cstdlib>
 #include <string>
@@ -44,6 +44,8 @@
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/log.h"
 #include "processinfo.h"
+
+using namespace std;
 
 namespace mongo {
 
@@ -118,6 +120,10 @@ namespace mongo {
         kinfo_proc * task = kvm_getprocs(kd, KERN_PROC_PID, _pid.toNative(), &cnt);
         kvm_close(kd);
         return task->ki_rssize * sysconf( _SC_PAGESIZE ) / 1024 / 1024; // convert from pages to MB
+    }
+
+    double ProcessInfo::getSystemMemoryPressurePercentage() {
+        return 0.0;
     }
 
     void ProcessInfo::SystemInfo::collectSystemInfo() {

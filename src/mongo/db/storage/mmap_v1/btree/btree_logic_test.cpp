@@ -43,6 +43,8 @@
 
 namespace mongo {
 
+    using std::string;
+
     /**
      * This class is made friend of BtreeLogic so we can add whatever private method accesses we
      * need to it, to be used by the tests.
@@ -70,9 +72,9 @@ namespace mongo {
             ASSERT_EQUALS(nKeys, _helper.btree.fullValidate(&txn, NULL, true, false, 0));
         }
 
-        void insert(const BSONObj &key, const DiskLoc dl) {
+        Status insert(const BSONObj &key, const DiskLoc dl, bool dupsAllowed = true) {
             OperationContextNoop txn;
-            _helper.btree.insert(&txn, key, dl, true);
+            return _helper.btree.insert(&txn, key, dl, dupsAllowed);
         }
 
         bool unindex(const BSONObj &key) {
@@ -80,6 +82,14 @@ namespace mongo {
             return _helper.btree.unindex(&txn, key, _helper.dummyDiskLoc);
         }
 
+        void locate(const BSONObj &key,
+                    int expectedPos,
+                    bool expectedFound,
+                    const RecordId &expectedLocation,
+                    int direction) {
+            return locate(key, expectedPos, expectedFound, DiskLoc::fromRecordId(expectedLocation),
+                          direction);
+        }
         void locate(const BSONObj &key,
                     int expectedPos,
                     bool expectedFound,
@@ -116,7 +126,7 @@ namespace mongo {
             return _helper.btree.getBucket(&txn, _helper.headManager.getHead(&txn));
         }
 
-        void forcePackBucket(const DiskLoc bucketLoc) {
+        void forcePackBucket(const RecordId bucketLoc) {
             BucketType* bucket = _helper.btree.getBucket(NULL, bucketLoc);
 
             bucket->topSize += bucket->emptySize;
@@ -132,13 +142,13 @@ namespace mongo {
             return _helper.btree._packedDataSize(bucket, refPos);
         }
 
-        int bucketRebalancedSeparatorPos(const DiskLoc bucketLoc, int leftIndex) {
+        int bucketRebalancedSeparatorPos(const RecordId bucketLoc, int leftIndex) {
             BucketType* bucket = _helper.btree.getBucket(NULL, bucketLoc);
             OperationContextNoop txn;
             return _helper.btree._rebalancedSeparatorPos(&txn, bucket, leftIndex);
         }
 
-        FullKey getKey(const DiskLoc bucketLoc, int pos) const {
+        FullKey getKey(const RecordId bucketLoc, int pos) const {
             const BucketType* bucket = _helper.btree.getBucket(NULL, bucketLoc);
             return BtreeLogic<BtreeLayoutType>::getFullKey(bucket, pos);
         }
@@ -285,7 +295,7 @@ namespace mongo {
             locateExtended(1, 'a', 'b', this->_helper.headManager.getHead(&txn));
             locateExtended(1, 'c', 'd', this->_helper.headManager.getHead(&txn));
             locateExtended(1, 'e', 'f', this->_helper.headManager.getHead(&txn));
-            locateExtended(1, 'g', 'g' + 1, DiskLoc()); // of course, 'h' isn't in the index.
+            locateExtended(1, 'g', 'g' + 1, RecordId()); // of course, 'h' isn't in the index.
 
             // old behavior
             //       locateExtended( -1, 'a', 'b', dl() );
@@ -293,7 +303,7 @@ namespace mongo {
             //       locateExtended( -1, 'e', 'f', dl() );
             //       locateExtended( -1, 'g', 'f', dl() );
 
-            locateExtended(-1, 'a', 'a' - 1, DiskLoc()); // of course, 'a' - 1 isn't in the index
+            locateExtended(-1, 'a', 'a' - 1, RecordId()); // of course, 'a' - 1 isn't in the index
             locateExtended(-1, 'c', 'b', this->_helper.headManager.getHead(&txn));
             locateExtended(-1, 'e', 'd', this->_helper.headManager.getHead(&txn));
             locateExtended(-1, 'g', 'f', this->_helper.headManager.getHead(&txn));
@@ -301,7 +311,7 @@ namespace mongo {
 
     private:
         void locateExtended(
-                    int direction, char token, char expectedMatch, DiskLoc expectedLocation) {
+                    int direction, char token, char expectedMatch, RecordId expectedLocation) {
             const BSONObj k = simpleKey(token);
             int expectedPos = (expectedMatch - 'b') / 2;
 
@@ -335,7 +345,7 @@ namespace mongo {
             // 'E' is the split point and should be in the head the rest should be ~50/50
             const BSONObj splitPoint = simpleKey('E', 800);
             this->_helper.btree.locate(&txn, splitPoint, this->_helper.dummyDiskLoc, 1, &pos, &loc);
-            ASSERT_EQUALS(this->_helper.headManager.getHead(&txn), loc);
+            ASSERT_EQUALS(this->_helper.headManager.getHead(&txn), loc.toRecordId());
             ASSERT_EQUALS(0, pos);
 
             // Find the one before 'E'
@@ -385,7 +395,7 @@ namespace mongo {
             // 'H' is the maximum 'large' interval key, 90% should be < 'H' and 10% larger
             const BSONObj splitPoint = simpleKey('H', 800);
             this->_helper.btree.locate(&txn, splitPoint, this->_helper.dummyDiskLoc, 1, &pos, &loc);
-            ASSERT_EQUALS(this->_helper.headManager.getHead(&txn), loc);
+            ASSERT_EQUALS(this->_helper.headManager.getHead(&txn), loc.toRecordId());
             ASSERT_EQUALS(0, pos);
 
             // Find the one before 'H'
@@ -871,11 +881,13 @@ namespace mongo {
             const BSONObj& topKey = biggestKey('m');
 
             DiskLoc leftChild = this->newBucket();
-            builder.push(this->_helper.headManager.getHead(&txn), topKey, leftChild);
+            builder.push(DiskLoc::fromRecordId(this->_helper.headManager.getHead(&txn)), topKey,
+                         leftChild);
             _count++;
 
             DiskLoc rightChild = this->newBucket();
-            this->setBucketNextChild(this->_helper.headManager.getHead(&txn), rightChild);
+            this->setBucketNextChild(DiskLoc::fromRecordId(this->_helper.headManager.getHead(&txn)),
+                                     rightChild);
 
             _count += builder.fillBucketToExactSize(leftChild, leftSize(), 'a');
             _count += builder.fillBucketToExactSize(rightChild, rightSize(), 'n');
@@ -2027,6 +2039,53 @@ namespace mongo {
         }
     };
 
+    template<class OnDiskFormat>
+    class DuplicateKeys : public BtreeLogicTestBase<OnDiskFormat> {
+    public:
+        void run() {
+            OperationContextNoop txn;
+            this->_helper.btree.initAsEmpty(&txn);
+
+            BSONObj key1 = simpleKey('z');
+            ASSERT_OK(this->insert(key1, this->_helper.dummyDiskLoc, true));
+            this->checkValidNumKeys(1);
+            this->locate(key1, 0, true, this->_helper.headManager.getHead(&txn), 1);
+
+            // Attempt to insert a dup key/value.
+            ASSERT_EQUALS(ErrorCodes::DuplicateKeyValue, 
+                          this->insert(key1, this->_helper.dummyDiskLoc, true));
+            this->checkValidNumKeys(1);
+            this->locate(key1, 0, true, this->_helper.headManager.getHead(&txn), 1);
+
+            // Attempt to insert a dup key/value with dupsAllowed=false.
+            ASSERT_EQUALS(ErrorCodes::DuplicateKeyValue, 
+                          this->insert(key1, this->_helper.dummyDiskLoc, false));
+            this->checkValidNumKeys(1);
+            this->locate(key1, 0, true, this->_helper.headManager.getHead(&txn), 1);
+
+            // Add another record to produce another diskloc.
+            StatusWith<RecordId> s = this->_helper.recordStore.insertRecord(&txn, "a", 1, false);
+            
+            ASSERT_TRUE(s.isOK());
+            ASSERT_EQUALS(3, this->_helper.recordStore.numRecords(NULL));
+
+            const DiskLoc dummyDiskLoc2 = DiskLoc::fromRecordId(s.getValue());
+
+            // Attempt to insert a dup key but this time with a different value.
+            ASSERT_EQUALS(ErrorCodes::DuplicateKey, this->insert(key1, dummyDiskLoc2, false));
+            this->checkValidNumKeys(1);
+
+            // Insert a dup key with dupsAllowed=true, should succeed.
+            ASSERT_OK(this->insert(key1, dummyDiskLoc2, true));
+            this->checkValidNumKeys(2);
+
+            // Clean up.
+            this->_helper.recordStore.deleteRecord(&txn, s.getValue());
+            ASSERT_EQUALS(2, this->_helper.recordStore.numRecords(NULL));
+        }
+    };
+
+
     /* This test requires the entire server to be linked-in and it is better implemented using
        the JS framework. Disabling here and will put in jsCore.
 
@@ -2150,8 +2209,8 @@ namespace mongo {
             // too much work to try to make this happen through inserts and deletes
             // we are intentionally manipulating the btree bucket directly here
             BtreeBucket::Loc* L = const_cast< BtreeBucket::Loc* >( &bt()->keyNode( 1 ).prevChildBucket );
-            getDur().writing(L)->Null();
-            getDur().writingInt( const_cast< BtreeBucket::Loc& >( bt()->keyNode( 1 ).recordLoc ).GETOFS() ) |= 1; // make unused
+            writing(L)->Null();
+            writingInt( const_cast< BtreeBucket::Loc& >( bt()->keyNode( 1 ).recordLoc ).GETOFS() ) |= 1; // make unused
             BSONObj k = BSON( "a" << toInsert );
             Base::insert( k );
         }
@@ -2254,10 +2313,15 @@ namespace mongo {
 
             add< LocateEmptyForward<OnDiskFormat> >();
             add< LocateEmptyReverse<OnDiskFormat> >();
+
+            add< DuplicateKeys<OnDiskFormat> >();
         }
     };
 
     // Test suite for both V0 and V1
-    static BtreeLogicTestSuite<BtreeLayoutV0> SUITE_V0("BTreeLogicTests_V0");
-    static BtreeLogicTestSuite<BtreeLayoutV1> SUITE_V1("BTreeLogicTests_V1");
+    static unittest::SuiteInstance< BtreeLogicTestSuite<BtreeLayoutV0> > SUITE_V0(
+        "BTreeLogicTests_V0");
+
+    static unittest::SuiteInstance< BtreeLogicTestSuite<BtreeLayoutV1> > SUITE_V1(
+        "BTreeLogicTests_V1");
 }

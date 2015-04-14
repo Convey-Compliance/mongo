@@ -28,8 +28,10 @@
 
 #include "mongo/s/write_ops/batch_write_exec.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
-#include "mongo/s/mock_multi_write_command.h"
+#include "mongo/s/client/mock_multi_write_command.h"
 #include "mongo/s/mock_ns_targeter.h"
 #include "mongo/s/mock_shard_resolver.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -37,6 +39,10 @@
 #include "mongo/unittest/unittest.h"
 
 namespace {
+
+    using boost::scoped_ptr;
+    using std::string;
+    using std::vector;
 
     using namespace mongo;
 

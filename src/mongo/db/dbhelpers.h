@@ -28,11 +28,12 @@
 
 #pragma once
 
+#include <boost/filesystem/path.hpp>
+
 #include "mongo/db/client.h"
 #include "mongo/db/db.h"
-#include "mongo/db/diskloc.h"
+#include "mongo/db/record_id.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/s/range_arithmetic.h"
 
 namespace mongo {
 
@@ -41,6 +42,7 @@ namespace mongo {
     class Collection;
     class Cursor;
     class OperationContext;
+    struct KeyRange;
     struct WriteConcernOptions;
 
     /**
@@ -86,7 +88,7 @@ namespace mongo {
                             BSONObj& result, 
                             bool requireIndex = false);
 
-        static DiskLoc findOne(OperationContext* txn,
+        static RecordId findOne(OperationContext* txn,
                                Collection* collection,
                                const BSONObj &query,
                                bool requireIndex);
@@ -102,24 +104,30 @@ namespace mongo {
         /* TODO: should this move into Collection?
          * uasserts if no _id index.
          * @return null loc if not found */
-        static DiskLoc findById(OperationContext* txn,
+        static RecordId findById(OperationContext* txn,
                                 Collection* collection, const BSONObj& query);
 
-        /** Get/put the first (or last) object from a collection.  Generally only useful if the collection
-            only ever has a single object -- which is a "singleton collection".
-
-            You do not need to set the database (Context) before calling.
-
-            @return true if object exists.
-        */
+        /**
+         * Get the first object generated from a forward natural-order scan on "ns".  Callers do not
+         * have to lock "ns".
+         *
+         * Returns true if there is such an object.  An owned copy of the object is placed into the
+         * out-argument "result".
+         *
+         * Returns false if there is no such object.
+         */
         static bool getSingleton(OperationContext* txn, const char *ns, BSONObj& result);
-        static void putSingleton(OperationContext* txn, const char *ns, BSONObj obj);
-        static void putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp);
 
         /**
-         * get last object int he collection; e.g. {$natural : -1}
+         * Same as getSingleton, but with a reverse natural-order scan on "ns".
          */
         static bool getLast(OperationContext* txn, const char *ns, BSONObj& result);
+
+        /**
+         * Performs an upsert of "obj" into the collection "ns", with an empty update predicate.
+         * Callers must have "ns" locked.
+         */
+        static void putSingleton(OperationContext* txn, const char *ns, BSONObj obj);
 
         /**
          * you have to lock
@@ -191,7 +199,7 @@ namespace mongo {
         static Status getLocsInRange( OperationContext* txn,
                                       const KeyRange& range,
                                       long long maxChunkSizeBytes,
-                                      std::set<DiskLoc>* locs,
+                                      std::set<RecordId>* locs,
                                       long long* numDocs,
                                       long long* estChunkSizeBytes );
 

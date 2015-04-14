@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <string.h> // strlen
 #include <string>
 #include <vector>
@@ -36,15 +37,14 @@
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
-#include "mongo/client/export_macros.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/platform/cstdint.h"
-#include "mongo/platform/float_utils.h"
 
 namespace mongo {
-    class OpTime;
     class BSONObj;
     class BSONElement;
     class BSONObjBuilder;
+    class Timestamp;
 
     typedef BSONElement be;
     typedef BSONObj bo;
@@ -67,7 +67,7 @@ namespace mongo {
         value()
         type()
     */
-    class MONGO_CLIENT_API BSONElement {
+    class BSONElement {
     public:
         /** These functions, which start with a capital letter, throw a MsgAssertionException if the
             element is not of the required type. Example:
@@ -114,6 +114,19 @@ namespace mongo {
         */
         bool ok() const { return !eoo(); }
 
+        /**
+         * True if this element has a value (ie not EOO).
+         *
+         * Makes it easier to check for a field's existence and use it:
+         * if (auto elem = myObj["foo"]) {
+         *     // Use elem
+         * }
+         * else {
+         *     // default behavior
+         * }
+         */
+        explicit operator bool() const { return ok(); }
+
         std::string toString( bool includeFieldName = true, bool full=false) const;
         void toString(StringBuilder& s, bool includeFieldName = true, bool full=false, int depth=0) const;
         std::string jsonString( JsonStringFormat format, bool includeFieldNames = true, int pretty = 0 ) const;
@@ -148,7 +161,7 @@ namespace mongo {
         BSONObj wrap() const;
 
         /** Wrap this element up as a singleton object with a new name. */
-        BSONObj wrap( const StringData& newName) const;
+        BSONObj wrap( StringData newName) const;
 
         /** field name of the element.  e.g., for
             name : "Joe"
@@ -169,7 +182,7 @@ namespace mongo {
         }
 
         const StringData fieldNameStringData() const {
-            return StringData(fieldName(), fieldNameSize() - 1);
+            return StringData(fieldName(), eoo() ? 0 : fieldNameSize() - 1);
         }
 
         /** raw data of the element's value (so be careful). */
@@ -400,6 +413,15 @@ namespace mongo {
         */
         int woCompare( const BSONElement &e, bool considerFieldName = true ) const;
 
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const BSONElement& elem) const;
+        };
+
         const char * rawdata() const { return data; }
 
         /** 0 == Equality, just not defined yet */
@@ -429,6 +451,12 @@ namespace mongo {
             default:
                 return false;
             }
+        }
+
+        Timestamp timestamp() const {
+            if( type() == mongo::Date || type() == bsonTimestamp )
+                return Timestamp(ConstDataView(value()).readLE<unsigned long long>());
+            return Timestamp();
         }
 
         Date_t timestampTime() const {
@@ -473,8 +501,8 @@ namespace mongo {
                 totalSize = -1;
                 fieldNameSize_ = -1;
                 if ( maxLen != -1 ) {
-                    int size = (int) strnlen( fieldName(), maxLen - 1 );
-                    uassert( 10333 ,  "Invalid field name", size != -1 );
+                    size_t size = strnlen( fieldName(), maxLen - 1 );
+                    uassert( 10333 ,  "Invalid field name", size < size_t(maxLen - 1) );
                     fieldNameSize_ = size + 1;
                 }
             }
@@ -503,7 +531,6 @@ namespace mongo {
         }
 
         std::string _asCode() const;
-        OpTime _opTime() const;
 
         template<typename T> bool coerce( T* out ) const;
 
@@ -632,7 +659,7 @@ namespace mongo {
         switch( type() ) {
         case NumberDouble:
             d = numberDouble();
-            if ( isNaN( d ) ){
+            if ( std::isnan( d ) ){
                 return 0;
             }
             if ( d > (double) std::numeric_limits<long long>::max() ){
@@ -647,8 +674,8 @@ namespace mongo {
     }
 
     inline BSONElement::BSONElement() {
-        static char z = 0;
-        data = &z;
+        static const char kEooElement[] = "";
+        data = kEooElement;
         fieldNameSize_ = 0;
         totalSize = 1;
     }

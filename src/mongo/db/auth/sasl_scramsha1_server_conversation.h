@@ -58,7 +58,7 @@ namespace mongo {
          * authentication conversation is finished or not.
          *
          **/
-        virtual StatusWith<bool> step(const StringData& inputData, std::string* outputData);
+        virtual StatusWith<bool> step(StringData inputData, std::string* outputData);
 
     private:
         /**
@@ -69,7 +69,7 @@ namespace mongo {
         /**
          * Parse client-final-message and generate server-final-message
          **/
-        StatusWith<bool> _secondStep(const std::vector<string>& input, std::string* outputData);
+        StatusWith<bool> _secondStep(const std::vector<std::string>& input, std::string* outputData);
 
         int _step;
         std::string _authMessage;

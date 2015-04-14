@@ -1,4 +1,4 @@
-/*
+/**
  *    Copyright (C) 2013 10gen Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
@@ -32,11 +32,13 @@
 
 #include "mongo/s/mongos_options.h"
 
+#include <iostream>
 #include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_options_helpers.h"
 #include "mongo/s/chunk.h"
@@ -48,6 +50,8 @@
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
+
+    using std::endl;
 
     MongosGlobalParams mongosGlobalParams;
 
@@ -69,7 +73,7 @@ namespace mongo {
         }
 #endif
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         moe::OptionSection ssl_options("SSL options");
 
         ret = addSSLServerOptions(&ssl_options);
@@ -113,7 +117,7 @@ namespace mongo {
 
         options->addSection(sharding_options);
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         options->addSection(ssl_options);
 #endif
 
@@ -174,7 +178,7 @@ namespace mongo {
             return ret;
         }
 
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         ret = canonicalizeSSLServerOptions(params);
         if (!ret.isOK()) {
             return ret;

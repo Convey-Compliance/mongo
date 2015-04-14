@@ -36,6 +36,9 @@
 
 namespace mongo {
 
+    using std::max;
+    using std::string;
+
     ProjectionExec::ProjectionExec()
         : _include(true),
           _special(false),
@@ -128,8 +131,8 @@ namespace mongo {
                     if (e2.valuestr() == LiteParsedQuery::metaTextScore) {
                         _meta[e.fieldName()] = META_TEXT_SCORE;
                     }
-                    else if (e2.valuestr() == LiteParsedQuery::metaDiskLoc) {
-                        _meta[e.fieldName()] = META_DISKLOC;
+                    else if (e2.valuestr() == LiteParsedQuery::metaRecordId) {
+                        _meta[e.fieldName()] = META_RECORDID;
                     }
                     else if (e2.valuestr() == LiteParsedQuery::metaGeoNearPoint) {
                         _meta[e.fieldName()] = META_GEONEAR_POINT;
@@ -245,9 +248,9 @@ namespace mongo {
             }
 
             member->state = WorkingSetMember::OWNED_OBJ;
-            member->obj = keyObj;
+            member->obj = Snapshotted<BSONObj>(SnapshotId(), keyObj);
             member->keyData.clear();
-            member->loc = DiskLoc();
+            member->loc = RecordId();
             return Status::OK();
         }
 
@@ -259,10 +262,10 @@ namespace mongo {
             if (transformRequiresDetails()) {
                 matchDetails.requestElemMatchKey();
                 verify(NULL != _queryExpression);
-                verify(_queryExpression->matchesBSON(member->obj, &matchDetails));
+                verify(_queryExpression->matchesBSON(member->obj.value(), &matchDetails));
             }
 
-            Status projStatus = transform(member->obj, &bob, &matchDetails);
+            Status projStatus = transform(member->obj.value(), &bob, &matchDetails);
             if (!projStatus.isOK()) {
                 return projStatus;
             }
@@ -335,16 +338,16 @@ namespace mongo {
                     bob.append(it->first, 0.0);
                 }
             }
-            else if (META_DISKLOC == it->second) {
-                bob.append(it->first, member->loc.toBSONObj());
+            else if (META_RECORDID == it->second) {
+                bob.append(it->first, static_cast<long long>(member->loc.repr()));
             }
         }
 
         BSONObj newObj = bob.obj();
         member->state = WorkingSetMember::OWNED_OBJ;
-        member->obj = newObj;
+        member->obj = Snapshotted<BSONObj>(SnapshotId(), newObj);
         member->keyData.clear();
-        member->loc = DiskLoc();
+        member->loc = RecordId();
 
         return Status::OK();
     }

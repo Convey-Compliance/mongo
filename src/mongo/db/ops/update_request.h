@@ -43,17 +43,15 @@ namespace mongo {
 
     class UpdateRequest {
     public:
-        inline UpdateRequest(OperationContext* txn, const NamespaceString& nsString)
-            : _txn(txn)
-            , _nsString(nsString)
+        inline UpdateRequest(const NamespaceString& nsString)
+            : _nsString(nsString)
             , _god(false)
             , _upsert(false)
             , _multi(false)
-            , _callLogOp(false)
             , _fromMigration(false)
-            , _fromReplication(false)
             , _lifecycle(NULL)
             , _isExplain(false)
+            , _storeResultDoc(false)
             , _yieldPolicy(PlanExecutor::YIELD_MANUAL) {}
 
         const NamespaceString& getNamespaceString() const {
@@ -103,28 +101,12 @@ namespace mongo {
             return _multi;
         }
 
-        inline void setUpdateOpLog(bool value = true) {
-            _callLogOp = value;
-        }
-
-        bool shouldCallLogOp() const {
-            return _callLogOp;
-        }
-
         inline void setFromMigration(bool value = true) {
             _fromMigration = value;
         }
 
         bool isFromMigration() const {
             return _fromMigration;
-        }
-
-        inline void setFromReplication(bool value = true) {
-            _fromReplication = value;
-        }
-
-        bool isFromReplication() const {
-            return _fromReplication;
         }
 
         inline void setLifecycle(UpdateLifecycle* value) {
@@ -135,16 +117,20 @@ namespace mongo {
             return _lifecycle;
         }
 
-        inline OperationContext* getOpCtx() const {
-            return _txn;
-        }
-
         inline void setExplain(bool value = true) {
             _isExplain = value;
         }
 
         inline bool isExplain() const {
             return _isExplain;
+        }
+
+        inline void setStoreResultDoc(bool value = true) {
+            _storeResultDoc = value;
+        }
+
+        inline bool shouldStoreResultDoc() const {
+            return _storeResultDoc;
         }
 
         inline void setYieldPolicy(PlanExecutor::YieldPolicy yieldPolicy) {
@@ -162,15 +148,10 @@ namespace mongo {
                         << " god: " << _god
                         << " upsert: " << _upsert
                         << " multi: " << _multi
-                        << " callLogOp: " << _callLogOp
                         << " fromMigration: " << _fromMigration
-                        << " fromReplications: " << _fromReplication
                         << " isExplain: " << _isExplain;
         }
     private:
-
-        // Not owned. Must live as long as the request lives.
-        OperationContext* _txn;
 
         const NamespaceString& _nsString;
 
@@ -192,20 +173,22 @@ namespace mongo {
         // True if this update is allowed to affect more than one document.
         bool _multi;
 
-        // True if the effects of the update should be written to the oplog.
-        bool _callLogOp;
-
         // True if this update is on behalf of a chunk migration.
         bool _fromMigration;
-
-        // True if this update is being applied during the application for the oplog.
-        bool _fromReplication;
 
         // The lifecycle data, and events used during the update request.
         UpdateLifecycle* _lifecycle;
 
         // Whether or not we are requesting an explained update. Explained updates are read-only.
         bool _isExplain;
+
+        // Whether or not we keep an owned copy of the resulting document for a non-multi update.
+        // This allows someone executing an update to retrieve the resulting document without
+        // another query once the update is complete.
+        //
+        // It is illegal to use this flag in combination with the '_multi' flag, and doing so will
+        // trigger an invariant check.
+        bool _storeResultDoc;
 
         // Whether or not the update should yield. Defaults to YIELD_MANUAL.
         PlanExecutor::YieldPolicy _yieldPolicy;

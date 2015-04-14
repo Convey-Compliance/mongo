@@ -439,20 +439,28 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     var cmd     = {};
     var cmdKey  = initCmd || 'replSetInitiate';
     var timeout = timeout || 60000;
+    var ex;
     cmd[cmdKey] = config;
     printjson(cmd);
 
-    assert.soon(function() {
-        var result = master.runCommand(cmd);
-        printjson(result);
-        return result['ok'] == 1;
-    }, "Initiate replica set", timeout);
-
+    // TODO(schwerin): After removing the legacy implementation of replica sets, there should be no
+    // reason to try these commands more than once, so we should be able to get rid of assert.soon()
+    // here.
+    assert.soon(function () {
+        try {
+            assert.commandWorked(master.runCommand(cmd), tojson(cmd));
+            return true;
+        }
+        catch (ex) {
+            print("ReplSetTest caught exception " + tojson(ex) + " while running " + tojson(cmd) +
+                  " in assert.soon");
+            return false;
+        }
+    }, "Failed all attempts to run "  + tojson(cmd), timeout);
     this.awaitSecondaryNodes(timeout);
 
     // Setup authentication if running test with authentication
-    if ((jsTestOptions().keyFile || jsTestOptions().useX509) && 
-          cmdKey == 'replSetInitiate') {
+    if ((jsTestOptions().keyFile) && cmdKey == 'replSetInitiate') {
         master = this.getMaster();
         jsTest.authenticateNodes(this.nodes);
     }
@@ -722,7 +730,7 @@ ReplSetTest.prototype.restart = function( n , options, signal, wait ){
     this.stop(n, signal, options);
     started = this.start( n , options , true, wait );
 
-    if (jsTestOptions().keyFile || jsTestOptions().useX509) {
+    if (jsTestOptions().keyFile) {
         if (started.length) {
              // if n was an array of conns, start will return an array of connections
             for (var i = 0; i < started.length; i++) {
@@ -970,7 +978,7 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
     
     var lastTime = null
     var currTime = new Date().getTime()
-    var status = undefined
+    var status = undefined;
 
     var self = this;
     assert.soon(function() {
@@ -979,7 +987,6 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
             if (!conn) conn = self.liveNodes.slaves[0];
             if (!conn) return false; // Try again to load connection
 
-            var status = null;
             var getStatusFunc = function() {
                 status = conn.getDB('admin').runCommand({replSetGetStatus: 1});
             };
@@ -1034,17 +1041,23 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
 
     print( "ReplSetTest waitForIndicator final status:" )
     printjson( status )
-}
+};
 
-ReplSetTest.Health = {}
-ReplSetTest.Health.UP = 1
-ReplSetTest.Health.DOWN = 0
+ReplSetTest.Health = {};
+ReplSetTest.Health.UP = 1;
+ReplSetTest.Health.DOWN = 0;
 
-ReplSetTest.State = {}
-ReplSetTest.State.PRIMARY = 1
-ReplSetTest.State.SECONDARY = 2
-ReplSetTest.State.RECOVERING = 3
-ReplSetTest.State.ARBITER = 7
+ReplSetTest.State = {};
+ReplSetTest.State.PRIMARY = 1;
+ReplSetTest.State.SECONDARY = 2;
+ReplSetTest.State.RECOVERING = 3;
+// Note there is no state 4.
+ReplSetTest.State.STARTUP_2 = 5;
+ReplSetTest.State.UNKNOWN = 6;
+ReplSetTest.State.ARBITER = 7;
+ReplSetTest.State.DOWN = 8;
+ReplSetTest.State.ROLLBACK = 9;
+ReplSetTest.State.REMOVED = 10;
 
 /** 
  * Overflows a replica set secondary or secondaries, specified by id or conn.
@@ -1130,7 +1143,6 @@ ReplSetTest.prototype.bridge = function( opts ) {
         
         if (!config) {
             print("ReplSetTest bridge couldn't find config for "+this.nodes[i]);
-            printjson(this.nodes[i].getDB("local").system.namespaces.find().toArray());
             assert(false);
         }
 

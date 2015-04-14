@@ -33,9 +33,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/bson/optime.h"
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/s/multi_command_dispatch.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batch_write_op.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -46,99 +44,7 @@
 
 namespace mongo {
 
-    /**
-     * Interface to execute a single safe write and enforce write concern on a connection.
-     */
-    class SafeWriter {
-    public:
-
-        virtual ~SafeWriter() {
-        }
-
-        /**
-         * Sends a write to a remote host and returns a GLE response.
-         */
-        virtual Status safeWrite( DBClientBase* conn,
-                                  const BatchItemRef& batchItem,
-                                  const BSONObj& writeConcern,
-                                  BSONObj* gleResponse ) = 0;
-
-        /**
-         * Purely enforces a write concern on a remote host by clearing the previous error.
-         * This is more expensive than a normal safe write, but is sometimes needed to support
-         * write command emulation.
-         */
-        virtual Status enforceWriteConcern( DBClientBase* conn,
-                                            const StringData& dbName,
-                                            const BSONObj& writeConcern,
-                                            BSONObj* gleResponse ) = 0;
-
-        /**
-         * Clears the error information on this connection.
-         */
-        virtual Status clearErrors( DBClientBase* conn,
-                                    const StringData& dbName ) = 0;
-    };
-
-    /**
-     * Executes a batch write using safe writes.
-     *
-     * The actual safe write operation is done via an interface to allow testing the rest of the
-     * aggregation functionality.
-     */
-    class BatchSafeWriter {
-    public:
-
-        BatchSafeWriter( SafeWriter* safeWriter ) :
-            _safeWriter( safeWriter ) {
-        }
-
-        // Testable static dispatching method, defers to SafeWriter for actual writes over the
-        // connection.
-        void safeWriteBatch( DBClientBase* conn,
-                             const BatchedCommandRequest& request,
-                             BatchedCommandResponse* response );
-
-        // Helper that acts as an auto-ptr for write and wc errors
-        struct GLEErrors {
-            std::auto_ptr<WriteErrorDetail> writeError;
-            std::auto_ptr<WCErrorDetail> wcError;
-        };
-
-        /**
-         * Given a GLE response, extracts a write error and a write concern error for the previous
-         * operation.
-         *
-         * Returns !OK if the GLE itself failed in an unknown way.
-         */
-        static Status extractGLEErrors( const BSONObj& gleResponse, GLEErrors* errors );
-
-        struct GLEStats {
-            GLEStats() :
-                n( 0 ) {
-            }
-
-            int n;
-            BSONObj upsertedId;
-            OpTime lastOp;
-        };
-
-        /**
-         * Given a GLE response, pulls out stats for the previous write operation.
-         */
-        static void extractGLEStats(const BSONObj& gleResponse,
-                                    const BatchItemRef& batchItem,
-                                    GLEStats* stats);
-
-        /**
-         * Given a GLE response, strips out all non-write-concern related information
-         */
-        static BSONObj stripNonWCInfo( const BSONObj& gleResponse );
-
-    private:
-
-        SafeWriter* _safeWriter;
-    };
+    class MultiCommandDispatch;
 
     // Used for reporting legacy write concern responses
     struct LegacyWCResponse {
@@ -155,8 +61,33 @@ namespace mongo {
      * Returns !OK if there was an error getting a GLE response
      */
     Status enforceLegacyWriteConcern( MultiCommandDispatch* dispatcher,
-                                      const StringData& dbName,
+                                      StringData dbName,
                                       const BSONObj& options,
                                       const HostOpTimeMap& hostOpTimes,
                                       std::vector<LegacyWCResponse>* wcResponses );
+
+    //
+    // Below exposed for testing only
+    //
+
+    // Helper that acts as an auto-ptr for write and wc errors
+    struct GLEErrors {
+        std::auto_ptr<WriteErrorDetail> writeError;
+        std::auto_ptr<WCErrorDetail> wcError;
+    };
+
+    /**
+     * Given a GLE response, extracts a write error and a write concern error for the previous
+     * operation.
+     *
+     * Returns !OK if the GLE itself failed in an unknown way.
+     */
+    Status extractGLEErrors( const BSONObj& gleResponse, GLEErrors* errors );
+
+    /**
+     * Given a GLE response, strips out all non-write-concern related information
+     */
+    BSONObj stripNonWCInfo( const BSONObj& gleResponse );
+
+
 }

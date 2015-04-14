@@ -48,6 +48,10 @@
 #include "mongo/platform/unordered_map.h"
 
 namespace mongo {
+
+    using std::make_pair;
+    using std::string;
+
 namespace modifiertable {
 
     namespace {
@@ -56,7 +60,7 @@ namespace modifiertable {
             string name;
             ModifierType type;
 
-            ModifierEntry(const StringData& name, ModifierType type)
+            ModifierEntry(StringData name, ModifierType type)
                 : name(name.toString())
                 , type(type) {
             }
@@ -125,7 +129,7 @@ namespace modifiertable {
         return Status::OK();
     }
 
-    ModifierType getType(const StringData& typeStr) {
+    ModifierType getType(StringData typeStr) {
         NameMap::const_iterator it = MODIFIER_NAME_MAP->find(typeStr);
         if (it == MODIFIER_NAME_MAP->end()) {
             return MOD_UNKNOWN;

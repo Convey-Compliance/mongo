@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
 #include <vector>
 
+#include "mongo/config.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/sock.h"
 
@@ -130,7 +133,7 @@ namespace mongo {
         bool connect(SockAddr& farEnd) {
             return psock->connect( farEnd );
         }
-#ifdef MONGO_SSL
+#ifdef MONGO_CONFIG_SSL
         /**
          * Initiates the TLS/SSL handshake on this MessagingPort.
          * When this function returns, further communication on this

@@ -32,8 +32,6 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
@@ -47,315 +45,130 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/authz_session_external_state_d.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/db.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/dbwebserver.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/jsobj.h"
-#include "mongo/db/repl/handshake_args.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage_options.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/d_state.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/concurrency/thread_name.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/log.h"
-
 
 namespace mongo {
 
+    using std::string;
+    using std::stringstream;
+
     using logger::LogComponent;
 
-    mongo::mutex& Client::clientsMutex = *(new mutex("clientsMutex"));
-    set<Client*>& Client::clients = *(new set<Client*>); // always be in clientsMutex when manipulating this
+    boost::mutex Client::clientsMutex;
+    ClientSet Client::clients;
 
     TSP_DEFINE(Client, currentClient)
 
-    /* each thread which does db operations has a Client object in TLS.
-       call this when your thread starts.
-    */
+    /**
+     * This must be called whenever a new thread is started, so that active threads can be tracked
+     * so each thread has a Client object in TLS.
+     */
     void Client::initThread(const char *desc, AbstractMessagingPort *mp) {
-        verify( currentClient.get() == 0 );
+        invariant(currentClient.get() == 0);
 
-        string fullDesc = desc;
-        if ( str::equals( "conn" , desc ) && mp != NULL )
+        string fullDesc;
+        if (mp != NULL) {
             fullDesc = str::stream() << desc << mp->connectionId();
+        }
+        else {
+            fullDesc = desc;
+        }
 
-        setThreadName( fullDesc.c_str() );
+        setThreadName(fullDesc.c_str());
+        mongo::lastError.initThread();
 
         // Create the client obj, attach to thread
-        Client *c = new Client( fullDesc, mp );
-        currentClient.reset(c);
-        mongo::lastError.initThread();
-        c->setAuthorizationSession(new AuthorizationSession(new AuthzSessionExternalStateMongod(
-                getGlobalAuthorizationManager())));
+        Client* client = new Client(fullDesc, getGlobalServiceContext(), mp);
+        client->setAuthorizationSession(
+                getGlobalAuthorizationManager()->makeAuthorizationSession());
+
+        currentClient.reset(client);
+
+        // This makes the client visible to maintenance threads
+        boost::lock_guard<boost::mutex> clientLock(clientsMutex);
+        clients.insert(client);
     }
 
-    Client::Client(const string& desc, AbstractMessagingPort *p) :
-        ClientBasic(p),
-        _shutdown(false),
-        _desc(desc),
-        _god(0),
-        _lastOp(0)
-    {
-        _hasWrittenSinceCheckpoint = false;
-        _connectionId = p ? p->connectionId() : 0;
-        _curOp = new CurOp( this );
-#ifndef _WIN32
-        stringstream temp;
-        temp << hex << showbase << pthread_self();
-        _threadId = temp.str();
-#endif
-        scoped_lock bl(clientsMutex);
-        clients.insert(this);
+    Client::Client(const string& desc, ServiceContext* serviceContext, AbstractMessagingPort *p)
+        : ClientBasic(serviceContext, p),
+          _desc(desc),
+          _threadId(boost::this_thread::get_id()),
+          _connectionId(p ? p->connectionId() : 0),
+          _inDirectClient(false),
+          _txn(NULL) {
     }
 
     Client::~Client() {
-        _god = 0;
-
-        // Because both Client object pointers and logging infrastructure are stored in Thread
-        // Specific Pointers and because we do not explicitly control the order in which TSPs are
-        // deleted, it is possible for the logging infrastructure to have been deleted before
-        // this code runs.  This leads to segfaults (access violations) if this code attempts
-        // to log anything.  Therefore, disable logging from this destructor until this is fixed.
-        // TODO(tad) Force the logging infrastructure to be the last TSP to be deleted for each
-        // thread and reenable this code once that is done.
-#if 0
-        if ( _context )
-            error() << "Client::~Client _context should be null but is not; client:" << _desc << endl;
-
-        if ( ! _shutdown ) {
-            error() << "Client::shutdown not called: " << _desc << endl;
-        }
-#endif
-
         if ( ! inShutdown() ) {
             // we can't clean up safely once we're in shutdown
             {
-                scoped_lock bl(clientsMutex);
-                if ( ! _shutdown )
-                    clients.erase(this);
+                boost::lock_guard<boost::mutex> clientLock(clientsMutex);
+                clients.erase(this);
             }
-
-            CurOp* last;
-            do {
-                last = _curOp;
-                delete _curOp;
-                // _curOp may have been reset to _curOp->_wrapped
-            } while (_curOp != last);
         }
     }
 
     bool Client::shutdown() {
-        _shutdown = true;
-        if ( inShutdown() )
-            return false;
-        {
-            scoped_lock bl(clientsMutex);
+        if (!inShutdown()) {
+            boost::lock_guard<boost::mutex> clientLock(clientsMutex);
             clients.erase(this);
         }
-
         return false;
-    }
-
-    BSONObj CachedBSONObjBase::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
-
-    Client::Context::Context(OperationContext* txn, const std::string& ns, Database * db)
-        : _client( currentClient.get() ), 
-          _justCreated(false),
-          _doVersion( true ),
-          _ns( ns ), 
-          _db(db),
-          _txn(txn) {
-
-    }
-
-    Client::Context::Context(OperationContext* txn,
-                             const string& ns,
-                             bool doVersion)
-        : _client( currentClient.get() ), 
-          _justCreated(false), // set for real in finishInit
-          _doVersion(doVersion),
-          _ns( ns ), 
-          _db(NULL),
-          _txn(txn) {
-
-        _finishInit();
-    }
-
-
-    AutoGetDb::AutoGetDb(OperationContext* txn, const StringData& ns, LockMode mode)
-            : _dbLock(txn->lockState(), ns, mode),
-              _db(dbHolder().get(txn, ns)) {
-
-    }
-
-
-    AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn,
-                                                       const std::string& ns)
-            : _txn(txn),
-              _nss(ns),
-              _dbLock(_txn->lockState(), _nss.db(), MODE_IS),
-              _db(NULL),
-              _coll(NULL) {
-
-        _init();
-    }
-
-    AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* txn,
-                                                       const NamespaceString& nss)
-            : _txn(txn),
-              _nss(nss),
-              _dbLock(_txn->lockState(), _nss.db(), MODE_IS),
-              _db(NULL),
-              _coll(NULL) {
-
-        _init();
-    }
-
-    void AutoGetCollectionForRead::_init() {
-        massert(28535, "need a non-empty collection name", !_nss.coll().empty());
-
-        // TODO: Client::Context legacy, needs to be removed
-        _txn->getCurOp()->ensureStarted();
-        _txn->getCurOp()->setNS(_nss.toString());
-
-        // Lock both the DB and the collection (DB is locked in the constructor), because this is
-        // necessary in order to to shard version checking.
-        const ResourceId resId(RESOURCE_COLLECTION, _nss);
-        const LockMode collLockMode = supportsDocLocking() ? MODE_IS : MODE_S;
-
-        invariant(LOCK_OK == _txn->lockState()->lock(resId, collLockMode));
-
-        // Shard version check needs to be performed under the collection lock
-        ensureShardVersionOKOrThrow(_nss);
-
-        // At this point, we are locked in shared mode for the database by the DB lock in the
-        // constructor, so it is safe to load the DB pointer.
-        _db = dbHolder().get(_txn, _nss.db());
-        if (_db != NULL) {
-            // TODO: Client::Context legacy, needs to be removed
-            _txn->getCurOp()->enter(_nss.toString().c_str(), _db->getProfilingLevel());
-
-            _coll = _db->getCollection(_txn, _nss);
-        }
-    }
-
-    AutoGetCollectionForRead::~AutoGetCollectionForRead() {
-        // If the database is NULL, we would never have tried to lock the collection resource
-        if (_db) {
-            const ResourceId resId(RESOURCE_COLLECTION, _nss);
-            _txn->lockState()->unlock(resId);
-        }
-
-        // Report time spent in read lock
-        _txn->getCurOp()->recordGlobalTime(false, _timer.micros());
-    }
-
-
-    Client::WriteContext::WriteContext(OperationContext* opCtx, const std::string& ns)
-        : _txn(opCtx),
-          _nss(ns),
-          _dblk(opCtx->lockState(), _nss.db(), MODE_IX),
-          _collk(opCtx->lockState(), ns, MODE_IX),
-          _c(opCtx, ns) { }
-
-    void Client::Context::checkNotStale() const { 
-        switch ( _client->_curOp->getOp() ) {
-        case dbGetMore: // getMore's are special and should be handled else where
-        case dbUpdate: // update & delete check shard version in instance.cpp, so don't check here as well
-        case dbDelete:
-            break;
-        default: {
-            ensureShardVersionOKOrThrow(_ns);
-        }
-        }
-    }
-       
-    void Client::Context::_finishInit() {
-        _db = dbHolder().openDb(_txn, _ns, &_justCreated);
-        invariant(_db);
-
-        if( _doVersion ) checkNotStale();
-
-        _client->_curOp->enter(_ns.c_str(), _db->getProfilingLevel());
-    }
-    
-    Client::Context::~Context() {
-        DEV verify( _client == currentClient.get() );
-
-        // Lock must still be held
-        invariant(_txn->lockState()->isLocked());
-
-        _client->_curOp->recordGlobalTime(_txn->lockState()->isWriteLocked(), _timer.micros());
-    }
-
-    void Client::appendLastOp( BSONObjBuilder& b ) const {
-        // _lastOp is never set if replication is off
-        if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeReplSet || !_lastOp.isNull()) {
-            b.appendTimestamp( "lastOp" , _lastOp.asDate() );
-        }
     }
 
     void Client::reportState(BSONObjBuilder& builder) {
         builder.append("desc", desc());
-        if (_threadId.size()) {
-            builder.append("threadId", _threadId);
-        }
+
+        std::stringstream ss;
+        ss << _threadId;
+        builder.append("threadId", ss.str());
 
         if (_connectionId) {
             builder.appendNumber("connectionId", _connectionId);
         }
     }
 
+    void Client::setOperationContext(OperationContext* txn) {
+        // We can only set the OperationContext once before resetting it.
+        invariant(txn != NULL && _txn == NULL);
+
+        boost::unique_lock<SpinLock> uniqueLock(_lock);
+        _txn = txn;
+    }
+
+    void Client::resetOperationContext() {
+        invariant(_txn != NULL);
+        boost::unique_lock<SpinLock> uniqueLock(_lock);
+        _txn = NULL;
+    }
+
     string Client::clientAddress(bool includePort) const {
-        if( _curOp )
-            return _curOp->getRemoteString(includePort);
-        return "";
+        if (!hasRemote()) {
+            return "";
+        }
+        if (includePort) {
+            return getRemote().toString();
+        }
+        return getRemote().host();
     }
 
     ClientBasic* ClientBasic::getCurrent() {
         return currentClient.get();
     }
-
-    class HandshakeCmd : public Command {
-    public:
-        void help(stringstream& h) const { h << "internal"; }
-        HandshakeCmd() : Command( "handshake" ) {}
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool adminOnly() const { return false; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::internal);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
-        virtual bool run(OperationContext* txn, const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            repl::HandshakeArgs handshake;
-            Status status = handshake.initialize(cmdObj);
-            if (!status.isOK()) {
-                return appendCommandStatus(result, status);
-            }
-
-            // TODO(dannenberg) move this into actual processing for both version
-            txn->getClient()->setRemoteID(handshake.getRid());
-
-            status = repl::getGlobalReplicationCoordinator()->processHandshake(txn,
-                                                                               handshake);
-            return appendCommandStatus(result, status);
-        }
-
-    } handshakeCmd;
-
 
 
     void OpDebug::reset() {
@@ -385,6 +198,7 @@ namespace mongo {
         fastmodinsert = false;
         upsert = false;
         keyUpdates = 0;  // unsigned, so -1 not possible
+        writeConflicts = 0;
         planSummary = "";
         execStats.reset();
         
@@ -398,7 +212,7 @@ namespace mongo {
 
 #define OPDEBUG_TOSTRING_HELP(x) if( x >= 0 ) s << " " #x ":" << (x)
 #define OPDEBUG_TOSTRING_HELP_BOOL(x) if( x ) s << " " #x ":" << (x)
-    string OpDebug::report( const CurOp& curop ) const {
+    string OpDebug::report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const {
         StringBuilder s;
         if ( iscommand )
             s << "command ";
@@ -412,8 +226,7 @@ namespace mongo {
                 
                 Command* curCommand = curop.getCommand();
                 if (curCommand) {
-                    mutablebson::Document cmdToLog(curop.query(), 
-                            mutablebson::Document::kInPlaceDisabled);
+                    mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
                     curCommand->redactForLogging(&cmdToLog);
                     s << curCommand->name << " ";
                     s << cmdToLog.toString();
@@ -455,6 +268,7 @@ namespace mongo {
         OPDEBUG_TOSTRING_HELP_BOOL( fastmodinsert );
         OPDEBUG_TOSTRING_HELP_BOOL( upsert );
         OPDEBUG_TOSTRING_HELP( keyUpdates );
+        OPDEBUG_TOSTRING_HELP( writeConflicts );
         
         if ( extra.len() )
             s << " " << extra.str();
@@ -467,65 +281,77 @@ namespace mongo {
 
         s << " numYields:" << curop.numYields();
         
-        s << " ";
-        curop.lockStat().report( s );
-        
         OPDEBUG_TOSTRING_HELP( nreturned );
-        if ( responseLength > 0 )
+        if (responseLength > 0) {
             s << " reslen:" << responseLength;
+        }
+
+        {
+            BSONObjBuilder locks;
+            lockStats.report(&locks);
+            s << " locks:" << locks.obj().toString();
+        }
+
         s << " " << executionTime << "ms";
         
         return s.str();
     }
 
+    namespace {
+        /**
+         * Appends {name: obj} to the provided builder.  If obj is greater than maxSize, appends a
+         * string summary of obj instead of the object itself.
+         */
+        void appendAsObjOrString(StringData name,
+                                 const BSONObj& obj,
+                                 size_t maxSize,
+                                 BSONObjBuilder* builder) {
+            if (static_cast<size_t>(obj.objsize()) <= maxSize) {
+                builder->append(name, obj);
+            }
+            else {
+                // Generate an abbreviated serialization for the object, by passing false as the
+                // "full" argument to obj.toString().
+                const bool isArray = false;
+                const bool full = false;
+                std::string objToString = obj.toString(isArray, full);
+                if (objToString.size() <= maxSize) {
+                    builder->append(name, objToString);
+                }
+                else {
+                    // objToString is still too long, so we append to the builder a truncated form
+                    // of objToString concatenated with "...".  Instead of creating a new string
+                    // temporary, mutate objToString to do this (we know that we can mutate
+                    // characters in objToString up to and including objToString[maxSize]).
+                    objToString[maxSize - 3] = '.';
+                    objToString[maxSize - 2] = '.';
+                    objToString[maxSize - 1] = '.';
+                    builder->append(name, StringData(objToString).substr(0, maxSize));
+                }
+            }
+        }
+    } // namespace
+
 #define OPDEBUG_APPEND_NUMBER(x) if( x != -1 ) b.appendNumber( #x , (x) )
 #define OPDEBUG_APPEND_BOOL(x) if( x ) b.appendBool( #x , (x) )
-    bool OpDebug::append(const CurOp& curop, BSONObjBuilder& b, size_t maxSize) const {
+    void OpDebug::append(const CurOp& curop,
+                         const SingleThreadedLockStats& lockStats,
+                         BSONObjBuilder& b) const {
+
+        const size_t maxElementSize = 50 * 1024;
+
         b.append( "op" , iscommand ? "command" : opToString( op ) );
         b.append( "ns" , ns.toString() );
-        
-        int queryUpdateObjSize = 0;
+
         if (!query.isEmpty()) {
-            queryUpdateObjSize += query.objsize();
+            appendAsObjOrString(iscommand ? "command" : "query", query, maxElementSize, &b);
         }
         else if (!iscommand && curop.haveQuery()) {
-            queryUpdateObjSize += curop.query()["query"].size();
+            appendAsObjOrString("query", curop.query(), maxElementSize, &b);
         }
 
         if (!updateobj.isEmpty()) {
-            queryUpdateObjSize += updateobj.objsize();
-        }
-
-        if (static_cast<size_t>(queryUpdateObjSize) > maxSize) {
-            if (!query.isEmpty()) {
-                // Use 60 since BSONObj::toString can truncate strings into 150 chars
-                // and we want to have enough room for both query and updateobj when
-                // the entire document is going to be serialized into a string
-                const string abbreviated(query.toString(false, false), 0, 60);
-                b.append(iscommand ? "command" : "query", abbreviated + "...");
-            }
-            else if (!iscommand && curop.haveQuery()) {
-                const string abbreviated(curop.query()["query"].toString(false, false), 0, 60);
-                b.append("query", abbreviated + "...");
-            }
-
-            if (!updateobj.isEmpty()) {
-                const string abbreviated(updateobj.toString(false, false), 0, 60);
-                b.append("updateobj", abbreviated + "...");
-            }
-
-            return false;
-        }
-
-        if (!query.isEmpty()) {
-            b.append(iscommand ? "command" : "query", query);
-        }
-        else if (!iscommand && curop.haveQuery()) {
-            curop.appendQuery(b, "query");
-        }
-
-        if (!updateobj.isEmpty()) {
-            b.append("updateobj", updateobj);
+            appendAsObjOrString("updateobj", updateobj, maxElementSize, &b);
         }
 
         const bool moved = (nmoved >= 1);
@@ -549,24 +375,27 @@ namespace mongo {
         OPDEBUG_APPEND_BOOL( fastmodinsert );
         OPDEBUG_APPEND_BOOL( upsert );
         OPDEBUG_APPEND_NUMBER( keyUpdates );
+        OPDEBUG_APPEND_NUMBER( writeConflicts );
+        b.appendNumber("numYield", curop.numYields());
 
-        b.appendNumber( "numYield" , curop.numYields() );
-        b.append( "lockStats" , curop.lockStat().report() );
+        {
+            BSONObjBuilder locks(b.subobjStart("locks"));
+            lockStats.report(&locks);
+        }
 
-        if ( ! exceptionInfo.empty() )
-            exceptionInfo.append( b , "exception" , "exceptionCode" );
+        if (!exceptionInfo.empty()) {
+            exceptionInfo.append(b, "exception", "exceptionCode");
+        }
 
         OPDEBUG_APPEND_NUMBER( nreturned );
         OPDEBUG_APPEND_NUMBER( responseLength );
         b.append( "millis" , executionTime );
 
         execStats.append(b, "execStats");
-
-        return true;
     }
 
     void saveGLEStats(const BSONObj& result, const std::string& conn) {
         // This can be called in mongod, which is unfortunate.  To fix this,
         // we can redesign how connection pooling works on mongod for sharded operations.
     }
-}
+} // namespace mongo

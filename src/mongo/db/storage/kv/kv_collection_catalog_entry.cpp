@@ -36,10 +36,54 @@
 
 namespace mongo {
 
+    using std::string;
+
+    class KVCollectionCatalogEntry::AddIndexChange : public RecoveryUnit::Change {
+    public:
+        AddIndexChange(OperationContext* opCtx, KVCollectionCatalogEntry* cce,
+                       StringData ident)
+            : _opCtx(opCtx)
+            , _cce(cce)
+            , _ident(ident.toString())
+        {}
+
+        virtual void commit() {}
+        virtual void rollback() {
+            // Intentionally ignoring failure.
+            _cce->_engine->dropIdent(_opCtx, _ident);
+        }
+
+        OperationContext* const _opCtx;
+        KVCollectionCatalogEntry* const _cce;
+        const std::string _ident;
+    };
+
+    class KVCollectionCatalogEntry::RemoveIndexChange : public RecoveryUnit::Change {
+    public:
+        RemoveIndexChange(OperationContext* opCtx, KVCollectionCatalogEntry* cce,
+                          StringData ident)
+            : _opCtx(opCtx)
+            , _cce(cce)
+            , _ident(ident.toString())
+        {}
+
+        virtual void rollback() {}
+        virtual void commit() {
+            // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
+            // index, we should never see it again anyway.
+            _cce->_engine->dropIdent(_opCtx, _ident);
+        }
+
+        OperationContext* const _opCtx;
+        KVCollectionCatalogEntry* const _cce;
+        const std::string _ident;
+    };
+
+
     KVCollectionCatalogEntry::KVCollectionCatalogEntry( KVEngine* engine,
                                                         KVCatalog* catalog,
-                                                        const StringData& ns,
-                                                        const StringData& ident,
+                                                        StringData ns,
+                                                        StringData ident,
                                                         RecordStore* rs)
         : BSONCollectionCatalogEntry( ns ),
           _engine( engine ),
@@ -52,7 +96,7 @@ namespace mongo {
     }
 
     bool KVCollectionCatalogEntry::setIndexIsMultikey(OperationContext* txn,
-                                                      const StringData& indexName,
+                                                      StringData indexName,
                                                       bool multikey ) {
         MetaData md = _getMetaData(txn);
 
@@ -66,8 +110,8 @@ namespace mongo {
     }
 
     void KVCollectionCatalogEntry::setIndexHead( OperationContext* txn,
-                                                 const StringData& indexName,
-                                                 const DiskLoc& newHead ) {
+                                                 StringData indexName,
+                                                 const RecordId& newHead ) {
         MetaData md = _getMetaData( txn );
         int offset = md.findIndexOffset( indexName );
         invariant( offset >= 0 );
@@ -76,29 +120,40 @@ namespace mongo {
     }
 
     Status KVCollectionCatalogEntry::removeIndex( OperationContext* txn,
-                                                  const StringData& indexName ) {
-        string ident = _catalog->getIndexIdent( txn, ns().ns(), indexName );
-
+                                                  StringData indexName ) {
         MetaData md = _getMetaData( txn );
+        
+        if (md.findIndexOffset(indexName) < 0)
+            return Status::OK(); // never had the index so nothing to do.
+
+        const string ident = _catalog->getIndexIdent( txn, ns().ns(), indexName );
+
         md.eraseIndex( indexName );
         _catalog->putMetaData( txn, ns().toString(), md );
 
-        return _engine->dropSortedDataInterface( txn, ident );
+        // Lazily remove to isolate underlying engine from rollback.
+        txn->recoveryUnit()->registerChange(new RemoveIndexChange(txn, this, ident));
+        return Status::OK();
     }
 
     Status KVCollectionCatalogEntry::prepareForIndexBuild( OperationContext* txn,
                                                            const IndexDescriptor* spec ) {
         MetaData md = _getMetaData( txn );
-        md.indexes.push_back( IndexMetaData( spec->infoObj(), false, DiskLoc(), false ) );
+        md.indexes.push_back( IndexMetaData( spec->infoObj(), false, RecordId(), false ) );
         _catalog->putMetaData( txn, ns().toString(), md );
 
         string ident = _catalog->getIndexIdent( txn, ns().ns(), spec->indexName() );
 
-        return _engine->createSortedDataInterface( txn, ident, spec );
+        const Status status = _engine->createSortedDataInterface( txn, ident, spec );
+        if (status.isOK()) {
+            txn->recoveryUnit()->registerChange(new AddIndexChange(txn, this, ident));
+        }
+
+        return status;
     }
 
     void KVCollectionCatalogEntry::indexBuildSuccess( OperationContext* txn,
-                                                      const StringData& indexName ) {
+                                                      StringData indexName ) {
         MetaData md = _getMetaData( txn );
         int offset = md.findIndexOffset( indexName );
         invariant( offset >= 0 );
@@ -107,12 +162,19 @@ namespace mongo {
     }
 
     void KVCollectionCatalogEntry::updateTTLSetting( OperationContext* txn,
-                                                     const StringData& idxName,
+                                                     StringData idxName,
                                                      long long newExpireSeconds ) {
         MetaData md = _getMetaData( txn );
         int offset = md.findIndexOffset( idxName );
         invariant( offset >= 0 );
         md.indexes[offset].updateTTLSetting( newExpireSeconds );
+        _catalog->putMetaData( txn, ns().toString(), md );
+    }
+
+    void KVCollectionCatalogEntry::updateFlags(OperationContext* txn, int newValue) {
+        MetaData md = _getMetaData( txn );
+        md.options.flags = newValue;
+        md.options.flagsSet = true;
         _catalog->putMetaData( txn, ns().toString(), md );
     }
 

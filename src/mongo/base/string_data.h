@@ -37,8 +37,6 @@
 
 namespace mongo {
 
-    using std::string;
-
     /**
      * A StringData object wraps a 'const std::string&' or a 'const char*' without copying its
      * contents. The most common usage is as a function argument that takes any of the two
@@ -63,8 +61,8 @@ namespace mongo {
          * Constructs a StringData, for the case where the length of std::string is not known. 'c'
          * must be a pointer to a null-terminated string.
          */
-        StringData( const char* c )
-            : _data(c), _size((c == NULL) ? 0 : std::string::npos) {}
+        StringData( const char* str )
+            : _data(str), _size((str == NULL) ? 0 : std::strlen(str)) {}
 
         /**
          * Constructs a StringData explicitly, for the case where the length of the std::string is
@@ -91,14 +89,14 @@ namespace mongo {
          * Returns -1, 0, or 1 if 'this' is less, equal, or greater than 'other' in
          * lexicographical order.
          */
-        int compare(const StringData& other) const;
+        int compare(StringData other) const;
 
         /**
          * note: this uses tolower, and therefore does not handle
          *       come languages correctly.
          *       should be use sparingly
          */
-        bool equalCaseInsensitive( const StringData& other ) const;
+        bool equalCaseInsensitive( StringData other ) const;
 
         void copyTo( char* dest, bool includeEndingNull ) const;
 
@@ -109,18 +107,18 @@ namespace mongo {
         //
 
         size_t find( char c , size_t fromPos = 0 ) const;
-        size_t find( const StringData& needle ) const;
+        size_t find( StringData needle ) const;
         size_t rfind( char c, size_t fromPos = std::string::npos ) const;
 
         /**
          * Returns true if 'prefix' is a substring of this instance, anchored at position 0.
          */
-        bool startsWith( const StringData& prefix ) const;
+        bool startsWith( StringData prefix ) const;
 
         /**
          * Returns true if 'suffix' is a substring of this instance, anchored at the end.
          */
-        bool endsWith( const StringData& suffix ) const;
+        bool endsWith( StringData suffix ) const;
 
         //
         // accessors
@@ -133,7 +131,7 @@ namespace mongo {
          */
         const char* rawData() const { return _data; }
 
-        size_t size() const { fillSize(); return _size; }
+        size_t size() const { return _size; }
         bool empty() const { return size() == 0; }
         std::string toString() const { return std::string(_data, size()); }
         char operator[] ( unsigned pos ) const { return _data[pos]; }
@@ -144,7 +142,7 @@ namespace mongo {
          *          to be consistent across versions.
          */
         struct Hasher {
-            size_t operator() (const StringData& str) const;
+            size_t operator() (StringData str) const;
         };
 
         //
@@ -158,40 +156,34 @@ namespace mongo {
 
     private:
         const char* _data;        // is not guaranted to be null terminated (see "notes" above)
-        mutable size_t _size;     // 'size' does not include the null terminator
-
-        void fillSize() const {
-            if (_size == std::string::npos) {
-                _size = strlen(_data);
-            }
-        }
+        size_t _size;     // 'size' does not include the null terminator
     };
 
-    inline bool operator==(const StringData& lhs, const StringData& rhs) {
-        return lhs.compare(rhs) == 0;
+    inline bool operator==(StringData lhs, StringData rhs) {
+        return (lhs.size() == rhs.size()) && (lhs.compare(rhs) == 0);
     }
 
-    inline bool operator!=(const StringData& lhs, const StringData& rhs) {
-        return lhs.compare(rhs) != 0;
+    inline bool operator!=(StringData lhs, StringData rhs) {
+        return !(lhs == rhs);
     }
 
-    inline bool operator<(const StringData& lhs, const StringData& rhs) {
+    inline bool operator<(StringData lhs, StringData rhs) {
         return lhs.compare(rhs) < 0 ;
     }
 
-    inline bool operator<=(const StringData& lhs, const StringData& rhs) {
+    inline bool operator<=(StringData lhs, StringData rhs) {
         return lhs.compare(rhs) <= 0;
     }
 
-    inline bool operator>(const StringData& lhs, const StringData& rhs) {
+    inline bool operator>(StringData lhs, StringData rhs) {
         return lhs.compare(rhs) > 0;
     }
 
-    inline bool operator>=(const StringData& lhs, const StringData& rhs) {
+    inline bool operator>=(StringData lhs, StringData rhs) {
         return lhs.compare(rhs) >= 0;
     }
 
-    std::ostream& operator<<(std::ostream& stream, const StringData& value);
+    std::ostream& operator<<(std::ostream& stream, StringData value);
 
 } // namespace mongo
 

@@ -31,9 +31,11 @@
 
 #include "mongo/util/timer.h"
 
+#include "mongo/config.h"
+
 #include <ctime>
 #include <limits>
-#if defined(MONGO_HAVE_HEADER_UNISTD_H)
+#if defined(MONGO_CONFIG_HAVE_HEADER_UNISTD_H)
 #include <unistd.h>
 #endif
 
@@ -46,6 +48,7 @@ namespace mongo {
     // Define Timer::_countsPerSecond before static initializer "atstartuputil" to ensure correct
     // relative sequencing regardless of how _countsPerSecond is initialized (static or dynamic).
     long long Timer::_countsPerSecond = Timer::microsPerSecond;
+    double Timer::_microsPerCount = 1.0f;
 
     namespace {
 
@@ -81,11 +84,11 @@ namespace mongo {
             LARGE_INTEGER x;
             bool ok = QueryPerformanceFrequency(&x);
             verify(ok);
-            Timer::_countsPerSecond = x.QuadPart;
+            Timer::setCountsPerSecond(x.QuadPart);
             _timerNow = &timerNowWindows;
         }
 
-#elif defined(MONGO_HAVE_POSIX_MONOTONIC_CLOCK)
+#elif defined(MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK)
 
         /**
          * Implementation for timer on systems that support the
@@ -112,7 +115,7 @@ namespace mongo {
                 return;
             }
 
-            Timer::_countsPerSecond = Timer::nanosPerSecond;
+            Timer::setCountsPerSecond(Timer::nanosPerSecond);
             _timerNow = &timerNowPosixMonotonicClock;
 
             // Make sure that the current time relative to the (unspecified) epoch isn't already too

@@ -31,12 +31,15 @@
 #include <iostream>
 
 #include "mongo/bson/util/builder.h"
-#include "mongo/bson/bsonobjiterator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/options_parser/constraints.h"
 
 namespace mongo {
 namespace optionenvironment {
+
+    using boost::shared_ptr;
+    using std::string;
+    using std::type_info;
 
     // Environment implementation
 

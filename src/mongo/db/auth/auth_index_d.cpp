@@ -37,14 +37,17 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::endl;
+
 namespace authindex {
 
 namespace {
@@ -74,72 +77,52 @@ namespace {
 
 }  // namespace
 
-    void configureSystemIndexes(OperationContext* txn) {
-        int authzVersion;
-        Status status = getGlobalAuthorizationManager()->getAuthorizationVersion(
-                                                                txn, &authzVersion);
-        if (!status.isOK()) {
-            return;
+    Status verifySystemIndexes(OperationContext* txn) {
+        const NamespaceString systemUsers = AuthorizationManager::usersCollectionNamespace;
+
+        // Make sure the old unique index from v2.4 on system.users doesn't exist.
+        ScopedTransaction scopedXact(txn, MODE_IX);
+        AutoGetDb autoDb(txn, systemUsers.db(), MODE_X);
+        if (!autoDb.getDb()) {
+            return Status::OK();
         }
 
-        if (authzVersion >= AuthorizationManager::schemaVersion26Final) {
-            const NamespaceString systemUsers("admin", "system.users");
-
-            // Make sure the old unique index from v2.4 on system.users doesn't exist.
-            AutoGetDb autoDb(txn, systemUsers.db(), MODE_X);
-            if (!autoDb.getDb()) {
-                return;
-            }
-
-            Collection* collection = autoDb.getDb()->getCollection(txn,
-                                                                   NamespaceString(systemUsers));
-            if (!collection) {
-                return;
-            }
-
-            IndexCatalog* indexCatalog = collection->getIndexCatalog();
-            IndexDescriptor* oldIndex = NULL;
-
-            WriteUnitOfWork wunit(txn);
-            while ((oldIndex = indexCatalog->findIndexByKeyPattern(txn, v1SystemUsersKeyPattern))) {
-                indexCatalog->dropIndex(txn, oldIndex);
-            }
-            wunit.commit();
+        Collection* collection = autoDb.getDb()->getCollection(NamespaceString(systemUsers));
+        if (!collection) {
+            return Status::OK();
         }
+
+        IndexCatalog* indexCatalog = collection->getIndexCatalog();
+        IndexDescriptor* oldIndex = NULL;
+
+        if (indexCatalog &&
+            (oldIndex = indexCatalog->findIndexByKeyPattern(txn, v1SystemUsersKeyPattern))) {
+            return Status(ErrorCodes::AuthSchemaIncompatible,
+                          "Old 2.4 style user index identified. "
+                          "The authentication schema needs to be updated by "
+                          "running authSchemaUpgrade on a 2.6 server.");
+        }
+
+        return Status::OK();
     }
 
     void createSystemIndexes(OperationContext* txn, Collection* collection) {
         invariant( collection );
         const NamespaceString& ns = collection->ns();
         if (ns == AuthorizationManager::usersCollectionNamespace) {
-            try {
-                Helpers::ensureIndex(txn,
-                                     collection,
-                                     v3SystemUsersKeyPattern,
-                                     true,  // unique
-                                     v3SystemUsersIndexName.c_str());
-            } catch (const DBException& e) {
-                if (e.getCode() == ASSERT_ID_DUPKEY) {
-                    log() << "Duplicate key exception while trying to build unique index on " <<
-                            ns << ".  This is likely due to problems during the upgrade process " <<
-                            endl;
-                }
-                throw;
-            }
+            collection->getIndexCatalog()->createIndexOnEmptyCollection(
+                txn,
+                BSON("name" << v3SystemUsersIndexName
+                  << "ns" << collection->ns().ns()
+                  << "key" << v3SystemUsersKeyPattern
+                  << "unique" << true));
         } else if (ns == AuthorizationManager::rolesCollectionNamespace) {
-            try {
-                Helpers::ensureIndex(txn,
-                                     collection,
-                                     v3SystemRolesKeyPattern,
-                                     true,  // unique
-                                     v3SystemRolesIndexName.c_str());
-            } catch (const DBException& e) {
-                if (e.getCode() == ASSERT_ID_DUPKEY) {
-                    log() << "Duplicate key exception while trying to build unique index on " <<
-                            ns << "." << endl;
-                }
-                throw;
-            }
+            collection->getIndexCatalog()->createIndexOnEmptyCollection(
+                txn,
+                BSON("name" << v3SystemRolesIndexName
+                  << "ns" << collection->ns().ns()
+                  << "key" << v3SystemRolesKeyPattern
+                  << "unique" << true));
         }
     }
 

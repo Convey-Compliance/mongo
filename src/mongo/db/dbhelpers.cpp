@@ -34,17 +34,20 @@
 
 #include "mongo/db/dbhelpers.h"
 
-#include <boost/filesystem/convenience.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/db.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/index/btree_access_method.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -53,18 +56,26 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/range_arithmetic.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/s/d_state.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::ios_base;
+    using std::ofstream;
+    using std::set;
+    using std::string;
+    using std::stringstream;
 
     using logger::LogComponent;
 
@@ -104,22 +115,22 @@ namespace mongo {
                           const BSONObj &query, 
                           BSONObj& result, 
                           bool requireIndex) {
-        DiskLoc loc = findOne( txn, collection, query, requireIndex );
+        RecordId loc = findOne( txn, collection, query, requireIndex );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor(txn, loc);
+        result = collection->docFor(txn, loc).value();
         return true;
     }
 
     /* fetch a single object from collection ns that matches query
        set your db SavedContext first
     */
-    DiskLoc Helpers::findOne(OperationContext* txn,
+    RecordId Helpers::findOne(OperationContext* txn,
                              Collection* collection,
                              const BSONObj &query,
                              bool requireIndex) {
         if ( !collection )
-            return DiskLoc();
+            return RecordId();
 
         CanonicalQuery* cq;
         const WhereCallbackReal whereCallback(txn, collection->ns().db());
@@ -139,11 +150,11 @@ namespace mongo {
 
         auto_ptr<PlanExecutor> exec(rawExec);
         PlanExecutor::ExecState state;
-        DiskLoc loc;
+        RecordId loc;
         if (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
             return loc;
         }
-        return DiskLoc();
+        return RecordId();
     }
 
     bool Helpers::findById(OperationContext* txn,
@@ -156,7 +167,7 @@ namespace mongo {
 
         invariant(database);
 
-        Collection* collection = database->getCollection( txn, ns );
+        Collection* collection = database->getCollection( ns );
         if ( !collection ) {
             return false;
         }
@@ -173,43 +184,35 @@ namespace mongo {
         if ( indexFound )
             *indexFound = 1;
 
-        // See SERVER-12397.  This may not always be true.
-        BtreeBasedAccessMethod* accessMethod =
-            static_cast<BtreeBasedAccessMethod*>(catalog->getIndex( desc ));
-
-        DiskLoc loc = accessMethod->findSingle( txn, query["_id"].wrap() );
+        RecordId loc = catalog->getIndex(desc)->findSingle( txn, query["_id"].wrap() );
         if ( loc.isNull() )
             return false;
-        result = collection->docFor( txn, loc );
+        result = collection->docFor(txn, loc).value();
         return true;
     }
 
-    DiskLoc Helpers::findById(OperationContext* txn,
+    RecordId Helpers::findById(OperationContext* txn,
                               Collection* collection,
                               const BSONObj& idquery) {
         verify(collection);
         IndexCatalog* catalog = collection->getIndexCatalog();
         const IndexDescriptor* desc = catalog->findIdIndex( txn );
         uassert(13430, "no _id index", desc);
-        // See SERVER-12397.  This may not always be true.
-        BtreeBasedAccessMethod* accessMethod =
-            static_cast<BtreeBasedAccessMethod*>(catalog->getIndex( desc ));
-        return accessMethod->findSingle( txn, idquery["_id"].wrap() );
+        return catalog->getIndex(desc)->findSingle( txn, idquery["_id"].wrap() );
     }
 
-    /* Get the first object from a collection.  Generally only useful if the collection
-       only ever has a single object -- which is a "singleton collection". Note that the
-       BSONObj returned is *not* owned and will become invalid if the database is closed.
-
-       Returns: true if object exists.
-    */
     bool Helpers::getSingleton(OperationContext* txn, const char *ns, BSONObj& result) {
         AutoGetCollectionForRead ctx(txn, ns);
         auto_ptr<PlanExecutor> exec(InternalPlanner::collectionScan(txn, ns, ctx.getCollection()));
-
         PlanExecutor::ExecState state = exec->getNext(&result, NULL);
+
         txn->getCurOp()->done();
-        return PlanExecutor::ADVANCED == state;
+
+        if (PlanExecutor::ADVANCED == state) {
+            result = result.getOwned();
+            return true;
+        }
+        return false;
     }
 
     bool Helpers::getLast(OperationContext* txn, const char *ns, BSONObj& result) {
@@ -218,9 +221,13 @@ namespace mongo {
                                                                     ns,
                                                                     autoColl.getCollection(),
                                                                     InternalPlanner::BACKWARD));
-
         PlanExecutor::ExecState state = exec->getNext(&result, NULL);
-        return PlanExecutor::ADVANCED == state;
+
+        if (PlanExecutor::ADVANCED == state) {
+            result = result.getOwned();
+            return true;
+        }
+        return false;
     }
 
     void Helpers::upsert( OperationContext* txn,
@@ -232,55 +239,36 @@ namespace mongo {
         BSONObj id = e.wrap();
 
         OpDebug debug;
-        Client::Context context(txn, ns);
+        OldClientContext context(txn, ns);
 
         const NamespaceString requestNs(ns);
-        UpdateRequest request(txn, requestNs);
+        UpdateRequest request(requestNs);
 
         request.setQuery(id);
         request.setUpdates(o);
         request.setUpsert();
-        request.setUpdateOpLog();
         request.setFromMigration(fromMigrate);
         UpdateLifecycleImpl updateLifecycle(true, requestNs);
         request.setLifecycle(&updateLifecycle);
 
-        update(context.db(), request, &debug);
+        update(txn, context.db(), request, &debug);
     }
 
     void Helpers::putSingleton(OperationContext* txn, const char *ns, BSONObj obj) {
         OpDebug debug;
-        Client::Context context(txn, ns);
+        OldClientContext context(txn, ns);
 
         const NamespaceString requestNs(ns);
-        UpdateRequest request(txn, requestNs);
+        UpdateRequest request(requestNs);
 
         request.setUpdates(obj);
         request.setUpsert();
-        request.setUpdateOpLog();
         UpdateLifecycleImpl updateLifecycle(true, requestNs);
         request.setLifecycle(&updateLifecycle);
 
-        update(context.db(), request, &debug);
+        update(txn, context.db(), request, &debug);
 
-        context.getClient()->curop()->done();
-    }
-
-    void Helpers::putSingletonGod(OperationContext* txn, const char *ns, BSONObj obj, bool logTheOp) {
-        OpDebug debug;
-        Client::Context context(txn, ns);
-
-        const NamespaceString requestNs(ns);
-        UpdateRequest request(txn, requestNs);
-
-        request.setGod();
-        request.setUpdates(obj);
-        request.setUpsert();
-        request.setUpdateOpLog(logTheOp);
-
-        update(context.db(), request, &debug);
-
-        context.getClient()->curop()->done();
+        CurOp::get(txn->getClient())->done();
     }
 
     BSONObj Helpers::toKeyFormat( const BSONObj& o ) {
@@ -372,7 +360,7 @@ namespace mongo {
         while ( 1 ) {
             // Scoping for write lock.
             {
-                Client::WriteContext ctx(txn, ns);
+                OldClientWriteContext ctx(txn, ns);
                 Collection* collection = ctx.getCollection();
                 if ( !collection )
                     break;
@@ -388,7 +376,7 @@ namespace mongo {
                                                                        InternalPlanner::IXSCAN_FETCH));
                 exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-                DiskLoc rloc;
+                RecordId rloc;
                 BSONObj obj;
                 PlanExecutor::ExecState state;
                 // This may yield so we cannot touch nsd after this.
@@ -403,7 +391,7 @@ namespace mongo {
                     break;
                 }
 
-                if (PlanExecutor::EXEC_ERROR == state) {
+                if (PlanExecutor::FAILURE == state) {
                     warning(LogComponent::kSharding) << "cursor error while trying to delete "
                               << min << " to " << max
                               << " in " << ns << ": "
@@ -446,13 +434,19 @@ namespace mongo {
                         break;
                     }
                 }
+
+                if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(ns)) {
+                    warning() << "stepped down from primary while deleting chunk; "
+                              << "orphaning data in " << ns
+                              << " in range [" << min << ", " << max << ")";
+                    return numDeleted;
+                }
+
                 if ( callback )
                     callback->goingToDelete( obj );
 
                 BSONObj deletedId;
                 collection->deleteDocument( txn, rloc, false, false, &deletedId );
-                // The above throws on failure, and so is not logged
-                repl::logOp(txn, "d", ns.c_str(), deletedId, 0, 0, fromMigrate);
                 wuow.commit();
                 numDeleted++;
             }
@@ -462,9 +456,10 @@ namespace mongo {
 
             if (writeConcern.shouldWaitForOtherNodes() && numDeleted > 0) {
                 repl::ReplicationCoordinator::StatusAndDuration replStatus =
-                        repl::getGlobalReplicationCoordinator()->awaitReplication(txn,
-                                                                                  txn->getClient()->getLastOp(),
-                                                                                  writeConcern);
+                        repl::getGlobalReplicationCoordinator()->awaitReplication(
+                                txn,
+                                repl::ReplClientInfo::forClient(txn->getClient()).getLastOp(),
+                                writeConcern);
                 if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
                     warning(LogComponent::kSharding)
                             << "replication to secondaries for removeRange at "
@@ -497,7 +492,7 @@ namespace mongo {
     Status Helpers::getLocsInRange( OperationContext* txn,
                                     const KeyRange& range,
                                     long long maxChunkSizeBytes,
-                                    set<DiskLoc>* locs,
+                                    set<RecordId>* locs,
                                     long long* numDocs,
                                     long long* estChunkSizeBytes )
     {
@@ -556,7 +551,7 @@ namespace mongo {
         // already being queued and will be migrated in the 'transferMods' stage
         exec->setYieldPolicy(PlanExecutor::YIELD_AUTO);
 
-        DiskLoc loc;
+        RecordId loc;
         PlanExecutor::ExecState state;
         while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &loc))) {
             if ( !isLargeChunk ) {
@@ -582,7 +577,10 @@ namespace mongo {
 
 
     void Helpers::emptyCollection(OperationContext* txn, const char *ns) {
-        Client::Context context(txn, ns);
+        OldClientContext context(txn, ns);
+        bool shouldReplicateWrites = txn->writesAreReplicated();
+        txn->setReplicatedWrites(false);
+        ON_BLOCK_EXIT(&OperationContext::setReplicatedWrites, txn, shouldReplicateWrites);
         deleteObjects(txn, context.db(), ns, BSONObj(), PlanExecutor::YIELD_MANUAL, false);
     }
 

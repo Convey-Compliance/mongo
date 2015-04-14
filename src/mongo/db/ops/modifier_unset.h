@@ -68,7 +68,7 @@ namespace mongo {
          * 'execInfo' accordingly. Return OK if successful or a status describing the error.
          */
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
         /**
@@ -97,7 +97,7 @@ namespace mongo {
         // prepare() was issued and until a log() is issued. The document this mod is
         // being prepared against must be live throughout all the calls.
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
 
     };
 

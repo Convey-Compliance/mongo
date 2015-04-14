@@ -60,8 +60,18 @@ namespace mongo {
         invariant(!"unittests shouldn't call dbexit");
     }
 
-    void exitCleanly( ExitCode code, OperationContext* txn ) {
+    void exitCleanly(ExitCode code) {
         invariant(!"unittests shouldn't call exitCleanly");
     }
+
+#ifdef _WIN32
+    void signalShutdown() {}
+
+namespace ntservice {
+    bool shouldStartService() {
+        return false;
+    }
+}
+#endif
 
 }  // namespace mongo

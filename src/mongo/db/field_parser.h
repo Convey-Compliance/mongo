@@ -30,7 +30,6 @@
 
 #include <string>
 
-#include "mongo/bson/bson_field.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/s/bson_serializable.h"
 #include "mongo/util/time_support.h"
@@ -107,13 +106,13 @@ namespace mongo {
                                    std::string* errMsg = NULL );
 
         static FieldState extract( BSONObj doc,
-                                   const BSONField<OpTime>& field,
-                                   OpTime* out,
+                                   const BSONField<Timestamp>& field,
+                                   Timestamp* out,
                                    std::string* errMsg = NULL );
 
         static FieldState extract( BSONElement elem,
-                                   const BSONField<OpTime>& field,
-                                   OpTime* out,
+                                   const BSONField<Timestamp>& field,
+                                   Timestamp* out,
                                    std::string* errMsg = NULL );
 
         static FieldState extract( BSONObj doc,
@@ -262,6 +261,22 @@ namespace mongo {
          */
         template<typename T>
         static FieldState extract(BSONObj doc,
+                            const BSONField<std::vector<T*> >& field,
+                            std::vector<T*>* out,
+                            std::string* errMsg = NULL);
+
+        /**
+         * Extracts a mandatory repetition of BSONSerializable structures, 'field', from the
+         * field 'elem'. Write the extracted contents to '*out' if successful or fills
+         * '*errMsg', if exising, otherwise.  This variant relies on T having a parseBSON,
+         * which all BSONSerializable's have.
+         *
+         * The vector owns the instances of T.
+         *
+         * TODO: Tighten for BSONSerializable's only
+         */
+        template<typename T>
+        static FieldState extract(BSONElement elem,
                             const BSONField<std::vector<T*> >& field,
                             std::vector<T*>* out,
                             std::string* errMsg = NULL);

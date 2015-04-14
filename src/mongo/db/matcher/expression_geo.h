@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/geo/geometry_container.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
@@ -81,7 +83,7 @@ namespace mongo {
         /**
          * Takes ownership of the passed-in GeoExpression.
          */
-        Status init( const StringData& path, const GeoExpression* query, const BSONObj& rawObj );
+        Status init( StringData path, const GeoExpression* query, const BSONObj& rawObj );
 
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
@@ -99,7 +101,7 @@ namespace mongo {
     private:
         BSONObj _rawObj;
         // Share ownership of our query with all of our clones
-        shared_ptr<const GeoExpression> _query;
+        boost::shared_ptr<const GeoExpression> _query;
     };
 
 
@@ -150,7 +152,7 @@ namespace mongo {
         GeoNearMatchExpression() : LeafMatchExpression( GEO_NEAR ){}
         virtual ~GeoNearMatchExpression(){}
 
-        Status init( const StringData& path, const GeoNearExpression* query, const BSONObj& rawObj );
+        Status init( StringData path, const GeoNearExpression* query, const BSONObj& rawObj );
 
         // This shouldn't be called and as such will crash.  GeoNear always requires an index.
         virtual bool matchesSingleElement( const BSONElement& e ) const;
@@ -168,7 +170,7 @@ namespace mongo {
     private:
         BSONObj _rawObj;
         // Share ownership of our query with all of our clones
-        shared_ptr<const GeoNearExpression> _query;
+        boost::shared_ptr<const GeoNearExpression> _query;
     };
 
 }  // namespace mongo

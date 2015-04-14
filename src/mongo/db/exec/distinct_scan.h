@@ -31,18 +31,16 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/index/btree_index_cursor.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/index_bounds.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
     class IndexAccessMethod;
-    class IndexCursor;
     class IndexDescriptor;
     class WorkingSet;
 
@@ -79,24 +77,6 @@ namespace mongo {
      */
     class DistinctScan : public PlanStage {
     public:
-        /**
-         * Keeps track of what this distinct scan is currently doing so that it
-         * can do the right thing on the next call to work().
-         */
-        enum ScanState {
-            // Need to initialize the underlying index traversal machinery.
-            INITIALIZING,
-
-            // Skipping keys in order to check whether we have reached the end.
-            CHECKING_END,
-
-            // Retrieving the next key, and applying the filter if necessary.
-            GETTING_NEXT,
-
-            // The index scan is finished.
-            HIT_END
-        };
-
         DistinctScan(OperationContext* txn, const DistinctParams& params, WorkingSet* workingSet);
         virtual ~DistinctScan() { }
 
@@ -104,11 +84,11 @@ namespace mongo {
         virtual bool isEOF();
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
-        virtual StageType stageType() const { return STAGE_DISTINCT; }
+        virtual StageType stageType() const { return STAGE_DISTINCT_SCAN; }
 
         virtual PlanStageStats* getStats();
 
@@ -119,14 +99,6 @@ namespace mongo {
         static const char* kStageType;
 
     private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
-
-        /** See if the cursor is pointing at or past _endKey, if _endKey is non-empty. */
-        void checkEnd();
-
         // transactional context for read locks. Not owned by us
         OperationContext* _txn;
 
@@ -138,23 +110,13 @@ namespace mongo {
         const IndexAccessMethod* _iam; // owned by Collection -> IndexCatalog
 
         // The cursor we use to navigate the tree.
-        boost::scoped_ptr<BtreeIndexCursor> _btreeCursor;
-
-        // Keeps track of what work we need to do next.
-        ScanState _scanState;
-
-        // For yielding.
-        BSONObj _savedKey;
-        DiskLoc _savedLoc;
+        std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
         DistinctParams _params;
 
         // _checker gives us our start key and ensures we stay in bounds.
-        boost::scoped_ptr<IndexBoundsChecker> _checker;
-        int _keyEltsToUse;
-        bool _movePastKeyElts;
-        std::vector<const BSONElement*> _keyElts;
-        std::vector<bool> _keyEltsInc;
+        IndexBoundsChecker _checker;
+        IndexSeekPoint _seekPoint;
 
         // Stats
         CommonStats _commonStats;

@@ -33,23 +33,25 @@
 #include "mongo/db/repl/bgsync.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
-#include "mongo/db/repl/repl_coordinator_impl.h"
-#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/repl/rs_sync.h"
-#include "mongo/db/repl/rslog.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::string;
 
 namespace repl {
 
@@ -106,7 +108,6 @@ namespace {
                                        _lastFetchedHash(0),
                                        _pause(true),
                                        _appliedBuffer(true),
-                                       _assumingPrimary(false),
                                        _replCoord(getGlobalReplicationCoordinator()),
                                        _initialSyncRequestedFlag(false),
                                        _indexPrefetchConfig(PREFETCH_ALL) {
@@ -121,34 +122,44 @@ namespace {
     }
 
     void BackgroundSync::shutdown() {
-        notify();
+        boost::lock_guard<boost::mutex> lock(_mutex);
+
+        // Clear the buffer in case the producerThread is waiting in push() due to a full queue.
+        invariant(inShutdown());
+        _buffer.clear();
+        _pause = true;
+
+        // Wake up producerThread so it notices that we're in shutdown
+        _appliedBufferCondition.notify_all();
+        _pausedCondition.notify_all();
     }
 
-    void BackgroundSync::notify() {
+    void BackgroundSync::notify(OperationContext* txn) {
         boost::lock_guard<boost::mutex> lock(_mutex);
 
         // If all ops in the buffer have been applied, unblock waitForRepl (if it's waiting)
         if (_buffer.empty()) {
             _appliedBuffer = true;
-            _replCoord->signalDrainComplete();
-            _condvar.notify_all();
+            _appliedBufferCondition.notify_all();
         }
     }
 
     void BackgroundSync::producerThread() {
         Client::initThread("rsBackgroundSync");
-        replLocalAuth();
+        cc().getAuthorizationSession()->grantInternalAuthorization();
 
         while (!inShutdown()) {
             try {
                 _producerThread();
             }
             catch (const DBException& e) {
-                sethbmsg(str::stream() << "sync source problem: " << e.toString());
+                std::string msg(str::stream() << "sync producer problem: " << e.toString());
+                error() << msg;
+                _replCoord->setMyHeartbeatMessage(msg);
             }
             catch (const std::exception& e2) {
-                sethbmsg(str::stream() << "exception in producer: " << e2.what());
-                sleepsecs(60);
+                severe() << "sync producer exception: " << e2.what();
+                fassertFailed(28546);
             }
         }
 
@@ -156,7 +167,7 @@ namespace {
     }
 
     void BackgroundSync::_producerThread() {
-        const MemberState state = _replCoord->getCurrentMemberState();
+        const MemberState state = _replCoord->getMemberState();
         // we want to pause when the state changes to primary
         if (_replCoord->isWaitingForApplierToDrain() || state.primary()) {
             if (!_pause) {
@@ -203,8 +214,11 @@ namespace {
             }
 
             // Wait until we've applied the ops we have before we choose a sync target
-            while (!_appliedBuffer) {
-                _condvar.wait(lock);
+            while (!_appliedBuffer && !inShutdownStrict()) {
+                _appliedBufferCondition.wait(lock);
+            }
+            if (inShutdownStrict()) {
+                return;
             }
         }
 
@@ -214,7 +228,7 @@ namespace {
 
 
         // find a target to sync from the last optime fetched
-        OpTime lastOpTimeFetched;
+        Timestamp lastOpTimeFetched;
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
             lastOpTimeFetched = _lastOpTimeFetched;
@@ -237,7 +251,7 @@ namespace {
             _replCoord->signalUpstreamUpdater();
         }
 
-        _syncSourceReader.tailingQueryGTE(rsoplog, lastOpTimeFetched);
+        _syncSourceReader.tailingQueryGTE(rsOplogName.c_str(), lastOpTimeFetched);
 
         // if target cut connections between connecting and querying (for
         // example, because it stepped down) we might not have a cursor
@@ -272,7 +286,7 @@ namespace {
                 // If we are transitioning to primary state, we need to leave
                 // this loop in order to go into bgsync-pause mode.
                 if (_replCoord->isWaitingForApplierToDrain() || 
-                    _replCoord->getCurrentMemberState().primary()) {
+                    _replCoord->getMemberState().primary()) {
                     return;
                 }
 
@@ -303,7 +317,7 @@ namespace {
 
                     _syncSourceReader.tailCheck();
                     if( !_syncSourceReader.haveCursor() ) {
-                        LOG(1) << "replSet end syncTail pass" << rsLog;
+                        LOG(1) << "replSet end syncTail pass";
                         return;
                     }
 
@@ -314,7 +328,7 @@ namespace {
             // If we are transitioning to primary state, we need to leave
             // this loop in order to go into bgsync-pause mode.
             if (_replCoord->isWaitingForApplierToDrain() ||
-                _replCoord->getCurrentMemberState().primary()) {
+                _replCoord->getMemberState().primary()) {
                 LOG(1) << "waiting for draining or we are primary, not adding more ops to buffer";
                 return;
             }
@@ -330,7 +344,7 @@ namespace {
             }
 
             OCCASIONALLY {
-                LOG(2) << "bgsync buffer has " << _buffer.size() << " bytes" << rsLog;
+                LOG(2) << "bgsync buffer has " << _buffer.size() << " bytes";
             }
 
             bufferCountGauge.increment();
@@ -340,9 +354,8 @@ namespace {
             {
                 boost::unique_lock<boost::mutex> lock(_mutex);
                 _lastFetchedHash = o["h"].numberLong();
-                _lastOpTimeFetched = o["ts"]._opTime();
-                LOG(3) << "replSet lastOpTimeFetched: "
-                       << _lastOpTimeFetched.toStringPretty() << rsLog;
+                _lastOpTimeFetched = o["ts"].timestamp();
+                LOG(3) << "lastOpTimeFetched: " << _lastOpTimeFetched.toStringPretty();
             }
         }
     }
@@ -378,59 +391,40 @@ namespace {
         bufferSizeGauge.decrement(getSize(op));
     }
 
-    bool BackgroundSync::isStale(OpTime lastOpTimeFetched, 
-                                 OplogReader& r, 
-                                 BSONObj& remoteOldestOp) {
-        remoteOldestOp = r.findOne(rsoplog, Query());
-        OpTime remoteTs = remoteOldestOp["ts"]._opTime();
-        {
-            boost::unique_lock<boost::mutex> lock(_mutex);
-
-            if (lastOpTimeFetched >= remoteTs) {
-                return false;
-            }
-            log() << "replSet remoteOldestOp:    " << remoteTs.toStringLong() << rsLog;
-            log() << "replSet lastOpTimeFetched: " << lastOpTimeFetched.toStringLong() << rsLog;
-        }
-
-        return true;
-    }
-
     bool BackgroundSync::_rollbackIfNeeded(OperationContext* txn, OplogReader& r) {
         string hn = r.conn()->getServerAddress();
 
         if (!r.more()) {
             try {
-                BSONObj theirLastOp = r.getLastOp(rsoplog);
+                BSONObj theirLastOp = r.getLastOp(rsOplogName.c_str());
                 if (theirLastOp.isEmpty()) {
-                    log() << "replSet error empty query result from " << hn << " oplog" << rsLog;
+                    error() << "empty query result from " << hn << " oplog";
                     sleepsecs(2);
                     return true;
                 }
-                OpTime theirTS = theirLastOp["ts"]._opTime();
+                Timestamp theirTS = theirLastOp["ts"].timestamp();
                 if (theirTS < _lastOpTimeFetched) {
-                    log() << "replSet we are ahead of the sync source, will try to roll back"
-                          << rsLog;
+                    log() << "we are ahead of the sync source, will try to roll back";
                     syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
                     return true;
                 }
                 /* we're not ahead?  maybe our new query got fresher data.  best to come back and try again */
-                log() << "replSet syncTail condition 1" << rsLog;
+                log() << "syncTail condition 1";
                 sleepsecs(1);
             }
             catch(DBException& e) {
-                log() << "replSet error querying " << hn << ' ' << e.toString() << rsLog;
+                error() << "querying " << hn << ' ' << e.toString();
                 sleepsecs(2);
             }
             return true;
         }
 
         BSONObj o = r.nextSafe();
-        OpTime ts = o["ts"]._opTime();
+        Timestamp ts = o["ts"].timestamp();
         long long hash = o["h"].numberLong();
         if( ts != _lastOpTimeFetched || hash != _lastFetchedHash ) {
-            log() << "replSet our last op time fetched: " << _lastOpTimeFetched.toStringPretty() << rsLog;
-            log() << "replset source's GTE: " << ts.toStringPretty() << rsLog;
+            log() << "our last op time fetched: " << _lastOpTimeFetched.toStringPretty();
+            log() << "source's GTE: " << ts.toStringPretty();
             syncRollback(txn, _replCoord->getMyLastOptime(), &r, _replCoord);
             return true;
         }
@@ -449,14 +443,14 @@ namespace {
     }
 
     void BackgroundSync::stop() {
-        boost::unique_lock<boost::mutex> lock(_mutex);
+        boost::lock_guard<boost::mutex> lock(_mutex);
 
         _pause = true;
-        _syncSourceReader.resetConnection();
         _syncSourceHost = HostAndPort();
-        _lastOpTimeFetched = OpTime(0,0);
+        _lastOpTimeFetched = Timestamp(0,0);
         _lastFetchedHash = 0;
-        _condvar.notify_all();
+        _appliedBufferCondition.notify_all();
+        _pausedCondition.notify_all();
     }
 
     void BackgroundSync::start(OperationContext* txn) {
@@ -471,27 +465,15 @@ namespace {
         _lastOpTimeFetched = _replCoord->getMyLastOptime();
         _lastFetchedHash = _lastAppliedHash;
 
-        LOG(1) << "replset bgsync fetch queue set to: " << _lastOpTimeFetched << 
-            " " << _lastFetchedHash << rsLog;
+        LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched <<
+            " " << _lastFetchedHash;
     }
 
-    bool BackgroundSync::isAssumingPrimary_inlock() {
-        return _assumingPrimary;
-    }
-
-    void BackgroundSync::stopReplicationAndFlushBuffer() {
-        boost::unique_lock<boost::mutex> lck(_mutex);
-
-        // 1. Tell syncing to stop
-        _assumingPrimary = true;
-
-        // 2. Wait for syncing to stop and buffer to be applied
-        while (!(_pause && _appliedBuffer)) {
-            _condvar.wait(lck);
+    void BackgroundSync::waitUntilPaused() {
+        boost::unique_lock<boost::mutex> lock(_mutex);
+        while (!_pause) {
+            _pausedCondition.wait(lock);
         }
-
-        // 3. Now actually become primary
-        _assumingPrimary = false;
     }
 
     long long BackgroundSync::getLastAppliedHash() const {
@@ -513,11 +495,9 @@ namespace {
     long long BackgroundSync::_readLastAppliedHash(OperationContext* txn) {
         BSONObj oplogEntry;
         try {
-            // Uses WuoW because there is no way to demarcate a read transaction boundary.
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), "local", MODE_X);
-            WriteUnitOfWork uow(txn);
-            bool success = Helpers::getLast(txn, rsoplog, oplogEntry);
-            uow.commit();
+            bool success = Helpers::getLast(txn, rsOplogName.c_str(), oplogEntry);
             if (!success) {
                 // This can happen when we are to do an initial sync.  lastHash will be set
                 // after the initial sync is complete.
@@ -525,18 +505,18 @@ namespace {
             }
         }
         catch (const DBException& ex) {
-            severe() << "Problem reading " << rsoplog << ": " << ex.toStatus();
+            severe() << "Problem reading " << rsOplogName << ": " << ex.toStatus();
             fassertFailed(18904);
         }
         BSONElement hashElement = oplogEntry[hashFieldName];
         if (hashElement.eoo()) {
-            severe() << "Most recent entry in " << rsoplog << " missing \"" << hashFieldName <<
+            severe() << "Most recent entry in " << rsOplogName << " missing \"" << hashFieldName <<
                 "\" field";
             fassertFailed(18902);
         }
         if (hashElement.type() != NumberLong) {
             severe() << "Expected type of \"" << hashFieldName << "\" in most recent " << 
-                rsoplog << " entry to have type NumberLong, but found " << 
+                rsOplogName << " entry to have type NumberLong, but found " << 
                 typeName(hashElement.type());
             fassertFailed(18903);
         }

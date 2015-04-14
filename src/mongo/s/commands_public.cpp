@@ -28,34 +28,37 @@
 *    then also delete it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/client/connpool.h"
-#include "mongo/client/parallel.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/commands/copydb.h"
 #include "mongo/db/commands/find_and_modify.h"
 #include "mongo/db/commands/mr.h"
 #include "mongo/db/commands/rename_collection.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/dbmessage.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/cluster_explain.h"
-#include "mongo/s/chunk.h"
+#include "mongo/s/cluster_last_error_info.h"
+#include "mongo/s/commands/cluster_commands_common.h"
+#include "mongo/s/commands/run_on_all_shards_cmd.h"
 #include "mongo/s/config.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/distlock.h"
@@ -70,41 +73,53 @@
 
 namespace mongo {
 
+    using boost::intrusive_ptr;
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::endl;
+    using std::list;
+    using std::make_pair;
+    using std::map;
+    using std::multimap;
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
+
     namespace dbgrid_pub_cmds {
 
         namespace {
 
             /**
-             * Utility function to compute a single error code from a vector of command results.  If
-             * there is an error code common to all of the error results, returns that error code;
-             * otherwise, returns 0.
+             * Utility function to parse a cursor command response and save the cursor in the
+             * CursorCache "refs" container.  Returns Status::OK() if the cursor was successfully
+             * saved or no cursor was specified in the command response, and returns an error Status
+             * if a parsing error was encountered.
              */
-            int getUniqueCode( const vector<Strategy::CommandResult>& results ) {
-                int commonErrCode = -1;
-                for ( vector<Strategy::CommandResult>::const_iterator it = results.begin();
-                      it != results.end();
-                      it++ ) {
-                    // Only look at shards with errors.
-                    if ( !it->result["ok"].trueValue() ) {
-                        int errCode = it->result["code"].numberInt();
-                        if ( commonErrCode == -1 ) {
-                            commonErrCode = errCode;
+            Status storePossibleCursor(const std::string& server, const BSONObj& cmdResult) {
+                if (cmdResult["ok"].trueValue() && cmdResult.hasField("cursor")) {
+                    BSONElement cursorIdElt = cmdResult.getFieldDotted("cursor.id");
+                    if (cursorIdElt.type() != mongo::NumberLong) {
+                        return Status(ErrorCodes::TypeMismatch,
+                                      str::stream() << "expected \"cursor.id\" field from shard "
+                                                    << "response to have NumberLong type, instead "
+                                                    << "got: " << typeName(cursorIdElt.type()));
+                    }
+                    const long long cursorId = cursorIdElt.Long();
+                    if (cursorId != 0) {
+                        BSONElement cursorNsElt = cmdResult.getFieldDotted("cursor.ns");
+                        if (cursorNsElt.type() != mongo::String) {
+                            return Status(ErrorCodes::TypeMismatch,
+                                          str::stream() << "expected \"cursor.ns\" field from "
+                                                        << "shard response to have String type, "
+                                                        << "instead got: "
+                                                        << typeName(cursorNsElt.type()));
                         }
-                        else if ( commonErrCode != errCode ) {
-                            // At least two shards with errors disagree on the error code.
-                            commonErrCode = 0;
-                        }
+                        const std::string cursorNs = cursorNsElt.String();
+                        cursorCache.storeRef(server, cursorId, cursorNs);
                     }
                 }
-
-                // If no error encountered or shards with errors disagree on the error code, return
-                // 0.
-                if ( commonErrCode == -1 || commonErrCode == 0 ) {
-                    return 0;
-                }
-
-                // Otherwise, shards with errors agree on the error code; return that code.
-                return commonErrCode;
+                return Status::OK();
             }
 
         } // namespace
@@ -130,17 +145,15 @@ namespace mongo {
         protected:
 
             bool passthrough( DBConfigPtr conf, const BSONObj& cmdObj , BSONObjBuilder& result ) {
-                return _passthrough(conf->getName(), conf, cmdObj, 0, result);
+                return _passthrough(conf->name(), conf, cmdObj, 0, result);
             }
+
             bool adminPassthrough( DBConfigPtr conf, const BSONObj& cmdObj , BSONObjBuilder& result ) {
                 return _passthrough("admin", conf, cmdObj, 0, result);
             }
 
             bool passthrough( DBConfigPtr conf, const BSONObj& cmdObj , int options, BSONObjBuilder& result ) {
-                return _passthrough(conf->getName(), conf, cmdObj, options, result);
-            }
-            bool adminPassthrough( DBConfigPtr conf, const BSONObj& cmdObj , int options, BSONObjBuilder& result ) {
-                return _passthrough("admin", conf, cmdObj, options, result);
+                return _passthrough(conf->name(), conf, cmdObj, options, result);
             }
 
         private:
@@ -159,131 +172,6 @@ namespace mongo {
             }
         };
 
-        class RunOnAllShardsCommand : public Command {
-        public:
-            RunOnAllShardsCommand(const char* n,
-                                  const char* oldname=NULL,
-                                  bool useShardConn = false):
-                                      Command(n, false, oldname),
-                                      _useShardConn(useShardConn) {
-            }
-
-            virtual bool slaveOk() const { return true; }
-            virtual bool adminOnly() const { return false; }
-
-            // all grid commands are designed not to lock
-            virtual bool isWriteCommandForConfigServer() const { return false; }
-
-            // default impl uses all shards for DB
-            virtual void getShards(const string& dbName , BSONObj& cmdObj, set<Shard>& shards) {
-                DBConfigPtr conf = grid.getDBConfig( dbName , false );
-                conf->getAllShards(shards);
-            }
-
-            virtual void aggregateResults(const vector<BSONObj>& results, BSONObjBuilder& output) {}
-
-            virtual BSONObj specialErrorHandler( const string& server,
-                                                 const string& dbName,
-                                                 const BSONObj& cmdObj,
-                                                 const BSONObj& originalResult ) const {
-                return originalResult;
-            }
-
-            // don't override
-            virtual bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& output, bool) {
-                LOG(1) << "RunOnAllShardsCommand db: " << dbName << " cmd:" << cmdObj << endl;
-                set<Shard> shards;
-                getShards(dbName, cmdObj, shards);
-
-                // TODO: Future is deprecated, replace with commandOp()
-
-                list< shared_ptr<Future::CommandResult> > futures;
-                for ( set<Shard>::const_iterator i=shards.begin(), end=shards.end() ; i != end ; i++ ) {
-                    futures.push_back( Future::spawnCommand( i->getConnString(),
-                                                             dbName,
-                                                             cmdObj,
-                                                             0,
-                                                             NULL,
-                                                             _useShardConn ));
-                }
-
-                vector<BSONObj> results;
-                BSONObjBuilder subobj (output.subobjStart("raw"));
-                BSONObjBuilder errors;
-                int commonErrCode = -1;
-
-                for ( list< shared_ptr<Future::CommandResult> >::iterator i=futures.begin(); i!=futures.end(); i++ ) {
-                    shared_ptr<Future::CommandResult> res = *i;
-
-                    if ( res->join() ) {
-                        // success :)
-                        BSONObj result = res->result();
-                        results.push_back( result );
-                        subobj.append( res->getServer(), result );
-                        continue;
-                    }
-
-                    BSONObj result = res->result();
-
-                    if ( result["errmsg"].type() ||
-                         result["code"].numberInt() != 0 ) {
-                        result = specialErrorHandler( res->getServer(), dbName, cmdObj, result );
-
-                        BSONElement errmsg = result["errmsg"];
-                        if ( errmsg.eoo() || errmsg.String().empty() ) {
-                            // it was fixed!
-                            results.push_back( result );
-                            subobj.append( res->getServer(), result );
-                            continue;
-                        }
-                    }
-
-                    // Handle "errmsg".
-                    if( ! result["errmsg"].eoo() ){
-                        errors.appendAs(result["errmsg"], res->getServer());
-                    }
-                    else {
-                        // Can happen if message is empty, for some reason
-                        errors.append( res->getServer(), str::stream() <<
-                                       "result without error message returned : " << result );
-                    }
-
-                    // Handle "code".
-                    int errCode = result["code"].numberInt();
-                    if ( commonErrCode == -1 ) {
-                        commonErrCode = errCode;
-                    }
-                    else if ( commonErrCode != errCode ) {
-                        commonErrCode = 0;
-                    }
-
-                    results.push_back( result );
-                    subobj.append( res->getServer(), result );
-                }
-
-                subobj.done();
-
-                BSONObj errobj = errors.done();
-                if (! errobj.isEmpty()) {
-                    errmsg = errobj.toString(false, true);
-
-                    // If every error has a code, and the code for all errors is the same, then add
-                    // a top-level field "code" with this value to the output object.
-                    if ( commonErrCode > 0 ) {
-                        output.append( "code", commonErrCode );
-                    }
-
-                    return false;
-                }
-
-                aggregateResults(results, output);
-                return true;
-            }
-
-        private:
-            bool _useShardConn; // use ShardConnection as opposed to ScopedDbConnection
-        };
-
         class AllShardsCollectionCommand : public RunOnAllShardsCommand {
         public:
             AllShardsCollectionCommand(const char* n,
@@ -296,12 +184,17 @@ namespace mongo {
                 string fullns = dbName + '.' + cmdObj.firstElement().valuestrsafe();
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                uassert(28588,
+                        str::stream() << "Failed to load db sharding metadata for " << fullns,
+                        conf);
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     shards.insert(conf->getShard(fullns));
                 }
                 else {
-                    conf->getChunkManager(fullns)->getAllShards(shards);
+                    vector<Shard> shardList;
+                    Shard::getAllShards(shardList);
+                    shards.insert(shardList.begin(), shardList.end());
                 }
             }
         };
@@ -318,8 +211,13 @@ namespace mongo {
                 string fullns = getFullNS( dbName , cmdObj );
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , options, result );
                 }
                 errmsg = "can't do command: " + name + " on sharded collection";
@@ -629,10 +527,15 @@ namespace mongo {
             bool run(OperationContext* txn, const string& dbName,
                      BSONObj& cmdObj,
                      int,
-                     string&,
+                     string& errmsg,
                      BSONObjBuilder& result,
                      bool) {
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
+
                 return passthrough( conf , cmdObj , result );
             }
         } createCmd;
@@ -655,7 +558,12 @@ namespace mongo {
 
                 log() << "DROP: " << fullns << endl;
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
+
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     log() << "\tdrop going to do passthrough" << endl;
                     return passthrough( conf , cmdObj , result );
                 }
@@ -673,7 +581,7 @@ namespace mongo {
                     return passthrough( conf , cmdObj , result );
                 }
 
-                cm->drop( cm );
+                cm->drop();
 
                 if( ! conf->removeSharding( fullns ) ){
                     warning() << "collection " << fullns
@@ -684,74 +592,6 @@ namespace mongo {
                 return 1;
             }
         } dropCmd;
-
-        class DropDBCmd : public PublicGridCommand {
-        public:
-            DropDBCmd() : PublicGridCommand( "dropDatabase" ) {}
-            virtual void addRequiredPrivileges(const std::string& dbname,
-                                               const BSONObj& cmdObj,
-                                               std::vector<Privilege>* out) {
-                ActionSet actions;
-                actions.addAction(ActionType::dropDatabase);
-                out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
-            }
-            bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                // disallow dropping the config database from mongos
-                if( dbName == "config" ) {
-                    errmsg = "Cannot drop 'config' database via mongos";
-                    return false;
-                }
-
-                BSONElement e = cmdObj.firstElement();
-
-                if ( ! e.isNumber() || e.number() != 1 ) {
-                    errmsg = "invalid params";
-                    return 0;
-                }
-
-                DBConfigPtr conf = grid.getDBConfig( dbName, false );
-
-                log() << "DROP DATABASE: " << dbName << endl;
-
-                if ( ! conf ) {
-                    result.append( "info" , "database didn't exist" );
-                    return true;
-                }
-
-                //
-                // Reload the database configuration so that we're sure a database entry exists
-                // TODO: This won't work with parallel dropping
-                //
-
-                grid.removeDBIfExists( *conf );
-                grid.getDBConfig( dbName );
-
-                // TODO: Make dropping logic saner and more tolerant of partial drops.  This is
-                // particularly important since a database drop can be aborted by *any* collection
-                // with a distributed namespace lock taken (migrates/splits)
-
-                //
-                // Create a copy of the DB config object to drop, so that no one sees a weird
-                // intermediate version of the info
-                //
-
-                DBConfig confCopy( conf->getName() );
-                if( ! confCopy.load() ){
-                    errmsg = "could not load database info to drop";
-                    return false;
-                }
-
-                // Enable sharding so we can correctly retry failed drops
-                // This will re-drop old sharded entries if they exist
-                confCopy.enableSharding( false );
-
-                if ( ! confCopy.dropDatabase( errmsg ) )
-                    return false;
-
-                result.append( "dropped" , dbName );
-                return true;
-            }
-        } dropDBCmd;
 
         class RenameCollectionCmd : public PublicGridCommand {
         public:
@@ -830,188 +670,8 @@ namespace mongo {
                 }
 
             }
-        };
-        MONGO_INITIALIZER(RegisterCopyDBCommand)(InitializerContext* context) {
-            // Leaked intentionally: a Command registers itself when constructed.
-            // NOTE: this initializer block cannot be removed due to SERVER-9167
-            new CopyDBCmd();
-            return Status::OK();
-        }
 
-        class CountCmd : public PublicGridCommand {
-        public:
-            CountCmd() : PublicGridCommand( "count" ) { }
-            virtual bool passOptions() const { return true; }
-            virtual void addRequiredPrivileges(const std::string& dbname,
-                                               const BSONObj& cmdObj,
-                                               std::vector<Privilege>* out) {
-                ActionSet actions;
-                actions.addAction(ActionType::find);
-                out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-            }
-            long long applySkipLimit( long long num , const BSONObj& cmd ) {
-                BSONElement s = cmd["skip"];
-                BSONElement l = cmd["limit"];
-
-                if ( s.isNumber() ) {
-                    num = num - s.numberLong();
-                    if ( num < 0 ) {
-                        num = 0;
-                    }
-                }
-
-                if ( l.isNumber() ) {
-                    long long limit = l.numberLong();
-                    if( limit < 0 ){
-                        limit = -limit;
-                    }
-
-                    if ( limit < num && limit != 0 ) { // 0 limit means no limit
-                        num = limit;
-                    }
-                }
-
-                return num;
-            }
-            bool run(OperationContext* txn, const string& dbName,
-                    BSONObj& cmdObj,
-                    int options,
-                    string& errmsg,
-                    BSONObjBuilder& result,
-                    bool ){
-
-                long long skip = 0;
-                if( cmdObj["skip"].isNumber() ){
-                    skip = cmdObj["skip"].numberLong();
-                    if( skip < 0 ){
-                        errmsg = "skip value is negative in count query";
-                        return false;
-                    }
-                }
-                else if( cmdObj["skip"].ok() ){
-                    errmsg = "skip value is not a valid number";
-                    return false;
-                }
-
-                const string collection = cmdObj.firstElement().valuestrsafe();
-                const string fullns = dbName + "." + collection;
-
-                BSONObjBuilder countCmdBuilder;
-                countCmdBuilder.append( "count", collection );
-
-                BSONObj filter;
-                if( cmdObj["query"].isABSONObj() ){
-                    countCmdBuilder.append( "query", cmdObj["query"].Obj() );
-                    filter = cmdObj["query"].Obj();
-                }
-
-                if( cmdObj["limit"].isNumber() ){
-                    long long limit = cmdObj["limit"].numberLong();
-
-                    /* We only need to factor in the skip value when sending to
-                     * the shards if we have a value for limit, otherwise, we
-                     * apply it only once we have collected all counts.
-                     */
-                    if( limit != 0 && cmdObj["skip"].isNumber() ){
-                        if ( limit > 0 )
-                            limit += skip;
-                        else
-                            limit -= skip;
-                    }
-
-                    countCmdBuilder.append( "limit", limit );
-                }
-
-                if (cmdObj.hasField("hint")) {
-                    countCmdBuilder.append(cmdObj["hint"]);
-                }
-
-                if (cmdObj.hasField("$queryOptions")) {
-                    countCmdBuilder.append(cmdObj["$queryOptions"]);
-                }
-
-                if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
-                    countCmdBuilder.append(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
-                }
-
-                vector<Strategy::CommandResult> countResult;
-
-                STRATEGY->commandOp( dbName, countCmdBuilder.done(),
-                            options, fullns, filter, &countResult );
-
-                long long total = 0;
-                BSONObjBuilder shardSubTotal( result.subobjStart( "shards" ));
-
-                for( vector<Strategy::CommandResult>::const_iterator iter = countResult.begin();
-                        iter != countResult.end(); ++iter ){
-                    const string& shardName = iter->shardTarget.getName();
-
-                    if( iter->result["ok"].trueValue() ){
-                        long long shardCount = iter->result["n"].numberLong();
-
-                        shardSubTotal.appendNumber( shardName, shardCount );
-                        total += shardCount;
-                    }
-                    else {
-                        shardSubTotal.doneFast();
-                        errmsg = "failed on : " + shardName;
-                        result.append( "cause", iter->result );
-                        // Add "code" to the top-level response, if the failure of the sharded
-                        // command can be accounted to a single error.
-                        int code = getUniqueCode( countResult );
-                        if ( code != 0 ) {
-                            result.append( "code", code );
-                        }
-                        return false;
-                    }
-                }
-
-                shardSubTotal.doneFast();
-                total = applySkipLimit( total , cmdObj );
-                result.appendNumber( "n" , total );
-
-                return true;
-            }
-
-            Status explain(OperationContext* txn,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainCommon::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
-                const string fullns = parseNs(dbname, cmdObj);
-
-                // Extract the targeting query.
-                BSONObj targetingQuery;
-                if (Object == cmdObj["query"].type()) {
-                    targetingQuery = cmdObj["query"].Obj();
-                }
-
-                BSONObjBuilder explainCmdBob;
-                ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
-
-                // We will time how long it takes to run the commands on the shards.
-                Timer timer;
-
-                vector<Strategy::CommandResult> shardResults;
-                STRATEGY->commandOp(dbname,
-                                    explainCmdBob.obj(),
-                                    0,
-                                    fullns,
-                                    targetingQuery,
-                                    &shardResults);
-
-                long long millisElapsed = timer.millis();
-
-                const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults,
-                                                                                    cmdObj);
-
-                return ClusterExplain::buildExplainResult(shardResults,
-                                                          mongosStageName,
-                                                          millisElapsed,
-                                                          out);
-            }
-
-        } countCmd;
+        } clusterCopyDBCmd;
 
         class CollectionStats : public PublicGridCommand {
         public:
@@ -1028,8 +688,12 @@ namespace mongo {
                 string fullns = dbName + "." + collection;
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     result.appendBool("sharded", false);
                     result.append( "primary" , conf->getPrimary().getName() );
                     return passthrough( conf , cmdObj , result);
@@ -1105,6 +769,20 @@ namespace mongo {
                             if ( ! result.hasField( e.fieldName() ) )
                                 result.append( e );
                         }
+                        else if ( str::equals( e.fieldName() , "capped" ) ) {
+                            if ( ! result.hasField( e.fieldName() ) )
+                                result.append( e );
+                        }
+                        else if ( str::equals( e.fieldName() , "paddingFactorNote" ) ) {
+                            if ( ! result.hasField( e.fieldName() ) )
+                                result.append( e );
+                        }
+                        else if ( str::equals( e.fieldName() , "indexDetails" ) ) {
+                            //skip this field in the rollup
+                        }
+                        else if ( str::equals( e.fieldName() , "wiredTiger" ) ) {
+                            //skip this field in the rollup
+                        }
                         else if ( str::equals( e.fieldName() , "nindexes" ) ) {
                             int myIndexes = e.numberInt();
                             
@@ -1173,8 +851,12 @@ namespace mongo {
                 string fullns = dbName + "." + collection;
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , result);
                 }
 
@@ -1197,7 +879,7 @@ namespace mongo {
                 ChunkPtr chunk = cm->findIntersectingChunk(shardKey);
                 ShardConnection conn( chunk->getShard() , fullns );
                 BSONObj res;
-                bool ok = conn->runCommand( conf->getName() , cmdObj , res );
+                bool ok = conn->runCommand( conf->name() , cmdObj , res );
                 conn.done();
 
                 if (!ok && res.getIntField("code") == RecvStaleConfigCode) { // code for RecvStaleConfigException
@@ -1207,8 +889,8 @@ namespace mongo {
                 if (ok) {
                     // check whether split is necessary (using update object for size heuristic)
                     ClientInfo *client = ClientInfo::get();
-                        
-                    if (client != NULL && client->autoSplitOk()) {
+
+                    if (client != NULL && ClusterLastErrorInfo::get(client).autoSplitOk()) {
                       chunk->splitIfShould( cmdObj.getObjectField("update").objsize() ); 
                     }
                 }
@@ -1233,8 +915,12 @@ namespace mongo {
                 string fullns = cmdObj.firstElement().String();
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , result);
                 }
 
@@ -1265,7 +951,7 @@ namespace mongo {
                 for ( set<Shard>::iterator i=shards.begin(), end=shards.end() ; i != end; ++i ) {
                     ScopedDbConnection conn(i->getConnString());
                     BSONObj res;
-                    bool ok = conn->runCommand( conf->getName() , cmdObj , res );
+                    bool ok = conn->runCommand( conf->name() , cmdObj , res );
                     conn.done();
 
                     if ( ! ok ) {
@@ -1413,8 +1099,12 @@ namespace mongo {
                 string fullns = dbName + "." + collection;
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , options, result );
                 }
 
@@ -1431,7 +1121,7 @@ namespace mongo {
                 for ( set<Shard>::iterator i=shards.begin(), end=shards.end() ; i != end; ++i ) {
                     ShardConnection conn( *i , fullns );
                     BSONObj res;
-                    bool ok = conn->runCommand( conf->getName() , cmdObj , res, options );
+                    bool ok = conn->runCommand( conf->name() , cmdObj , res, options );
                     conn.done();
 
                     if ( ! ok ) {
@@ -1484,8 +1174,12 @@ namespace mongo {
             bool run(OperationContext* txn, const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 const std::string fullns = parseNs(dbName, cmdObj);
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , result );
                 }
 
@@ -1557,7 +1251,7 @@ namespace mongo {
                             return false;
                         }
 
-                        uassert(16246, "Shard " + conf->getName() + " is too old to support GridFS sharded by {files_id:1, n:1}",
+                        uassert(16246, "Shard " + conf->name() + " is too old to support GridFS sharded by {files_id:1, n:1}",
                                 res.hasField("md5state"));
 
                         lastResult = res;
@@ -1599,8 +1293,12 @@ namespace mongo {
                 string fullns = dbName + "." + collection;
 
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
 
-                if ( ! conf || ! conf->isShardingEnabled() || ! conf->isSharded( fullns ) ) {
+                if (!conf->isShardingEnabled() || !conf->isSharded(fullns)) {
                     return passthrough( conf , cmdObj , options, result );
                 }
 
@@ -1835,6 +1533,12 @@ namespace mongo {
                 }
 
                 DBConfigPtr confIn = grid.getDBConfig( dbName , false );
+                if (!confIn) {
+                    errmsg = str::stream() << "Sharding metadata for input database: " << dbName
+                                           << " does not exist";
+                    return false;
+                }
+
                 DBConfigPtr confOut = confIn;
                 if (customOutDB) {
                     confOut = grid.getDBConfig( outDB , true );
@@ -1895,31 +1599,7 @@ namespace mongo {
                 bool ok = true;
 
                 {
-                    // take distributed lock to prevent split / migration
-                    /*
-                    ConnectionString config = configServer.getConnectionString();
-                    DistributedLock lockSetup( config , fullns );
-                    dist_lock_try dlk;
-
-
-                    if (shardedInput) {
-                        try{
-                            int tryc = 0;
-                            while ( !dlk.got() ) {
-                                dlk = dist_lock_try( &lockSetup , (string)"mr-parallel" );
-                                if ( ! dlk.got() ) {
-                                    if ( ++tryc % 100 == 0 )
-                                        warning() << "the collection metadata could not be locked for mapreduce, already locked by " << dlk.other() << endl;
-                                    sleepmillis(100);
-                                }
-                            }
-                        }
-                        catch( LockException& e ){
-                            errmsg = str::stream() << "error locking distributed lock for mapreduce " << causedBy( e );
-                            return false;
-                        }
-                    }
-                    */
+                    // TODO: take distributed lock to prevent split / migration?
 
                     try {
                         STRATEGY->commandOp( dbName, shardedCommand, 0, fullns, q, &results );
@@ -1969,7 +1649,7 @@ namespace mongo {
                     errmsg += singleResult.toString();
                     // Add "code" to the top-level response, if the failure of the sharded command
                     // can be accounted to a single error.
-                    int code = getUniqueCode( results );
+                    int code = getUniqueCodeFromCommandResults( results );
                     if ( code != 0 ) {
                         result.append( "code", code );
                     }
@@ -2049,25 +1729,15 @@ namespace mongo {
 
                     map<BSONObj, int> chunkSizes;
                     {
-                        // take distributed lock to prevent split / migration
-                        ConnectionString config = configServer.getConnectionString();
-                        DistributedLock lockSetup( config , finalColLong );
-                        dist_lock_try dlk;
+                        // take distributed lock to prevent split / migration.
+                        ScopedDistributedLock nsLock(configServer.getConnectionString(),
+                                                     finalColLong);
+                        nsLock.setLockMessage("mr-post-process");
+                        nsLock.setLockTryIntervalMillis(100);
 
-                        try{
-                            int tryc = 0;
-                            while ( !dlk.got() ) {
-                                dlk = dist_lock_try( &lockSetup , (string)"mr-post-process" );
-                                if ( ! dlk.got() ) {
-                                    if ( ++tryc % 100 == 0 )
-                                        warning() << "the collection metadata could not be locked for mapreduce, already locked by " << dlk.other() << endl;
-                                    sleepmillis(100);
-                                }
-                            }
-                        }
-                        catch( LockException& e ){
-                            errmsg = str::stream() << "error locking distributed lock for mapreduce " << causedBy( e );
-                            return false;
+                        Status lockStatus = nsLock.acquire(-1 /* retry indefinitely */);
+                        if (!lockStatus.isOK()) {
+                            return appendCommandStatus(result, lockStatus);
                         }
 
                         BSONObj finalCmdObj = finalCmd.obj();
@@ -2207,12 +1877,22 @@ namespace mongo {
             virtual bool run(OperationContext* txn, const string& dbName,
                              BSONObj& cmdObj,
                              int,
-                             string&,
+                             string& errmsg,
                              BSONObjBuilder& result,
                              bool) {
+
+                RARELY {
+                    warning() << "the eval command is deprecated" << startupWarningsLog;
+                }
+
                 // $eval isn't allowed to access sharded collections, but we need to leave the
                 // shard to detect that.
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
+
                 return passthrough( conf , cmdObj , result );
             }
         } evalCmd;
@@ -2238,7 +1918,6 @@ namespace mongo {
                 const vector<Strategy::CommandResult>& shardResults,
                 const string& fullns);
 
-            void storePossibleCursor(const string& server, BSONObj cmdResult) const;
             void killAllCursors(const vector<Strategy::CommandResult>& shardResults);
             bool doAnyShardsNotSupportCursors(const vector<Strategy::CommandResult>& shardResults);
             bool wasMergeCursorsSupported(BSONObj cmdResult);
@@ -2463,7 +2142,7 @@ namespace mongo {
                         // If the failure of the sharded command can be accounted to a single error,
                         // throw a UserException with that error code; otherwise, throw with a
                         // location uassert code.
-                        int errCode = getUniqueCode( shardResults );
+                        int errCode = getUniqueCodeFromCommandResults( shardResults );
                         if ( errCode == 0 ) {
                             errCode = 17022;
                         }
@@ -2592,7 +2271,7 @@ namespace mongo {
                     cursor && cursor->more());
 
             BSONObj result = cursor->nextSafe().getOwned();
-            storePossibleCursor(cursor->originalHost(), result);
+            uassertStatusOK(storePossibleCursor(cursor->originalHost(), result));
             return result;
         }
 
@@ -2603,7 +2282,7 @@ namespace mongo {
             // Temporary hack. See comment on declaration for details.
 
             ShardConnection conn( conf->getPrimary() , "" );
-            BSONObj result = aggRunCommand(conn.get(), conf->getName(), cmd, queryOptions);
+            BSONObj result = aggRunCommand(conn.get(), conf->name(), cmd, queryOptions);
             conn.done();
 
             bool ok = result["ok"].trueValue();
@@ -2614,35 +2293,53 @@ namespace mongo {
             return ok;
         }
 
-        void PipelineCommand::storePossibleCursor(const string& server, BSONObj cmdResult) const {
-            if (cmdResult["ok"].trueValue() && cmdResult.hasField("cursor")) {
-                long long cursorId = cmdResult["cursor"]["id"].Long();
-                if (cursorId) {
-                    const string cursorNs = cmdResult["cursor"]["ns"].String();
-                    cursorCache.storeRef(server, cursorId, cursorNs);
-                }
-            }
-        }
-
         class CmdListCollections : public PublicGridCommand {
         public:
             CmdListCollections() : PublicGridCommand( "listCollections" ) {}
-            virtual void addRequiredPrivileges(const std::string& dbname,
-                                               const BSONObj& cmdObj,
-                                               std::vector<Privilege>* out) {
-                ActionSet actions;
-                actions.addAction(ActionType::listCollections);
-                out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
+
+            virtual Status checkAuthForCommand(ClientBasic* client,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj) {
+                AuthorizationSession* authzSession = client->getAuthorizationSession();
+
+                // Check for the listCollections ActionType on the database
+                // or find on system.namespaces for pre 3.0 systems.
+                if (authzSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forDatabaseName(dbname),
+                        ActionType::listCollections) ||
+                    authzSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forExactNamespace(
+                            NamespaceString(dbname, "system.namespaces")),
+                        ActionType::find)) {
+                    return Status::OK();
+                }
+
+                return Status(ErrorCodes::Unauthorized,
+                            str::stream() << "Not authorized to create users on db: " <<
+                            dbname);
             }
 
             bool run(OperationContext* txn, const string& dbName,
                      BSONObj& cmdObj,
                      int,
-                     string&,
+                     string& errmsg,
                      BSONObjBuilder& result,
                      bool) {
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
-                return passthrough( conf, cmdObj, result );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
+
+                bool retval = passthrough( conf, cmdObj, result );
+
+                Status storeCursorStatus = storePossibleCursor(conf->getPrimary().getConnString(),
+                                                               result.asTempObj());
+                if (!storeCursorStatus.isOK()) {
+                    return appendCommandStatus(result, storeCursorStatus);
+                }
+
+                return retval;
             }
         } cmdListCollections;
 
@@ -2661,13 +2358,54 @@ namespace mongo {
             bool run(OperationContext* txn, const string& dbName,
                      BSONObj& cmdObj,
                      int,
-                     string&,
+                     string& errmsg,
                      BSONObjBuilder& result,
                      bool) {
                 DBConfigPtr conf = grid.getDBConfig( dbName , false );
-                return passthrough( conf, cmdObj, result );
+                if (!conf) {
+                    errmsg = str::stream() << "Failed to load db sharding metadata for " << dbName;
+                    return false;
+                }
+
+                bool retval = passthrough( conf, cmdObj, result );
+
+                Status storeCursorStatus = storePossibleCursor(conf->getPrimary().getConnString(),
+                                                               result.asTempObj());
+                if (!storeCursorStatus.isOK()) {
+                    return appendCommandStatus(result, storeCursorStatus);
+                }
+
+                return retval;
             }
         } cmdListIndexes;
+
+        class AvailableQueryOptions : public Command {
+        public:
+          AvailableQueryOptions(): Command("availableQueryOptions",
+                                           false ,
+                                           "availablequeryoptions") {
+          }
+
+          virtual bool slaveOk() const { return true; }
+          virtual bool isWriteCommandForConfigServer() const { return false; }
+          virtual Status checkAuthForCommand(ClientBasic* client,
+                                             const std::string& dbname,
+                                             const BSONObj& cmdObj) {
+              return Status::OK();
+          }
+
+
+          virtual bool run(OperationContext* txn,
+                           const string& dbname,
+                           BSONObj& cmdObj,
+                           int,
+                           string& errmsg,
+                           BSONObjBuilder& result,
+                           bool) {
+              result << "options" << QueryOption_AllSupportedForSharding;
+              return true;
+          }
+        } availableQueryOptionsCmd;
 
     } // namespace pub_grid_cmds
 

@@ -30,10 +30,14 @@
 
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
 
     // Insert a key and verify that it can be unindexed.
     TEST( SortedDataInterface, Unindex ) {
@@ -190,7 +194,7 @@ namespace mongo {
     // Insert the same key multiple times and verify that each occurrence can be unindexed.
     TEST( SortedDataInterface, UnindexMultipleSameKey ) {
         scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
 
         {
             scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
@@ -201,7 +205,7 @@ namespace mongo {
             scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
             {
                 WriteUnitOfWork uow( opCtx.get() );
-                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, false ) );
+                ASSERT_OK( sorted->insert( opCtx.get(), key1, loc1, true ) );
                 ASSERT_OK( sorted->insert( opCtx.get(), key1, loc2, true /* allow duplicates */ ) );
                 uow.commit();
             }

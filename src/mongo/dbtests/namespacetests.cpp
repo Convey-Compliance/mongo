@@ -36,26 +36,29 @@
 #include <string>
 
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/db.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
 #include "mongo/db/storage/mmap_v1/extent.h"
 #include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
 #include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"
 #include "mongo/db/storage/mmap_v1/record_store_v1_simple.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/log.h"
 
 namespace NamespaceTests {
+
+    using std::string;
 
     const int MinExtentSize = 4096;
 
@@ -137,7 +140,7 @@ namespace NamespaceTests {
         class Base {
             const char *ns_;
             Lock::GlobalWrite lk;
-            Client::Context _context;
+            OldClientContext _context;
         public:
             Base( const char *ns = "unittests.NamespaceDetailsTests" ) : ns_( ns ) , _context( ns ) {}
             virtual ~Base() {
@@ -156,15 +159,15 @@ namespace NamespaceTests {
             int nRecords() const {
                 int count = 0;
                 const Extent* ext;
-                for ( DiskLoc extLoc = nsd()->firstExtent();
+                for ( RecordId extLoc = nsd()->firstExtent();
                         !extLoc.isNull();
                         extLoc = ext->xnext) {
                     ext = extentManager()->getExtent(extLoc);
                     int fileNo = ext->firstRecord.a();
                     if ( fileNo == -1 )
                         continue;
-                    for ( int recOfs = ext->firstRecord.getOfs(); recOfs != DiskLoc::NullOfs;
-                          recOfs = recordStore()->recordFor(DiskLoc(fileNo, recOfs))->nextOfs() ) {
+                    for ( int recOfs = ext->firstRecord.getOfs(); recOfs != RecordId::NullOfs;
+                          recOfs = recordStore()->recordFor(RecordId(fileNo, recOfs))->nextOfs() ) {
                         ++count;
                     }
                 }
@@ -173,7 +176,7 @@ namespace NamespaceTests {
             }
             int nExtents() const {
                 int count = 0;
-                for ( DiskLoc extLoc = nsd()->firstExtent();
+                for ( RecordId extLoc = nsd()->firstExtent();
                         !extLoc.isNull();
                         extLoc = extentManager()->getExtent(extLoc)->xnext ) {
                     ++count;
@@ -222,7 +225,7 @@ namespace NamespaceTests {
                 ASSERT( nsd() );
                 ASSERT_EQUALS( 0, nRecords() );
                 ASSERT( nsd()->firstExtent() == nsd()->capExtent() );
-                DiskLoc initial = DiskLoc();
+                RecordId initial = RecordId();
                 initial.setInvalid();
                 ASSERT( initial == nsd()->capFirstNewRecord() );
             }
@@ -249,10 +252,10 @@ namespace NamespaceTests {
 
                 const int N = 20;
                 const int Q = 16; // these constants depend on the size of the bson object, the extent size allocated by the system too
-                DiskLoc l[ N ];
+                RecordId l[ N ];
                 for ( int i = 0; i < N; ++i ) {
                     BSONObj b = bigObj();
-                    StatusWith<DiskLoc> status = collection()->insertDocument( &txn, b, true );
+                    StatusWith<RecordId> status = collection()->insertDocument( &txn, b, true );
                     ASSERT( status.isOK() );
                     l[ i ] = status.getValue();
                     ASSERT( !l[ i ].isNull() );
@@ -272,9 +275,9 @@ namespace NamespaceTests {
                 create();
                 ASSERT_EQUALS( 2, nExtents() );
 
-                DiskLoc l[ 8 ];
+                RecordId l[ 8 ];
                 for ( int i = 0; i < 8; ++i ) {
-                    StatusWith<DiskLoc> status = collection()->insertDocument( &txn, bigObj(), true );
+                    StatusWith<RecordId> status = collection()->insertDocument( &txn, bigObj(), true );
                     ASSERT( status.isOK() );
                     l[ i ] = status.getValue();
                     ASSERT( !l[ i ].isNull() );
@@ -289,7 +292,7 @@ namespace NamespaceTests {
                 bob.appendOID( "_id", NULL, true );
                 bob.append( "a", string( MinExtentSize + 500, 'a' ) ); // min extent size is now 4096
                 BSONObj bigger = bob.done();
-                StatusWith<DiskLoc> status = collection()->insertDocument( &txn, bigger, false );
+                StatusWith<RecordId> status = collection()->insertDocument( &txn, bigger, false );
                 ASSERT( !status.isOK() );
                 ASSERT_EQUALS( 0, nRecords() );
             }
@@ -322,7 +325,7 @@ namespace NamespaceTests {
                 ASSERT( nsd()->isCapped() );
                 ASSERT( !nsd()->isUserFlagSet( NamespaceDetails::Flag_UsePowerOf2Sizes ) );
 
-                StatusWith<DiskLoc> result =
+                StatusWith<RecordId> result =
                     collection()->insertDocument( &txn, docForRecordSize( 300 ), false );
                 ASSERT( result.isOK() );
                 Record* record = collection()->getRecordStore()->recordFor( result.getValue() );
@@ -333,7 +336,7 @@ namespace NamespaceTests {
         };
 
 
-        /* test  NamespaceDetails::cappedTruncateAfter(const char *ns, DiskLoc loc)
+        /* test  NamespaceDetails::cappedTruncateAfter(const char *ns, RecordId loc)
         */
         class TruncateCapped : public Base {
             virtual string spec() const {
@@ -349,13 +352,13 @@ namespace NamespaceTests {
                 int N = MinExtentSize / b.objsize() * nExtents() + 5;
                 int T = N - 4;
 
-                DiskLoc truncAt;
-                //DiskLoc l[ 8 ];
+                RecordId truncAt;
+                //RecordId l[ 8 ];
                 for ( int i = 0; i < N; ++i ) {
                     BSONObj bb = bigObj();
-                    StatusWith<DiskLoc> status = collection()->insertDocument( &txn, bb, true );
+                    StatusWith<RecordId> status = collection()->insertDocument( &txn, bb, true );
                     ASSERT( status.isOK() );
-                    DiskLoc a = status.getValue();
+                    RecordId a = status.getValue();
                     if( T == i )
                         truncAt = a;
                     ASSERT( !a.isNull() );
@@ -365,7 +368,7 @@ namespace NamespaceTests {
                 }
                 ASSERT( nRecords() < N );
 
-                DiskLoc last, first;
+                RecordId last, first;
                 {
                     auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
                                                                             ns(),
@@ -388,7 +391,7 @@ namespace NamespaceTests {
                 ASSERT_EQUALS( collection()->numRecords() , 28u );
 
                 {
-                    DiskLoc loc;
+                    RecordId loc;
                     auto_ptr<Runner> runner(InternalPlanner::collectionScan(&txn,
                                                                             ns(),
                                                                             collection(),
@@ -401,7 +404,7 @@ namespace NamespaceTests {
                                                                             ns(),
                                                                             collection(),
                                                                             InternalPlanner::BACKWARD));
-                    DiskLoc loc;
+                    RecordId loc;
                     runner->getNext(NULL, &loc);
                     ASSERT( last != loc );
                     ASSERT( !last.isNull() );
@@ -412,7 +415,7 @@ namespace NamespaceTests {
                 bob.appendOID("_id", 0, true);
                 bob.append( "a", string( MinExtentSize + 300, 'a' ) );
                 BSONObj bigger = bob.done();
-                StatusWith<DiskLoc> status = collection()->insertDocument( &txn, bigger, true );
+                StatusWith<RecordId> status = collection()->insertDocument( &txn, bigger, true );
                 ASSERT( !status.isOK() );
                 ASSERT_EQUALS( 0, nRecords() );
             }
@@ -429,7 +432,7 @@ namespace NamespaceTests {
             void run() {
                 create();
                 nsd()->deletedListEntry( 2 ) = nsd()->cappedListOfAllDeletedRecords().drec()->nextDeleted().drec()->nextDeleted();
-                nsd()->cappedListOfAllDeletedRecords().drec()->nextDeleted().drec()->nextDeleted().writing() = DiskLoc();
+                nsd()->cappedListOfAllDeletedRecords().drec()->nextDeleted().drec()->nextDeleted().writing() = RecordId();
                 nsd()->cappedLastDelRecLastExtent().Null();
                 NamespaceDetails *d = nsd();
 
@@ -443,13 +446,13 @@ namespace NamespaceTests {
                 ASSERT( nsd()->capExtent().getOfs() != 0 );
                 ASSERT( !nsd()->capFirstNewRecord().isValid() );
                 int nDeleted = 0;
-                for ( DiskLoc i = nsd()->cappedListOfAllDeletedRecords(); !i.isNull(); i = i.drec()->nextDeleted(), ++nDeleted );
+                for ( RecordId i = nsd()->cappedListOfAllDeletedRecords(); !i.isNull(); i = i.drec()->nextDeleted(), ++nDeleted );
                 ASSERT_EQUALS( 10, nDeleted );
                 ASSERT( nsd()->cappedLastDelRecLastExtent().isNull() );
             }
         private:
-            static void zero( DiskLoc *d ) {
-                memset( d, 0, sizeof( DiskLoc ) );
+            static void zero( RecordId *d ) {
+                memset( d, 0, sizeof( RecordId ) );
             }
             virtual string spec() const {
                 return "{\"capped\":true,\"size\":512,\"$nExtents\":10}";
@@ -526,6 +529,7 @@ namespace NamespaceTests {
 
                 OperationContextImpl txn;
 
+                ScopedTransaction transaction(&txn, MODE_IX);
                 Lock::DBLock lk(txn.lockState(), dbName, MODE_X);
 
                 bool justCreated;
@@ -535,28 +539,28 @@ namespace NamespaceTests {
                 Collection* committedColl;
                 {
                     WriteUnitOfWork wunit(&txn);
-                    ASSERT_FALSE(db->getCollection(&txn, committedName));
+                    ASSERT_FALSE(db->getCollection(committedName));
                     committedColl = db->createCollection(&txn, committedName);
-                    ASSERT_EQUALS(db->getCollection(&txn, committedName), committedColl);
+                    ASSERT_EQUALS(db->getCollection(committedName), committedColl);
                     wunit.commit();
                 }
 
-                ASSERT_EQUALS(db->getCollection(&txn, committedName), committedColl);
+                ASSERT_EQUALS(db->getCollection(committedName), committedColl);
 
                 {
                     WriteUnitOfWork wunit(&txn);
-                    ASSERT_FALSE(db->getCollection(&txn, rolledBackName));
+                    ASSERT_FALSE(db->getCollection(rolledBackName));
                     Collection* rolledBackColl = db->createCollection(&txn, rolledBackName);
-                    ASSERT_EQUALS(db->getCollection(&txn, rolledBackName), rolledBackColl);
+                    ASSERT_EQUALS(db->getCollection(rolledBackName), rolledBackColl);
                     // not committing so creation should be rolled back
                 }
 
                 // The rolledBackCollection creation should have been rolled back
-                ASSERT_FALSE(db->getCollection(&txn, rolledBackName));
+                ASSERT_FALSE(db->getCollection(rolledBackName));
 
                 // The committedCollection should not have been affected by the rollback. Holders
                 // of the original Collection pointer should still be valid.
-                ASSERT_EQUALS(db->getCollection(&txn, committedName), committedColl);
+                ASSERT_EQUALS(db->getCollection(committedName), committedColl);
             }
         };
 
@@ -569,6 +573,7 @@ namespace NamespaceTests {
 
                 OperationContextImpl txn;
 
+                ScopedTransaction transaction(&txn, MODE_IX);
                 Lock::DBLock lk(txn.lockState(), dbName, MODE_X);
 
                 bool justCreated;
@@ -577,33 +582,33 @@ namespace NamespaceTests {
 
                 {
                     WriteUnitOfWork wunit(&txn);
-                    ASSERT_FALSE(db->getCollection(&txn, droppedName));
+                    ASSERT_FALSE(db->getCollection(droppedName));
                     Collection* droppedColl;
                     droppedColl = db->createCollection(&txn, droppedName);
-                    ASSERT_EQUALS(db->getCollection(&txn, droppedName), droppedColl);
+                    ASSERT_EQUALS(db->getCollection(droppedName), droppedColl);
                     db->dropCollection(&txn, droppedName);
                     wunit.commit();
                 }
 
                 //  Should have been really dropped
-                ASSERT_FALSE(db->getCollection(&txn, droppedName));
+                ASSERT_FALSE(db->getCollection(droppedName));
 
                 {
                     WriteUnitOfWork wunit(&txn);
-                    ASSERT_FALSE(db->getCollection(&txn, rolledBackName));
+                    ASSERT_FALSE(db->getCollection(rolledBackName));
                     Collection* rolledBackColl = db->createCollection(&txn, rolledBackName);
                     wunit.commit();
-                    ASSERT_EQUALS(db->getCollection(&txn, rolledBackName), rolledBackColl);
+                    ASSERT_EQUALS(db->getCollection(rolledBackName), rolledBackColl);
                     db->dropCollection(&txn, rolledBackName);
                     // not committing so dropping should be rolled back
                 }
 
                 // The rolledBackCollection dropping should have been rolled back.
                 // Original Collection pointers are no longer valid.
-                ASSERT(db->getCollection(&txn, rolledBackName));
+                ASSERT(db->getCollection(rolledBackName));
 
                 // The droppedCollection should not have been restored by the rollback.
-                ASSERT_FALSE(db->getCollection(&txn, droppedName));
+                ASSERT_FALSE(db->getCollection(droppedName));
             }
         };
     }  // namespace DatabaseTests
@@ -635,6 +640,9 @@ namespace NamespaceTests {
             add< DatabaseTests::RollbackDropCollection >();
 #endif
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
+
 } // namespace NamespaceTests
 

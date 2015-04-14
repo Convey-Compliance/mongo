@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -38,21 +38,30 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/client.h"
-#include "mongo/db/commands/fsync.h"
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::vector;
 
     Counter64 ttlPasses;
     Counter64 ttlDeletedDocuments;
@@ -61,6 +70,7 @@ namespace mongo {
     ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments", &ttlDeletedDocuments);
 
     MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorEnabled, bool, true );
+    MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorSleepSecs, int, 60 ); //used for testing
 
     class TTLMonitor : public BackgroundJob {
     public:
@@ -76,7 +86,7 @@ namespace mongo {
             cc().getAuthorizationSession()->grantInternalAuthorization();
 
             while ( ! inShutdown() ) {
-                sleepsecs( 60 );
+                sleepsecs( ttlMonitorSleepSecs );
 
                 LOG(3) << "TTLMonitor thread awake" << endl;
 
@@ -92,39 +102,57 @@ namespace mongo {
                     continue;
                 }
 
-                // if part of replSet but not in a readable state (e.g. during initial sync), skip.
-                if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                        repl::ReplicationCoordinator::modeReplSet &&
-                        !repl::getGlobalReplicationCoordinator()->getCurrentMemberState().readable())
-                    continue;
+                try {
+                    doTTLPass();
+                }
+                catch ( const WriteConflictException& e ) {
+                    LOG(1) << "Got WriteConflictException in TTL thread";
+                }
 
-                set<string> dbs;
-                dbHolder().getAllShortNames( dbs );
+            }
+        }
 
-                ttlPasses.increment();
+    private:
 
-                for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
-                    string db = *i;
+        void doTTLPass() {
+            // Count it as active from the moment the TTL thread wakes up
+            OperationContextImpl txn;
 
-                    vector<BSONObj> indexes;
-                    {
-                        OperationContextImpl txn;
-                        getTTLIndexesForDB( &txn, db, &indexes );
-                    }
+            // if part of replSet but not in a readable state (e.g. during initial sync), skip.
+            if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+                repl::ReplicationCoordinator::modeReplSet &&
+                !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
+                return;
 
-                    for ( vector<BSONObj>::const_iterator it = indexes.begin();
-                          it != indexes.end(); ++it ) {
+            set<string> dbs;
+            dbHolder().getAllShortNames( dbs );
 
-                        OperationContextImpl txn;
-                        if ( !doTTLForIndex( &txn, db, *it ) ) {
+            ttlPasses.increment();
+
+            for ( set<string>::const_iterator i=dbs.begin(); i!=dbs.end(); ++i ) {
+                string db = *i;
+
+                vector<BSONObj> indexes;
+                getTTLIndexesForDB(&txn, db, &indexes);
+
+                for ( vector<BSONObj>::const_iterator it = indexes.begin();
+                      it != indexes.end(); ++it ) {
+
+                    BSONObj idx = *it;
+                    try {
+                        if ( !doTTLForIndex( &txn, db, idx ) ) {
                             break;  // stop processing TTL indexes on this database
                         }
+                    } catch (const DBException& dbex) {
+                        error() << "Error processing ttl index: " << idx
+                                << " -- " << dbex.toString();
+                        // continue on to the next index
+                        continue;
                     }
                 }
             }
         }
 
-    private:
         /**
          * Acquire an IS-mode lock on the specified database and for each
          * collection in the database, append the specification of all
@@ -137,6 +165,7 @@ namespace mongo {
                                  vector<BSONObj>* indexes ) {
 
             invariant( indexes && indexes->empty() );
+            ScopedTransaction transaction( txn, MODE_IS );
             Lock::DBLock dbLock( txn->lockState(), dbName, MODE_IS );
 
             Database* db = dbHolder().get( txn, dbName );
@@ -154,7 +183,7 @@ namespace mongo {
 
                 string ns = *it;
                 Lock::CollectionLock collLock( txn->lockState(), ns, MODE_IS );
-                CollectionCatalogEntry* coll = dbEntry->getCollectionCatalogEntry( txn, ns );
+                CollectionCatalogEntry* coll = dbEntry->getCollectionCatalogEntry( ns );
 
                 if ( !coll ) {
                     continue;  // skip since collection not found in catalog
@@ -183,6 +212,7 @@ namespace mongo {
          */
         bool doTTLForIndex( OperationContext* txn, const string& dbName, const BSONObj& idx ) {
             BSONObj key = idx["key"].Obj();
+            const string ns = idx["ns"].String();
             if ( key.nFields() != 1 ) {
                 error() << "key for ttl index can only have 1 field" << endl;
                 return true;
@@ -202,22 +232,21 @@ namespace mongo {
                 query = BSON( key.firstElement().fieldName() << b.obj() );
             }
 
-            LOG(1) << "TTL: " << key << " \t " << query << endl;
+            LOG(1) << "TTL -- ns: " << ns << "key:" << key << " query: " << query << endl;
 
-            long long n = 0;
-            {
-                const string ns = idx["ns"].String();
-
-                Lock::DBLock dbLock( txn->lockState(), dbName, MODE_IX );
-                Lock::CollectionLock collLock( txn->lockState(), ns, MODE_IX );
-
-                Database* db = dbHolder().get( txn, dbName );
-                if ( !db ) {
-                    // database was dropped
+            long long numDeleted = 0;
+            int attempt = 1;
+            while (1) {
+                ScopedTransaction scopedXact(txn, MODE_IX);
+                AutoGetDb autoDb(txn, dbName, MODE_IX);
+                Database* db = autoDb.getDb();
+                if (!db) {
                     return false;
                 }
 
-                Collection* collection = db->getCollection( txn, ns );
+                Lock::CollectionLock collLock( txn->lockState(), ns, MODE_IX );
+
+                Collection* collection = db->getCollection( ns );
                 if ( !collection ) {
                     // collection was dropped
                     return true;
@@ -235,13 +264,22 @@ namespace mongo {
                     return true;
                 }
 
-                WriteUnitOfWork uow( txn );
-                n = deleteObjects( txn, db, ns, query, PlanExecutor::YIELD_AUTO, false, true );
-                ttlDeletedDocuments.increment( n );
-                uow.commit();
+                try {
+                    numDeleted = deleteObjects(txn,
+                                               db,
+                                               ns,
+                                               query,
+                                               PlanExecutor::YIELD_AUTO,
+                                               false);
+                    break;
+                }
+                catch (const WriteConflictException& dle) {
+                    WriteConflictException::logAndBackoff(attempt++, "ttl", ns);
+                }
             }
 
-            LOG(1) << "\tTTL deleted: " << n << endl;
+            ttlDeletedDocuments.increment(numDeleted);
+            LOG(1) << "\tTTL deleted: " << numDeleted << endl;
             return true;
         }
     };

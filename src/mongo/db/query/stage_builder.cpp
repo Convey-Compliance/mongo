@@ -55,6 +55,8 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+
     PlanStage* buildStages(OperationContext* txn,
                            Collection* collection,
                            const QuerySolution& qsol,
@@ -109,7 +111,7 @@ namespace mongo {
             params.pattern = sn->pattern;
             params.query = sn->query;
             params.limit = sn->limit;
-            return new SortStage(txn, params, ws, childStage);
+            return new SortStage(params, ws, childStage);
         }
         else if (STAGE_PROJECTION == root->getType()) {
             const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
@@ -150,7 +152,7 @@ namespace mongo {
         }
         else if (STAGE_AND_HASH == root->getType()) {
             const AndHashNode* ahn = static_cast<const AndHashNode*>(root);
-            auto_ptr<AndHashStage> ret(new AndHashStage(txn, ws, ahn->filter.get(), collection));
+            auto_ptr<AndHashStage> ret(new AndHashStage(ws, ahn->filter.get(), collection));
             for (size_t i = 0; i < ahn->children.size(); ++i) {
                 PlanStage* childStage = buildStages(txn, collection, qsol, ahn->children[i], ws);
                 if (NULL == childStage) { return NULL; }
@@ -170,7 +172,7 @@ namespace mongo {
         }
         else if (STAGE_AND_SORTED == root->getType()) {
             const AndSortedNode* asn = static_cast<const AndSortedNode*>(root);
-            auto_ptr<AndSortedStage> ret(new AndSortedStage(txn, ws, asn->filter.get(), collection));
+            auto_ptr<AndSortedStage> ret(new AndSortedStage(ws, asn->filter.get(), collection));
             for (size_t i = 0; i < asn->children.size(); ++i) {
                 PlanStage* childStage = buildStages(txn, collection, qsol, asn->children[i], ws);
                 if (NULL == childStage) { return NULL; }
@@ -183,7 +185,7 @@ namespace mongo {
             MergeSortStageParams params;
             params.dedup = msn->dedup;
             params.pattern = msn->sort;
-            auto_ptr<MergeSortStage> ret(new MergeSortStage(txn, params, ws, collection));
+            auto_ptr<MergeSortStage> ret(new MergeSortStage(params, ws, collection));
             for (size_t i = 0; i < msn->children.size(); ++i) {
                 PlanStage* childStage = buildStages(txn, collection, qsol, msn->children[i], ws);
                 if (NULL == childStage) { return NULL; }
@@ -262,7 +264,9 @@ namespace mongo {
                                            ? fam->getSpec().defaultLanguage().str()
                                            : node->language);
 
-            Status parseStatus = params.query.parse(node->query, language,
+            Status parseStatus = params.query.parse(node->query,
+                                                    language,
+                                                    node->caseSensitive,
                                                     fam->getSpec().getTextIndexVersion());
             if (!parseStatus.isOK()) {
                 warning() << "Can't parse text search query";
@@ -284,7 +288,7 @@ namespace mongo {
             if (NULL == childStage) { return NULL; }
             return new KeepMutationsStage(km->filter.get(), ws, childStage);
         }
-        else if (STAGE_DISTINCT == root->getType()) {
+        else if (STAGE_DISTINCT_SCAN == root->getType()) {
             const DistinctNode* dn = static_cast<const DistinctNode*>(root);
 
             if (NULL == collection) {

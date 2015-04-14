@@ -31,13 +31,15 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
+
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_stat.h"
 #include "mongo/db/server_options.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
+#include "mongo/util/thread_safe_string.h"
 #include "mongo/util/time_support.h"
 
 
@@ -93,7 +95,7 @@ namespace mongo {
             return _get();
         }
 
-        void append( BSONObjBuilder& b , const StringData& name ) const {
+        void append( BSONObjBuilder& b , StringData name ) const {
             scoped_spinlock lk(_lock);
             BSONObj temp = _get();
             b.append( name , temp );
@@ -127,22 +129,17 @@ namespace mongo {
 
         void recordStats();
 
-        std::string report( const CurOp& curop ) const;
+        std::string report(const CurOp& curop, const SingleThreadedLockStats& lockStats) const;
 
         /**
-         * Appends stored data and information from curop to the builder.
+         * Appends information about the current operation to "builder"
          *
-         * @param curop information about the current operation which will be
-         *     use to append data to the builder.
-         * @param builder the BSON builder to use for appending data. Data can
-         *     still be appended even if this method returns false.
-         * @param maxSize the maximum allowed combined size for the query object
-         *     and update object
-         *
-         * @return false if the sum of the sizes for the query object and update
-         *     object exceeded maxSize
+         * @param curop reference to the CurOp that owns this OpDebug
+         * @param lockStats lockStats object containing locking information about the operation
          */
-        bool append(const CurOp& curop, BSONObjBuilder& builder, size_t maxSize) const;
+        void append(const CurOp& curop,
+                    const SingleThreadedLockStats& lockStats,
+                    BSONObjBuilder& builder) const;
 
         // -------------------
         
@@ -175,6 +172,7 @@ namespace mongo {
         bool fastmodinsert;  // upsert of an $operation. builds a default object
         bool upsert;         // true if the update actually did an insert
         int keyUpdates;
+        long long writeConflicts;
         ThreadSafeString planSummary; // a brief std::string describing the query solution
 
         // New Query Framework debugging/profiling info
@@ -195,19 +193,22 @@ namespace mongo {
     */
     class CurOp : boost::noncopyable {
     public:
-        CurOp( Client * client , CurOp * wrapped = 0 );
+        static CurOp* get(const Client* client);
+        static CurOp* get(const Client& client);
+
+        explicit CurOp(Client* client);
         ~CurOp();
 
         bool haveQuery() const { return _query.have(); }
         BSONObj query() const { return _query.get();  }
-        void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
+        void appendQuery( BSONObjBuilder& b , StringData name ) const { _query.append( b , name ); }
         
         void enter(const char* ns, int dbProfileLevel);
         void reset();
         void reset( const HostAndPort& remote, int op );
         void markCommand() { _isCommand = true; }
         OpDebug& debug()           { return _debug; }
-        string getNS() const { return _ns.toString(); }
+        std::string getNS() const { return _ns.toString(); }
 
         bool shouldDBProfile( int ms ) const {
             if ( _dbprofile <= 0 )
@@ -221,7 +222,6 @@ namespace mongo {
         /** if this op is running */
         bool active() const { return _active; }
 
-        bool displayInCurop() const { return _active && ! _suppressFromCurop; }
         int getOp() const { return _op; }
 
         //
@@ -281,11 +281,10 @@ namespace mongo {
         int elapsedSeconds() { return elapsedMillis() / 1000; }
 
         void setQuery(const BSONObj& query) { _query.set( query ); }
-        Client * getClient() const { return _client; }
-        
+
         Command * getCommand() const { return _command; }
         void setCommand(Command* command) { _command = command; }
-        
+
         void reportState(BSONObjBuilder* builder);
 
         // Fetches less information than "info()"; used to search for ops with certain criteria
@@ -303,40 +302,41 @@ namespace mongo {
                                   int secondsBetween = 3);
         std::string getMessage() const { return _message.toString(); }
         ProgressMeter& getProgressMeter() { return _progressMeter; }
-        CurOp *parent() const { return _wrapped; }
+        CurOp *parent() const { return _parent; }
         void kill(); 
         bool killPendingStrict() const { return _killPending.load(); }
         bool killPending() const { return _killPending.loadRelaxed(); }
+        void yielded() { _numYields++; }
         int numYields() const { return _numYields; }
-        void suppressFromCurop() { _suppressFromCurop = true; }
         
         long long getExpectedLatencyMs() const { return _expectedLatencyMs; }
         void setExpectedLatencyMs( long long latency ) { _expectedLatencyMs = latency; }
 
         void recordGlobalTime(bool isWriteLocked, long long micros) const;
-        
-        const LockStat& lockStat() const { return _lockStat; }
-        LockStat& lockStat() { return _lockStat; }
 
         /**
          * this should be used very sparingly
          * generally the Context should set this up
          * but sometimes you want to do it ahead of time
          */
-        void setNS( const StringData& ns );
+        void setNS( StringData ns );
 
     private:
-        friend class Client;
+        class ClientCuropStack;
+
+        static const Client::Decoration<ClientCuropStack> _curopStack;
+
+        explicit CurOp(ClientCuropStack*);
+
         void _reset();
 
         static AtomicUInt32 _nextOpNum;
-        Client * _client;
-        CurOp * _wrapped;
+        ClientCuropStack* _stack;
+        CurOp* _parent = nullptr;
         Command * _command;
         long long _start;
         long long _end;
         bool _active;
-        bool _suppressFromCurop; // unless $all is set
         int _op;
         bool _isCommand;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
@@ -349,7 +349,6 @@ namespace mongo {
         ProgressMeter _progressMeter;
         AtomicInt32 _killPending;
         int _numYields;
-        LockStat _lockStat;
         
         // this is how much "extra" time a query might take
         // a writebacklisten for example will block for 30s 

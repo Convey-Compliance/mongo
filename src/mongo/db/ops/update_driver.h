@@ -69,11 +69,11 @@ namespace mongo {
          * conflicts along the way then those errors will be returned.
          */
         Status populateDocumentWithQueryFields(const BSONObj& query,
-                                               const vector<FieldRef*>* immutablePaths,
+                                               const std::vector<FieldRef*>* immutablePaths,
                                                mutablebson::Document& doc) const;
 
         Status populateDocumentWithQueryFields(const CanonicalQuery* query,
-                                               const vector<FieldRef*>* immutablePaths,
+                                               const std::vector<FieldRef*>* immutablePaths,
                                                mutablebson::Document& doc) const;
 
         /**
@@ -95,10 +95,11 @@ namespace mongo {
          * If a non-NULL updatedField vector* is supplied,
          * then all updated fields will be added to it.
          */
-        Status update(const StringData& matchedField,
+        Status update(StringData matchedField,
                       mutablebson::Document* doc,
                       BSONObj* logOpRec = NULL,
-                      FieldRefSet* updatedFields = NULL);
+                      FieldRefSet* updatedFields = NULL,
+                      bool* docWasModified = NULL);
 
         //
         // Accessors

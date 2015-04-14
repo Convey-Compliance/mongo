@@ -31,10 +31,12 @@
 #include "mongo/dbtests/framework_options.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <iostream>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/query/new_find.h"
+#include "mongo/db/query/find.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -43,6 +45,11 @@
 #include "mongo/util/password.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     FrameworkGlobalParams frameworkGlobalParams;
 
@@ -53,7 +60,7 @@ namespace mongo {
         options->addOptionChaining("dbpath", "dbpath", moe::String,
                 "db data path for this test run. NOTE: the contents of this directory will "
                 "be overwritten if it already exists")
-                                  .setDefault(moe::Value(default_test_dbpath));
+                                  .setDefault(moe::Value(dbtests::default_test_dbpath));
 
         options->addOptionChaining("debug", "debug", moe::Switch, "run tests with verbose output");
 
@@ -95,7 +102,7 @@ namespace mongo {
         return Status::OK();
     }
 
-    std::string getTestFrameworkHelp(const StringData& name, const moe::OptionSection& options) {
+    std::string getTestFrameworkHelp(StringData name, const moe::OptionSection& options) {
         StringBuilder sb;
         sb << "usage: " << name << " [options] [suite]...\n"
             << options.helpString() << "suite: run the specified test suite(s) only\n";
@@ -151,7 +158,7 @@ namespace mongo {
         }
 
         if( params.count("nopreallocj") ) {
-            storageGlobalParams.preallocj = false;
+            mmapv1GlobalOptions.preallocj = false;
         }
 
         if (params.count("debug") || params.count("verbose") ) {
@@ -188,15 +195,15 @@ namespace mongo {
         string dbpathString = p.string();
         storageGlobalParams.dbpath = dbpathString.c_str();
 
-        storageGlobalParams.prealloc = false;
+        mmapv1GlobalOptions.prealloc = false;
 
         // dbtest defaults to smallfiles
-        storageGlobalParams.smallfiles = true;
+        mmapv1GlobalOptions.smallfiles = true;
         if( params.count("bigfiles") ) {
             storageGlobalParams.dur = true;
         }
 
-        DEV log() << "_DEBUG build" << endl;
+        DEV log() << "DEBUG build" << endl;
         if( sizeof(void*)==4 )
             log() << "32bit" << endl;
         log() << "random seed: " << frameworkGlobalParams.seed << endl;
@@ -222,11 +229,11 @@ namespace mongo {
             frameworkGlobalParams.filter = params["filter"].as<string>();
         }
 
-        if (debug && storageGlobalParams.dur) {
-            log() << "_DEBUG: automatically enabling storageGlobalParams.durOptions=8 "
-                  << "(DurParanoid)" << endl;
+        if (kDebugBuild && storageGlobalParams.dur) {
+            log() << "Debug Build: automatically enabling mmapv1GlobalOptions.journalOptions=8 "
+                  << "(JournalParanoid)" << endl;
             // this was commented out.  why too slow or something?
-            storageGlobalParams.durOptions |= 8;
+            mmapv1GlobalOptions.journalOptions |= MMAPV1Options::JournalParanoid;
         }
 
         return Status::OK();

@@ -31,17 +31,49 @@
 #include "mongo/db/exec/working_set.h"
 
 namespace mongo {
+    class CanonicalQuery;
+    class Collection;
 
     class WorkingSetCommon {
     public:
         /**
          * Get an owned copy of the BSONObj the WSM refers to.
-         * Requires either a valid BSONObj or valid DiskLoc.
+         * Requires either a valid BSONObj or valid RecordId.
          * Returns true if the fetch and invalidate succeeded, false otherwise.
          */
         static bool fetchAndInvalidateLoc(OperationContext* txn,
                                           WorkingSetMember* member,
                                           const Collection* collection);
+
+        /**
+         * This must be called as part of "saveState" operations after all nodes in the tree save
+         * their state.
+         *
+         * Iterates over 'workingSet' and converts all LOC_AND_UNOWNED_OBJ members to
+         * LOC_AND_OWNED_OBJ by calling getOwned on their obj. Also sets the isSuspicious flag on
+         * all nodes in LOC_AND_IDX state.
+         */
+        static void prepareForSnapshotChange(WorkingSet* workingSet);
+
+        /**
+         * Retrieves the document corresponding to 'member' from 'collection', and sets the state of
+         * 'member' appropriately.
+         *
+         * If false is returned, the document should not be considered for the result set. It is the
+         * caller's responsibility to free 'member' in this case.
+         *
+         * WriteConflict exceptions may be thrown. When they are, 'member' will be unmodified.
+         */
+        static bool fetch(OperationContext* txn,
+                          WorkingSetMember* member,
+                          const Collection* collection);
+
+        static bool fetchIfUnfetched(OperationContext* txn,
+                                     WorkingSetMember* member,
+                                     const Collection* collection) {
+            if (member->hasObj()) return true;
+            return fetch(txn, member, collection);
+        }
 
         /**
          * Initialize the fields in 'dest' from 'src', creating copies of owned objects as needed.

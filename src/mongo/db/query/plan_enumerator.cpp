@@ -34,12 +34,16 @@
 
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/index_tag.h"
-#include "mongo/db/query/qlog.h"
 #include "mongo/util/log.h"
 
 namespace {
 
     using namespace mongo;
+    using std::auto_ptr;
+    using std::endl;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     std::string getPathPrefix(std::string path) {
         if (mongoutils::str::contains(path, '.')) {
@@ -179,7 +183,7 @@ namespace mongo {
         sortUsingTags(*tree);
 
         _root->resetTag();
-        QLOG() << "Enumerator: memo just before moving:" << endl << dumpMemo();
+        LOG(5) << "Enumerator: memo just before moving:" << endl << dumpMemo();
         _done = nextMemo(memoIDForNode(_root));
         return true;
     }
@@ -411,9 +415,8 @@ namespace mongo {
             if (NULL != mandatoryPred) {
                 // We must have at least one index which can be used to answer 'mandatoryPred'.
                 invariant(!mandatoryIndices.empty());
-                enumerateMandatoryIndex(idxToFirst, idxToNotFirst, mandatoryPred,
-                                        mandatoryIndices, andAssignment);
-                return true;
+                return enumerateMandatoryIndex(idxToFirst, idxToNotFirst, mandatoryPred,
+                                               mandatoryIndices, andAssignment);
             }
 
             enumerateOneIndex(idxToFirst, idxToNotFirst, subnodes, andAssignment);
@@ -429,7 +432,7 @@ namespace mongo {
         return false;
     }
 
-    void PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
+    bool PlanEnumerator::enumerateMandatoryIndex(const IndexToPredMap& idxToFirst,
                                                  const IndexToPredMap& idxToNotFirst,
                                                  MatchExpression* mandatoryPred,
                                                  const set<IndexID>& mandatoryIndices,
@@ -456,6 +459,13 @@ namespace mongo {
             indexAssign.index = *indexIt;
 
             IndexToPredMap::const_iterator it = idxToFirst.find(*indexIt);
+            if (idxToFirst.end() == it) {
+                // We don't have any predicate to assign to the leading field of this index.
+                // This means that we cannot generate a solution using this index, so we
+                // just move on to the next index.
+                continue;
+            }
+
             const vector<MatchExpression*>& predsOverLeadingField = it->second;
 
             if (thisIndex.multikey) {
@@ -543,6 +553,8 @@ namespace mongo {
             state.assignments.push_back(indexAssign);
             andAssignment->choices.push_back(state);
         }
+
+        return andAssignment->choices.size() > 0;
     }
 
     void PlanEnumerator::enumerateOneIndex(const IndexToPredMap& idxToFirst,
@@ -946,9 +958,7 @@ namespace mongo {
                 bool mandatory = expressionRequiresIndex(child);
 
                 // Recursively prepMemo for the subnode. We fall through
-                // to this case for logical nodes other than AND (e.g. OR)
-                // and for array nodes other than ELEM_MATCH_OBJECT or
-                // ELEM_MATCH_VALUE (e.g. ALL).
+                // to this case for logical nodes other than AND (e.g. OR).
                 if (prepMemo(child, context)) {
                     size_t childID = memoIDForNode(child);
 
@@ -1136,7 +1146,7 @@ namespace mongo {
     //
 
     void PlanEnumerator::tagMemo(size_t id) {
-        QLOG() << "Tagging memoID " << id << endl;
+        LOG(5) << "Tagging memoID " << id << endl;
         NodeAssignment* assign = _memo[id];
         verify(NULL != assign);
 

@@ -35,7 +35,7 @@
 namespace mongo {
 
     class Collection;
-    class DiskLoc;
+    class RecordId;
     class OperationContext;
 
     /**
@@ -119,6 +119,29 @@ namespace mongo {
             // nothing output in the out parameter.
             NEED_TIME,
 
+            // The storage engine says we need to yield, possibly to fetch a record from disk, or
+            // due to an aborted transaction in the storage layer.
+            //
+            // Full yield request semantics:
+            //
+            // Each stage that receives a NEED_YIELD from a child must propagate the NEED_YIELD up
+            // and perform no work.
+            //
+            // If a yield is requested due to a WriteConflict, the out parameter of work(...) should
+            // be populated with WorkingSet::INVALID_ID. If it is illegal to yield, a
+            // WriteConflictException will be thrown.
+            //
+            // A yield-requesting stage populates the out parameter of work(...) with a WSID that
+            // refers to a WSM with a Fetcher*. If it is illegal to yield, this is ignored. This
+            // difference in behavior can be removed once SERVER-16051 is resolved.
+            //
+            // The plan executor is responsible for yielding and, if requested, paging in the data
+            // upon receipt of a NEED_YIELD. The plan executor does NOT free the WSID of the
+            // requested fetch. The stage that requested the fetch holds the WSID of the loc it
+            // wants fetched. On the next call to work() that stage can assume a fetch was performed
+            // on the WSM that the held WSID refers to.
+            NEED_YIELD,
+
             // Something went wrong but it's not an internal error.  Perhaps our collection was
             // dropped or state deleted.
             DEAD,
@@ -140,6 +163,12 @@ namespace mongo {
             }
             else if (NEED_TIME == state) {
                 return "NEED_TIME";
+            }
+            else if (NEED_YIELD == state) {
+                return "NEED_YIELD";
+            }
+            else if (DEAD == state) {
+                return "DEAD";
             }
             else {
                 verify(FAILURE == state);
@@ -177,6 +206,9 @@ namespace mongo {
         /**
          * Notifies the stage that all locks are about to be released.  The stage must save any
          * state required to resume where it was before saveState was called.
+         *
+         * Stages must be able to handle multiple calls to saveState() in a row without a call to
+         * restoreState() in between.
          */
         virtual void saveState() = 0;
 
@@ -186,19 +218,25 @@ namespace mongo {
          *
          * Can only be called after saveState.
          *
-         * XXX: We may not need to pass down 'opCtx' if getMore'd queries use the same
-         * OperationContext they were created with.
+         * If the stage needs an OperationContext during its execution, it may keep a handle to the
+         * provided OperationContext (which is valid until the next call to saveState()).
          */
         virtual void restoreState(OperationContext* opCtx) = 0;
 
         /**
-         * Notifies a stage that a DiskLoc is going to be deleted (or in-place updated) so that the
+         * Notifies a stage that a RecordId is going to be deleted (or in-place updated) so that the
          * stage can invalidate or modify any state required to continue processing without this
-         * DiskLoc.
+         * RecordId.
          *
          * Can only be called after a saveState but before a restoreState.
+         *
+         * The provided OperationContext should be used if any work needs to be performed during the
+         * invalidate (as the state of the stage must be saved before any calls to invalidate, the
+         * stage's own OperationContext is inactive during the invalidate and should not be used).
          */
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type) = 0;
+        virtual void invalidate(OperationContext* txn,
+                                const RecordId& dl,
+                                InvalidationType type) = 0;
 
         /**
          * Retrieve a list of this stage's children. This stage keeps ownership of

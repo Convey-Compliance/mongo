@@ -30,25 +30,30 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/database_holder.h"
+
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/background.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    static DatabaseHolder _dbHolder;
+    using std::set;
+    using std::string;
+    using std::stringstream;
 
 namespace {
-    static StringData _todb(const StringData& ns) {
+
+    StringData _todb(StringData ns) {
         size_t i = ns.find('.');
         if (i == std::string::npos) {
             uassert(13074, "db name can't be empty", ns.size());
@@ -62,17 +67,23 @@ namespace {
 
         return d;
     }
-}
+
+
+    DatabaseHolder _dbHolder;
+
+} // namespace
+
 
     DatabaseHolder& dbHolder() {
         return _dbHolder;
     }
 
+
     Database* DatabaseHolder::get(OperationContext* txn,
-                                  const StringData& ns) const {
+                                  StringData ns) const {
 
         const StringData db = _todb(ns);
-        invariant(txn->lockState()->isAtLeastReadLocked(db));
+        invariant(txn->lockState()->isDbLockedForMode(db, MODE_IS));
 
         SimpleMutex::scoped_lock lk(_m);
         DBs::const_iterator it = _dbs.find(db);
@@ -84,11 +95,11 @@ namespace {
     }
 
     Database* DatabaseHolder::openDb(OperationContext* txn,
-                                     const StringData& ns,
+                                     StringData ns,
                                      bool* justCreated) {
 
         const StringData dbname = _todb(ns);
-        invariant(txn->lockState()->isWriteLocked(dbname));
+        invariant(txn->lockState()->isDbLockedForMode(dbname, MODE_X));
 
         Database* db = get(txn, ns);
         if (db) {
@@ -111,28 +122,34 @@ namespace {
             uasserted(DatabaseDifferCaseCode, ss.str());
         }
 
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         invariant(storageEngine);
 
         DatabaseCatalogEntry* entry = storageEngine->getDatabaseCatalogEntry(txn, dbname);
         invariant(entry);
-        if (justCreated) {
-            *justCreated = !entry->exists();
+        const bool exists = entry->exists();
+        if (!exists) {
+            audit::logCreateDatabase(currentClient.get(), dbname);
         }
 
-        // Only one thread can be inside this method for the same DB name, because of the
-        // requirement for X-lock on the database. So there is no way we can insert two different
-        // databases for the same name.
-        SimpleMutex::scoped_lock lk(_m);
+        if (justCreated) {
+            *justCreated = !exists;
+        }
 
-        db = new Database(dbname, entry);
+        // Do this outside of the scoped lock, because database creation does transactional
+        // operations which may block. Only one thread can be inside this method for the same DB
+        // name, because of the requirement for X-lock on the database when we enter. So there is
+        // no way we can insert two different databases for the same name.
+        db = new Database(txn, dbname, entry);
+
+        SimpleMutex::scoped_lock lk(_m);
         _dbs[dbname] = db;
 
         return db;
     }
 
     void DatabaseHolder::close(OperationContext* txn,
-                               const StringData& ns) {
+                               StringData ns) {
         // TODO: This should be fine if only a DB X-lock
         invariant(txn->lockState()->isW());
 
@@ -149,7 +166,7 @@ namespace {
         delete it->second;
         _dbs.erase(it);
 
-        getGlobalEnvironment()->getGlobalStorageEngine()->closeDatabase(txn, dbName.toString());
+        getGlobalServiceContext()->getGlobalStorageEngine()->closeDatabase(txn, dbName.toString());
     }
 
     bool DatabaseHolder::closeAll(OperationContext* txn, BSONObjBuilder& result, bool force) {
@@ -172,8 +189,7 @@ namespace {
             if( !force && BackgroundOperation::inProgForDb(name) ) {
                 log() << "WARNING: can't close database "
                       << name
-                      << " because a bg job is in progress - try killOp command"
-                      << endl;
+                      << " because a bg job is in progress - try killOp command";
                 nNotClosed++;
                 continue;
             }
@@ -184,7 +200,7 @@ namespace {
 
             _dbs.erase( name );
 
-            getGlobalEnvironment()->getGlobalStorageEngine()->closeDatabase( txn, name );
+            getGlobalServiceContext()->getGlobalStorageEngine()->closeDatabase( txn, name );
 
             bb.append( name );
         }

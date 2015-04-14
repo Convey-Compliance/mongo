@@ -30,9 +30,13 @@
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
@@ -41,6 +45,10 @@
 #include "mongo/s/d_state.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::string;
 
 namespace {
     class MongodImplementation : public DocumentSourceNeedsMongod::MongodInterface {

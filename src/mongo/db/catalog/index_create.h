@@ -30,14 +30,15 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
-#include "mongo/db/diskloc.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -64,6 +65,7 @@ namespace mongo {
          * Neither pointer is owned.
          */
         MultiIndexBlock(OperationContext* txn, Collection* collection);
+        ~MultiIndexBlock();
 
         /**
          * By default we ignore the 'background' flag in specs when building an index. If this is
@@ -100,11 +102,29 @@ namespace mongo {
          * Prepares the index(es) for building.
          *
          * Does not need to be called inside of a WriteUnitOfWork (but can be due to nesting).
+         *
+         * Requires holding an exclusive database lock.
          */
         Status init(const std::vector<BSONObj>& specs);
         Status init(const BSONObj& spec) {
             return init(std::vector<BSONObj>(1, spec));
         }
+
+        /**
+         * Manages in-progress background index builds.
+         * Call registerIndexBuild() after calling init() to record this build in the catalog's 
+         * in-progress map.
+         * The build must be a background build and it must be a single index build (the size of
+         * _indexes must be 1).
+         * registerIndexBuild() returns the descriptor for the index build. You must subsequently
+         * call unregisterIndexBuild() with that same descriptor before this MultiIndexBlock goes
+         * out of scope.
+         * These functions are only intended to be used by the replication system. No internal
+         * concurrency control is performed; it is expected that the code has already taken steps
+         * to ensure calls to these functions are serialized, for a particular IndexCatalog.
+         */
+        IndexDescriptor* registerIndexBuild();
+        void unregisterIndexBuild(IndexDescriptor* descriptor);
 
         /**
          * Inserts all documents in the Collection into the indexes and logs with timing info.
@@ -120,7 +140,7 @@ namespace mongo {
          *
          * Should not be called inside of a WriteUnitOfWork.
          */
-        Status insertAllDocumentsInCollection(std::set<DiskLoc>* dupsOut = NULL);
+        Status insertAllDocumentsInCollection(std::set<RecordId>* dupsOut = NULL);
 
         /**
          * Call this after init() for each document in the collection.
@@ -129,7 +149,7 @@ namespace mongo {
          *
          * Should be called inside of a WriteUnitOfWork.
          */
-        Status insert(const BSONObj& wholeDocument, const DiskLoc& loc);
+        Status insert(const BSONObj& wholeDocument, const RecordId& loc);
 
         /**
          * Call this after the last insert(). This gives the index builder a chance to do any
@@ -143,7 +163,7 @@ namespace mongo {
          *
          * Should not be called inside of a WriteUnitOfWork.
          */
-        Status doneInserting(std::set<DiskLoc>* dupsOut = NULL);
+        Status doneInserting(std::set<RecordId>* dupsOut = NULL);
 
         /**
          * Marks the index ready for use. Should only be called as the last method after
@@ -151,6 +171,8 @@ namespace mongo {
          *
          * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
          * logOp() should be called from the same unit of work as commit().
+         *
+         * Requires holding an exclusive database lock.
          */
         void commit();
 
@@ -170,28 +192,45 @@ namespace mongo {
          */
         void abortWithoutCleanup();
 
-        ~MultiIndexBlock();
+        bool getBuildInBackground() const { return _buildInBackground; }
 
     private:
         class SetNeedToCleanupOnRollback;
+        class CleanupIndexesVectorOnRollback;
 
         struct IndexToBuild {
-            IndexToBuild() : real(NULL) {}
+#if defined(_MSC_VER) && _MSC_VER < 1900 // MVSC++ <= 2013 can't generate default move operations
+            IndexToBuild() = default;
+            IndexToBuild(IndexToBuild&& other)
+                : block(std::move(other.block))
+                , real(std::move(other.real))
+                , bulk(std::move(other.bulk))
+                , options(std::move(other.options))
+                , filterExpression(std::move(other.filterExpression))
+            {}
 
-            IndexAccessMethod* forInsert() { return bulk ? bulk.get() : real; }
+            IndexToBuild& operator= (IndexToBuild&& other) {
+                block = std::move(other.block);
+                real = std::move(other.real);
+                filterExpression = std::move(other.filterExpression);
+                bulk = std::move(other.bulk);
+                options = std::move(other.options);
+                return *this;
+            }
+#endif
 
-            boost::shared_ptr<IndexCatalog::IndexBuildBlock> block;
+            std::unique_ptr<IndexCatalog::IndexBuildBlock> block;
 
-            IndexAccessMethod* real; // owned elsewhere
-            boost::shared_ptr<IndexAccessMethod> bulk;
+            IndexAccessMethod* real = NULL; // owned elsewhere
+            const MatchExpression* filterExpression; // might be NULL, owned elsewhere
+            std::unique_ptr<IndexAccessMethod::BulkBuilder> bulk;
 
             InsertDeleteOptions options;
         };
 
         std::vector<IndexToBuild> _indexes;
 
-        boost::scoped_ptr<BackgroundOperation> _backgroundOperation;
-
+        std::unique_ptr<BackgroundOperation> _backgroundOperation;
 
         // Pointers not owned here and must outlive 'this'
         Collection* _collection;

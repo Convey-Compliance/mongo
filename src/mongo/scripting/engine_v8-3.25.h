@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <boost/shared_ptr.hpp>
 #include <v8.h>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -60,6 +63,7 @@ namespace mongo {
     class V8ScriptEngine;
     class V8Scope;
     class BSONHolder;
+    class JSThreadConfig;
 
     typedef v8::Local<v8::Value> (*v8Function)(V8Scope* scope,
                                   const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -92,7 +96,7 @@ namespace mongo {
          * V8Scope is destructed.
          */
         ~ObjTracker() {
-            typename set<TrackedPtr*>::iterator it = _container.begin();
+            typename std::set<TrackedPtr*>::iterator it = _container.begin();
             while (it != _container.end()) {
                 delete *it;
                 _container.erase(it++);
@@ -130,7 +134,7 @@ namespace mongo {
         }
 
         // container for all TrackedPtrs created by this ObjTracker instance
-        set<TrackedPtr*> _container;
+        std::set<TrackedPtr*> _container;
     };
 
     /**
@@ -173,6 +177,18 @@ namespace mongo {
         OperationContext* getOpContext() const;
 
         /**
+         * Register this scope with the mongo op id.  If executing outside the
+         * context of a mongo operation (e.g. from the shell), killOp will not
+         * be supported.
+         */
+        virtual void registerOperation(OperationContext* txn);
+
+        /**
+         * Unregister this scope with the mongo op id.
+         */
+        virtual void unregisterOperation();
+
+        /**
          * Connect to a local database, create a Mongo object instance, and load any
          * server-side js into the global object
          */
@@ -184,7 +200,7 @@ namespace mongo {
 
         virtual void installBSONTypes();
 
-        virtual string getError() { return _error; }
+        virtual std::string getError() { return _error; }
 
         virtual bool hasOutOfMemoryException();
 
@@ -202,12 +218,12 @@ namespace mongo {
         virtual double getNumber(const char* field);
         virtual int getNumberInt(const char* field);
         virtual long long getNumberLongLong(const char* field);
-        virtual string getString(const char* field);
+        virtual std::string getString(const char* field);
         virtual bool getBoolean(const char* field);
         virtual BSONObj getObject(const char* field);
 
         virtual void setNumber(const char* field, double val);
-        virtual void setString(const char* field, const StringData& val);
+        virtual void setString(const char* field, StringData val);
         virtual void setBoolean(const char* field, bool val);
         virtual void setElement(const char* field, const BSONElement& e);
         virtual void setObject(const char* field, const BSONObj& obj, bool readOnly);
@@ -221,7 +237,7 @@ namespace mongo {
                            int timeoutMs = 0, bool ignoreReturn = false,
                            bool readOnlyArgs = false, bool readOnlyRecv = false);
 
-        virtual bool exec(const StringData& code, const string& name, bool printResult,
+        virtual bool exec(StringData code, const std::string& name, bool printResult,
                           bool reportError, bool assertOnError, int timeoutMs);
 
         // functions to create v8 object and function templates
@@ -262,27 +278,27 @@ namespace mongo {
          */
         mongo::BSONObj v8ToMongo(v8::Local<v8::Object> obj, int depth = 0);
         void v8ToMongoElement(BSONObjBuilder& b,
-                              const StringData& sname,
+                              StringData sname,
                               v8::Local<v8::Value> value,
                               int depth = 0,
                               BSONObj* originalParent = 0);
         void v8ToMongoObject(BSONObjBuilder& b,
-                             const StringData& sname,
+                             StringData sname,
                              v8::Local<v8::Value> value,
                              int depth,
                              BSONObj* originalParent);
         void v8ToMongoNumber(BSONObjBuilder& b,
-                             const StringData& elementName,
+                             StringData elementName,
                              v8::Local<v8::Number> value,
                              BSONObj* originalParent);
         void v8ToMongoRegex(BSONObjBuilder& b,
-                            const StringData& elementName,
+                            StringData elementName,
                             v8::Local<v8::RegExp> v8Regex);
         void v8ToMongoDBRef(BSONObjBuilder& b,
-                            const StringData& elementName,
+                            StringData elementName,
                             v8::Local<v8::Object> obj);
         void v8ToMongoBinData(BSONObjBuilder& b,
-                              const StringData& elementName,
+                              StringData elementName,
                               v8::Local<v8::Object> obj);
         OID v8ToMongoObjectID(v8::Local<v8::Object> obj);
 
@@ -297,7 +313,7 @@ namespace mongo {
         /**
          * Create a V8 string with a local handle
          */
-        inline v8::Local<v8::String> v8StringData(const StringData& str) {
+        inline v8::Local<v8::String> v8StringData(StringData str) {
             return v8::String::NewFromUtf8(_isolate, str.rawData(), v8::String::kNormalString,
                                            str.size());
         }
@@ -330,6 +346,7 @@ namespace mongo {
                 : conn(conn), cursor(cursor) { }
         };
         ObjTracker<DBConnectionAndCursor> dbConnectionAndCursor;
+        ObjTracker<JSThreadConfig> jsThreadConfigTracker;
 
         // These are all named after the JS constructor name + FT
         v8::Local<v8::FunctionTemplate> ObjectIdFT()       { return _ObjectIdFT.Get(_isolate); }
@@ -428,21 +445,9 @@ namespace mongo {
         bool nativeEpilogue();
 
         /**
-         * Register this scope with the mongo op id.  If executing outside the
-         * context of a mongo operation (e.g. from the shell), killOp will not
-         * be supported.
-         */
-        void registerOpId();
-
-        /**
-         * Unregister this scope with the mongo op id.
-         */
-        void unregisterOpId();
-
-        /**
          * Create a new function; primarily used for BSON/V8 conversion.
          */
-        v8::Local<v8::Value> newFunction(const StringData& code);
+        v8::Local<v8::Value> newFunction(StringData code);
 
         template <typename _HandleType>
         bool checkV8ErrorState(const _HandleType& resultHandle,
@@ -454,7 +459,7 @@ namespace mongo {
 
         v8::Eternal<v8::Context> _context;
         v8::Eternal<v8::Object> _global;
-        string _error;
+        std::string _error;
         std::vector<v8::Eternal<v8::Value> > _funcs;
 
         enum ConnectState { NOT, LOCAL, EXTERNAL };
@@ -514,7 +519,7 @@ namespace mongo {
         mongo::mutex _interruptLock; // protects interruption-related flags
         bool _inNativeExecution;     // protected by _interruptLock
         bool _pendingKill;           // protected by _interruptLock
-        int _opId;                   // op id for this scope
+        unsigned int _opId;          // op id for this scope
         OperationContext* _opCtx;    // Op context for DbEval
     };
 
@@ -559,7 +564,7 @@ namespace mongo {
          */
         DeadlineMonitor<V8Scope>* getDeadlineMonitor() { return &_deadlineMonitor; }
 
-        typedef map<unsigned, V8Scope*> OpIdToScopeMap;
+        typedef std::map<unsigned, V8Scope*> OpIdToScopeMap;
         mongo::mutex _globalInterruptLock;  // protects map of all operation ids -> scope
         OpIdToScopeMap _opToScopeMap;       // map of mongo op ids to scopes (protected by
                                             // _globalInterruptLock).
@@ -590,7 +595,7 @@ namespace mongo {
         const BSONObj _obj;
         bool _modified;
         const bool _readOnly;
-        set<string> _removed;
+        std::set<std::string> _removed;
     };
 
     extern ScriptEngine* globalScriptEngine;

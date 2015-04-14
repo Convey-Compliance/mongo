@@ -32,6 +32,7 @@
 
 #include "mongo/db/storage/mmap_v1/record_store_v1_test_help.h"
 
+#include <boost/next_prior.hpp>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -39,11 +40,14 @@
 
 #include "mongo/db/storage/mmap_v1/extent.h"
 #include "mongo/db/storage/mmap_v1/record.h"
+#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::numeric_limits;
 
     DummyRecordStoreV1MetaData::DummyRecordStoreV1MetaData( bool capped, int userFlags ) {
         _dataSize = 0;
@@ -257,6 +261,10 @@ namespace mongo {
                                            int* numExtents,
                                            int64_t* totalFreeSizeBytes) const {
         invariant(false);
+    }
+
+    RecordFetcher* DummyExtentManager::recordNeedsFetch( const DiskLoc& loc ) const {
+        return NULL;
     }
 
     Record* DummyExtentManager::recordForV1( const DiskLoc& loc ) const {

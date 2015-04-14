@@ -30,11 +30,12 @@
 
 #pragma once
 
-#include "mongo/client/export_macros.h"
+#include <string>
+
 
 namespace mongo {
 
-    class MONGO_CLIENT_API LogFile {
+    class LogFile {
     public:
         /** create the file and open.  must not already exist.
             throws UserAssertion on i/o error

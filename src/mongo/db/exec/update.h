@@ -28,11 +28,14 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
+#include <boost/scoped_ptr.hpp>
+
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_request.h"
+#include "mongo/db/ops/update_result.h"
 
 namespace mongo {
 
@@ -76,9 +79,10 @@ namespace mongo {
     class UpdateStage : public PlanStage {
         MONGO_DISALLOW_COPYING(UpdateStage);
     public:
-        UpdateStage(const UpdateStageParams& params,
+        UpdateStage(OperationContext* txn,
+                    const UpdateStageParams& params,
                     WorkingSet* ws,
-                    Database* db,
+                    Collection* collection,
                     PlanStage* child);
 
         virtual bool isEOF();
@@ -86,7 +90,7 @@ namespace mongo {
 
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -100,12 +104,50 @@ namespace mongo {
 
         static const char* kStageType;
 
+        /**
+         * Converts the execution stats (stored by the update stage as an UpdateStats) for the
+         * update plan represented by 'exec' into the UpdateResult format used to report the results
+         * of writes.
+         *
+         * Also responsible for filling out 'opDebug' with execution info.
+         *
+         * Should only be called once this stage is EOF.
+         */
+        static UpdateResult makeUpdateResult(PlanExecutor* exec, OpDebug* opDebug);
+
+        /**
+         * Computes the document to insert if the upsert flag is set to true and no matching
+         * documents are found in the database. The document to upsert is computing using the
+         * query 'cq' and the update mods contained in 'driver'.
+         *
+         * If 'cq' is NULL, which can happen for the idhack update fast path, then 'query' is
+         * used to compute the doc to insert instead of 'cq'.
+         *
+         * 'doc' is the mutable BSON document which you would like the update driver to use
+         * when computing the document to insert.
+         *
+         * Set 'isInternalRequest' to true if the upsert was issued by the replication or
+         * sharding systems.
+         *
+         * Fills out whether or not this is a fastmodinsert in 'stats'.
+         *
+         * Returns the document to insert in *out.
+         */
+        static Status applyUpdateOpsForInsert(const CanonicalQuery* cq,
+                                              const BSONObj& query,
+                                              UpdateDriver* driver,
+                                              UpdateLifecycle* lifecycle,
+                                              mutablebson::Document* doc,
+                                              bool isInternalRequest,
+                                              UpdateStats* stats,
+                                              BSONObj* out);
+
     private:
         /**
-         * Computes the result of applying mods to the document 'oldObj' at DiskLoc 'loc' in
+         * Computes the result of applying mods to the document 'oldObj' at RecordId 'loc' in
          * memory, then commits these changes to the database.
          */
-        void transformAndUpdate(BSONObj& oldObj, DiskLoc& loc);
+        void transformAndUpdate(const Snapshotted<BSONObj>& oldObj, RecordId& loc);
 
         /**
          * Computes the document to insert and inserts it into the collection. Used if the
@@ -130,17 +172,22 @@ namespace mongo {
          */
         Status restoreUpdateState(OperationContext* opCtx);
 
+        // Transactional context.  Not owned by us.
+        OperationContext* _txn;
+
         UpdateStageParams _params;
 
         // Not owned by us.
         WorkingSet* _ws;
 
-        // Not owned by us.
-        Database* _db;
+        // Not owned by us. May be NULL.
         Collection* _collection;
 
         // Owned by us.
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
+
+        // If not Null, we use this rather than asking our child what to do next.
+        WorkingSetID _idRetrying;
 
         // Stats
         CommonStats _commonStats;
@@ -158,7 +205,7 @@ namespace mongo {
         // document and we wouldn't want to update that.
         //
         // So, no matter what, we keep track of where the doc wound up.
-        typedef unordered_set<DiskLoc, DiskLoc::Hasher> DiskLocSet;
+        typedef unordered_set<RecordId, RecordId::Hasher> DiskLocSet;
         const boost::scoped_ptr<DiskLocSet> _updatedLocs;
 
         // These get reused for each update.

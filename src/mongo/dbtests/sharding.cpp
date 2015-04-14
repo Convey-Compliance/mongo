@@ -1,5 +1,3 @@
-// sharding.cpp : some unit tests for sharding internals
-
 /**
  *    Copyright (C) 2009 10gen Inc.
  *
@@ -32,20 +30,33 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/client/dbclientmockcursor.h"
 #include "mongo/client/parallel.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/config_server_fixture.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/s/catalog/type_chunk.h"
+#include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_diff.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
-#include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/util/log.h"
 
 namespace ShardingTests {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::make_pair;
+    using std::map;
+    using std::pair;
+    using std::set;
+    using std::string;
+    using std::vector;
 
     namespace serverandquerytests {
         class test1 {
@@ -86,11 +97,8 @@ namespace ShardingTests {
     class ChunkManagerTest : public ConnectionString::ConnectionHook {
     public:
 
-        OperationContextImpl _txn;
-        CustomDirectClient _client;
-        Shard _shard;
-
-        ChunkManagerTest() {
+        ChunkManagerTest() : _client(&_txn) {
+            shardConnectionPool.clear();
 
             DBException::traceExceptions = true;
 
@@ -111,16 +119,20 @@ namespace ShardingTests {
             _shard = Shard("shard0000",
                            "$hostFooBar:27017",
                            0 /* maxSize */,
-                           false /* draining */,
-                           BSONArray() /* tags */);
+                           false /* draining */);
             // Need to run this to ensure the shard is in the global lookup table
             Shard::installShard(_shard.getName(), _shard);
+            // Add dummy shard to config DB
+            _client.insert(ShardType::ConfigNS,
+                           BSON(ShardType::name() << _shard.getName() <<
+                                ShardType::host() << _shard.getConnString()));
 
             // Create an index so that diffing works correctly, otherwise no cursors from S&O
-            _client.ensureIndex( ChunkType::ConfigNS, // br
-                                  BSON( ChunkType::ns() << 1 << // br
-                                          ChunkType::DEPRECATED_lastmod() << 1 ) );
-            configServer.init("$dummy:1000");
+            ASSERT_OK(dbtests::createIndex(
+                              &_txn,
+                              ChunkType::ConfigNS,
+                              BSON( ChunkType::ns() << 1 << // br
+                                    ChunkType::DEPRECATED_lastmod() << 1 ) ));
         }
 
         virtual ~ChunkManagerTest() {
@@ -137,8 +149,14 @@ namespace ShardingTests {
                                        double socketTimeout )
         {
             // Note - must be new, since it gets owned elsewhere
-            return new CustomDirectClient();
+            return new CustomDirectClient(&_txn);
         }
+
+
+    protected:
+        OperationContextImpl _txn;
+        CustomDirectClient _client;
+        Shard _shard;
     };
 
     //
@@ -671,6 +689,8 @@ namespace ShardingTests {
             add< ChunkDiffUnitTestNormal >();
             add< ChunkDiffUnitTestInverse >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 }

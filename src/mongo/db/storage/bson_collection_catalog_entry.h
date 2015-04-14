@@ -43,7 +43,7 @@ namespace mongo {
      */
     class BSONCollectionCatalogEntry : public CollectionCatalogEntry {
     public:
-        BSONCollectionCatalogEntry( const StringData& ns );
+        BSONCollectionCatalogEntry( StringData ns );
 
         virtual ~BSONCollectionCatalogEntry(){}
 
@@ -54,25 +54,25 @@ namespace mongo {
         virtual int getCompletedIndexCount( OperationContext* txn ) const;
 
         virtual BSONObj getIndexSpec( OperationContext* txn,
-                                      const StringData& idxName ) const;
+                                      StringData idxName ) const;
 
         virtual void getAllIndexes( OperationContext* txn,
                                     std::vector<std::string>* names ) const;
 
         virtual bool isIndexMultikey( OperationContext* txn,
-                                      const StringData& indexName) const;
+                                      StringData indexName) const;
 
-        virtual DiskLoc getIndexHead( OperationContext* txn,
-                                      const StringData& indexName ) const;
+        virtual RecordId getIndexHead( OperationContext* txn,
+                                      StringData indexName ) const;
 
         virtual bool isIndexReady( OperationContext* txn,
-                                   const StringData& indexName ) const;
+                                   StringData indexName ) const;
 
         // ------ for implementors
 
         struct IndexMetaData {
             IndexMetaData() {}
-            IndexMetaData( BSONObj s, bool r, DiskLoc h, bool m )
+            IndexMetaData( BSONObj s, bool r, RecordId h, bool m )
                 : spec( s ), ready( r ), head( h ), multikey( m ) {}
 
             void updateTTLSetting( long long newExpireSeconds );
@@ -81,7 +81,7 @@ namespace mongo {
 
             BSONObj spec;
             bool ready;
-            DiskLoc head;
+            RecordId head;
             bool multikey;
         };
 
@@ -89,15 +89,15 @@ namespace mongo {
             void parse( const BSONObj& obj );
             BSONObj toBSON() const;
 
-            int findIndexOffset( const StringData& name ) const;
+            int findIndexOffset( StringData name ) const;
 
             /**
              * Removes information about an index from the MetaData. Returns true if an index
              * called name existed and was deleted, and false otherwise.
              */
-            bool eraseIndex( const StringData& name );
+            bool eraseIndex( StringData name );
 
-            void rename( const StringData& toNS );
+            void rename( StringData toNS );
 
             std::string ns;
             CollectionOptions options;

@@ -51,6 +51,9 @@
 
 namespace mongo {
 
+    using std::endl;
+    using std::vector;
+
     static Counter64 freelistAllocs;
     static Counter64 freelistBucketExhausted;
     static Counter64 freelistIterations;
@@ -66,7 +69,7 @@ namespace mongo {
                                                           &freelistIterations );
 
     SimpleRecordStoreV1::SimpleRecordStoreV1( OperationContext* txn,
-                                              const StringData& ns,
+                                              StringData ns,
                                               RecordStoreV1MetaData* details,
                                               ExtentManager* em,
                                               bool isSystemIndexes )
@@ -229,15 +232,13 @@ namespace mongo {
     void SimpleRecordStoreV1::addDeletedRec( OperationContext* txn, const DiskLoc& dloc ) {
         DeletedRecord* d = drec( dloc );
 
-        DEBUGGING log() << "TEMP: add deleted rec " << dloc.toString() << ' ' << hex << d->extentOfs() << endl;
-
         int b = bucket(d->lengthWithHeaders());
         *txn->recoveryUnit()->writing(&d->nextDeleted()) = _details->deletedListEntry(b);
         _details->setDeletedListEntry(txn, b, dloc);
     }
 
     RecordIterator* SimpleRecordStoreV1::getIterator( OperationContext* txn,
-                                                      const DiskLoc& start,
+                                                      const RecordId& start,
                                                       const CollectionScanParams::Direction& dir) const {
         return new SimpleRecordStoreV1Iterator( txn, this, start, dir );
     }
@@ -374,9 +375,9 @@ namespace mongo {
                     // start of the compact, this insert will allocate a record in a new extent.
                     // See the comment in compact() for more details.
                     CompactDocWriter writer( recOld, rawDataSize, allocationSize );
-                    StatusWith<DiskLoc> status = insertRecord( txn, &writer, false );
+                    StatusWith<RecordId> status = insertRecord( txn, &writer, false );
                     uassertStatusOK( status.getStatus() );
-                    const Record* newRec = recordFor(status.getValue());
+                    const Record* newRec = recordFor(DiskLoc::fromRecordId(status.getValue()));
                     invariant(unsigned(newRec->netLength()) >= rawDataSize);
                     totalNetSize += newRec->netLength();
 

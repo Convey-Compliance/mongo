@@ -28,7 +28,8 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/plan_stage.h"
@@ -37,6 +38,7 @@
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
@@ -44,7 +46,7 @@ namespace mongo {
      * This stage outputs its mainChild, and possibly it's backup child
      * and also updates the cache.
      *
-     * Preconditions: Valid DiskLoc.
+     * Preconditions: Valid RecordId.
      *
      * Owns the query solutions and PlanStage roots for all candidate plans.
      */
@@ -63,7 +65,7 @@ namespace mongo {
 
         virtual void restoreState(OperationContext* opCtx);
 
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -121,7 +123,7 @@ namespace mongo {
          * Gathers execution stats for all losing plans. Caller takes ownership of
          * all pointers in the returned vector.
          */
-        vector<PlanStageStats*> generateCandidateStats();
+        std::vector<PlanStageStats*> generateCandidateStats();
 
         static const char* kStageType;
 
@@ -138,7 +140,15 @@ namespace mongo {
          *
          * Returns true if we need to keep working the plans and false otherwise.
          */
-        bool workAllPlans(size_t numResults);
+        bool workAllPlans(size_t numResults, PlanYieldPolicy* yieldPolicy);
+
+        /**
+         * Checks whether we need to perform either a timing-based yield or a yield for a document
+         * fetch. If so, then uses 'yieldPolicy' to actually perform the yield.
+         *
+         * Returns a non-OK status if killed during a yield.
+         */
+        Status tryYield(PlanYieldPolicy* yieldPolicy);
 
         static const int kNoSuchPlan = -1;
 
@@ -182,6 +192,12 @@ namespace mongo {
         // if pickBestPlan fails, this is set to the wsid of the statusMember
         // returned by ::work()
         WorkingSetID _statusMemberId;
+
+        // When a stage requests a yield for document fetch, it gives us back a RecordFetcher*
+        // to use to pull the record into memory. We take ownership of the RecordFetcher here,
+        // deleting it after we've had a chance to do the fetch. For timing-based yields, we
+        // just pass a NULL fetcher.
+        boost::scoped_ptr<RecordFetcher> _fetcher;
 
         // Stats
         CommonStats _commonStats;

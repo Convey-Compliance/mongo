@@ -33,10 +33,15 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
+
+    using std::set;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     // XXX: remove and put into storage api
     intmax_t dbSize( const string& database );
@@ -44,7 +49,7 @@ namespace mongo {
     class CmdListDatabases : public Command {
     public:
         virtual bool slaveOk() const {
-            return true;
+            return false;
         }
         virtual bool slaveOverrideOk() const {
             return true;
@@ -73,7 +78,7 @@ namespace mongo {
                  bool /*fromRepl*/) {
 
             vector< string > dbNames;
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
             storageEngine->listDatabases( &dbNames );
 
             vector< BSONObj > dbInfos;
@@ -87,6 +92,7 @@ namespace mongo {
                 b.append( "name", dbname );
 
                 {
+                    ScopedTransaction transaction(txn, MODE_IS);
                     Lock::DBLock dbLock(txn->lockState(), dbname, MODE_IS);
 
                     Database* db = dbHolder().get( txn, dbname );

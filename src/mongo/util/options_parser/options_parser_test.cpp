@@ -26,6 +26,7 @@
  */
 
 #include <map>
+#include <ostream>
 #include <sstream>
 
 #include "mongo/bson/util/builder.h"
@@ -3663,6 +3664,144 @@ namespace {
         ASSERT_EQUALS(var2, 6);
     }
 
+    // If configuration file contains a deprecated dotted name, value will be set in the
+    // environment with the canonical name as the key. Deprecated dotted name will not appear
+    // in result environment.
+    TEST(YAMLConfigFile, DeprecatedDottedNameDeprecatedOnly) {
+        OptionsParserTester parser;
+        moe::Environment environment;
+
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+        testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1",
+                                   "dotted.deprecated");
+
+        std::vector<std::string> argv;
+        argv.push_back("binaryname");
+        argv.push_back("--config");
+        argv.push_back("config.yaml");
+        std::map<std::string, std::string> env_map;
+
+        parser.setConfig("config.yaml",
+                         "dotted.deprecated: 6");
+
+        ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+        moe::Value value;
+        ASSERT_OK(environment.get(moe::Key("dotted.canonical"), &value));
+        int var1;
+        ASSERT_OK(value.get(&var1));
+        ASSERT_EQUALS(var1, 6);
+        ASSERT_FALSE(environment.count(moe::Key("dotted.deprecated")));
+    }
+
+    // Deprecated dotted name cannot be the same as the canonical name.
+    TEST(YAMLConfigFile, DeprecatedDottedNameSameAsCanonicalDottedName) {
+        moe::OptionSection testOpts;
+        ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1",
+                                                 "dotted.canonical"), ::mongo::DBException);
+    }
+
+    // Deprecated dotted name cannot be the empty string.
+    TEST(YAMLConfigFile, DeprecatedDottedNameEmptyString) {
+        moe::OptionSection testOpts;
+        ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1", ""),
+                      ::mongo::DBException);
+    }
+
+    // Deprecated dotted name cannot be the same as another option's dotted name.
+    TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDottedName) {
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1");
+        ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical2", "var2", moe::Int, "Var2",
+                                                 "dotted.canonical1"), ::mongo::DBException);
+    }
+
+    // Deprecated dotted name cannot be the same as another option's deprecated dotted name.
+    TEST(YAMLConfigFile, DeprecatedDottedNameSameAsOtherOptionsDeprecatedDottedName) {
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("dotted.canonical1", "var1", moe::Int, "Var1",
+                                   "dotted.deprecated1");
+        ASSERT_THROWS(testOpts.addOptionChaining("dotted.canonical2", "var2", moe::Int, "Var2",
+                                                 "dotted.deprecated1"), ::mongo::DBException);
+    }
+
+    // It is an error to have both canonical and deprecated dotted names in the same
+    // configuration file.
+    TEST(YAMLConfigFile, DeprecatedDottedNameCanonicalAndDeprecated) {
+        OptionsParserTester parser;
+        moe::Environment environment;
+
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+        testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1",
+                                   "dotted.deprecated");
+
+        std::vector<std::string> argv;
+        argv.push_back("binaryname");
+        argv.push_back("--config");
+        argv.push_back("config.yaml");
+        std::map<std::string, std::string> env_map;
+
+        parser.setConfig("config.yaml",
+                         "dotted.canonical: 5\n"
+                         "dotted.deprecated: 6");
+
+        ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+    }
+
+    // An option can have multiple deprecated dotted names.
+    TEST(YAMLConfigFile, DeprecatedDottedNameMultipleDeprecated) {
+        std::vector<std::string> deprecatedDottedNames;
+        deprecatedDottedNames.push_back("dotted.deprecated1");
+        deprecatedDottedNames.push_back("dotted.deprecated2");
+
+        moe::OptionSection testOpts;
+        testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+        testOpts.addOptionChaining("dotted.canonical", "var1", moe::Int, "Var1",
+            deprecatedDottedNames);
+
+        std::vector<std::string> argv;
+        argv.push_back("binaryname");
+        argv.push_back("--config");
+        argv.push_back("config.yaml");
+
+        // Parse 2 files - each containing a different deprecated dotted name.
+        for (std::vector<std::string>::const_iterator i = deprecatedDottedNames.begin();
+             i != deprecatedDottedNames.end(); ++i) {
+            OptionsParserTester parser;
+            moe::Environment environment;
+            std::map<std::string, std::string> env_map;
+
+            ::mongo::StringBuilder sb;
+            sb << *i << ": 6";
+            parser.setConfig("config.yaml", sb.str());
+
+            ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
+            moe::Value value;
+            ASSERT_OK(environment.get(moe::Key("dotted.canonical"), &value));
+            int var1;
+            ASSERT_OK(value.get(&var1));
+            ASSERT_EQUALS(var1, 6);
+            ASSERT_FALSE(environment.count(moe::Key(deprecatedDottedNames[0])));
+            ASSERT_FALSE(environment.count(moe::Key(deprecatedDottedNames[1])));
+        }
+
+        // It is an error to have multiple deprecated dotted names mapping to the same option
+        // in the same file.
+        {
+            OptionsParserTester parser;
+            moe::Environment environment;
+            std::map<std::string, std::string> env_map;
+
+            std::stringstream ss;
+            ss << deprecatedDottedNames[0] << ": 6" << std::endl
+               << deprecatedDottedNames[1] << ": 7";
+            parser.setConfig("config.yaml", ss.str());
+
+            ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+        }
+    }
+
     TEST(YAMLConfigFile, ListBrackets) {
         OptionsParserTester parser;
         moe::Environment environment;
@@ -4027,7 +4166,7 @@ namespace {
         // Hex values
         argv = std::vector<std::string>();
         argv.push_back("binaryname");
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // Hex doubles are not parseable by the Windows SDK libc or the Solaris libc in the mode we
         // build, so we cannot read hex doubles from the command line on those platforms.
         // See SERVER-14131.
@@ -4046,7 +4185,7 @@ namespace {
         environment = moe::Environment();
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
 
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // See SERVER-14131.
         ASSERT_OK(environment.get(moe::Key("doubleVal"), &value));
         ASSERT_OK(value.get(&doubleVal));
@@ -4178,7 +4317,7 @@ namespace {
         argv.push_back("binaryname");
         argv.push_back("--config");
         argv.push_back("config.ini");
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // Hex doubles are not parseable by the Windows SDK libc or the Solaris libc in the mode we
         // build, so we cannot read hex doubles from a config file on those platforms.
         // See SERVER-14131.
@@ -4192,7 +4331,7 @@ namespace {
         environment = moe::Environment();
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
 
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // See SERVER-14131.
         ASSERT_OK(environment.get(moe::Key("doubleVal"), &value));
         ASSERT_OK(value.get(&doubleVal));
@@ -4324,7 +4463,7 @@ namespace {
         argv.push_back("binaryname");
         argv.push_back("--config");
         argv.push_back("config.yaml");
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // Hex doubles are not parseable by the Windows SDK libc or the Solaris libc in the mode we
         // build, so we cannot read hex doubles from a config file on those platforms.
         // See SERVER-14131.
@@ -4338,7 +4477,7 @@ namespace {
         environment = moe::Environment();
         ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
 
-#if !(defined(_WIN32) || defined(__sunos__))
+#if !(defined(_WIN32) || defined(__sun))
         // See SERVER-14131.
         ASSERT_OK(environment.get(moe::Key("doubleVal"), &value));
         ASSERT_OK(value.get(&doubleVal));

@@ -13,6 +13,7 @@ env.Library(
         '$BUILD_DIR/mongo/bson',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/foundation',
+        '$BUILD_DIR/mongo/expressions',
     ],
 )
 
@@ -68,7 +69,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/expressions',
-        '$BUILD_DIR/mongo/global_optime',
+        '$BUILD_DIR/mongo/global_timestamp',
         'update_common',
     ],
 )

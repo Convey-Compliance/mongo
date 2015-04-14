@@ -26,14 +26,16 @@
 *    then also delete it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #ifdef _WIN32
 
-#include <ostream>
-
 #include "mongo/platform/basic.h"
+
+#include <ostream>
 #include <DbgHelp.h>
+
+#include "mongo/config.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/log.h"
@@ -97,7 +99,7 @@ namespace mongo {
             aMiniDumpInfo.ClientPointers = FALSE;
 
             MINIDUMP_TYPE miniDumpType =
-    #ifdef _DEBUG
+    #ifdef MONGO_CONFIG_DEBUG_BUILD
                 MiniDumpWithFullMemory;
     #else
                 static_cast<MINIDUMP_TYPE>(

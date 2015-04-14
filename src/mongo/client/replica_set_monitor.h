@@ -47,7 +47,7 @@ namespace mongo {
      * Holds state about a replica set and provides a means to refresh the local view.
      * All methods perform the required synchronization to allow callers from multiple threads.
      */
-    class MONGO_CLIENT_API ReplicaSetMonitor {
+    class ReplicaSetMonitor {
         MONGO_DISALLOW_COPYING(ReplicaSetMonitor);
     public:
         class Refresher;
@@ -227,7 +227,7 @@ namespace mongo {
      * All logic related to choosing the hosts to contact and updating the SetState based on replies
      * lives in this class.
      */
-    class MONGO_CLIENT_API ReplicaSetMonitor::Refresher {
+    class ReplicaSetMonitor::Refresher {
     public:
         /**
          * Contact hosts in the set to refresh our view, but stop once a host matches criteria.

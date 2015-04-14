@@ -62,7 +62,7 @@ namespace mongo {
         /** Evaluates the validity of applying $currentDate.
          */
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
         /** Updates the node passed in prepare with the results from prepare */
@@ -84,7 +84,7 @@ namespace mongo {
 
         // State which changes with each call of the mod.
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
     };
 
 } // namespace mongo

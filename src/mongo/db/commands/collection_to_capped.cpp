@@ -30,100 +30,27 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/background.h"
+#include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/index_builder.h"
-#include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/new_find.h"
-#include "mongo/db/repl/oplog.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/query/find.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 
 namespace mongo {
 
-    Status cloneCollectionAsCapped( OperationContext* txn,
-                                    Database* db,
-                                    const string& shortFrom,
-                                    const string& shortTo,
-                                    double size,
-                                    bool temp,
-                                    bool logForReplication ) {
+    using boost::scoped_ptr;
+    using std::string;
+    using std::stringstream;
 
-        string fromNs = db->name() + "." + shortFrom;
-        string toNs = db->name() + "." + shortTo;
-
-        Collection* fromCollection = db->getCollection( txn, fromNs );
-        if ( !fromCollection )
-            return Status( ErrorCodes::NamespaceNotFound,
-                           str::stream() << "source collection " << fromNs <<  " does not exist" );
-
-        if ( db->getCollection( txn, toNs ) )
-            return Status( ErrorCodes::NamespaceExists, "to collection already exists" );
-
-        // create new collection
-        {
-            Client::Context ctx(txn,  toNs );
-            BSONObjBuilder spec;
-            spec.appendBool( "capped", true );
-            spec.append( "size", size );
-            if ( temp )
-                spec.appendBool( "temp", true );
-
-            WriteUnitOfWork wunit(txn);
-            Status status = userCreateNS( txn, ctx.db(), toNs, spec.done(), logForReplication );
-            if ( !status.isOK() )
-                return status;
-            wunit.commit();
-        }
-
-        Collection* toCollection = db->getCollection( txn, toNs );
-        invariant( toCollection ); // we created above
-
-        // how much data to ignore because it won't fit anyway
-        // datasize and extentSize can't be compared exactly, so add some padding to 'size'
-
-        long long allocatedSpaceGuess =
-            std::max( static_cast<long long>(size * 2),
-                      static_cast<long long>(toCollection->getRecordStore()->storageSize(txn) * 2));
-
-        long long excessSize = fromCollection->dataSize(txn) - allocatedSpaceGuess;
-
-        scoped_ptr<PlanExecutor> exec( InternalPlanner::collectionScan(txn,
-                                                                       fromNs,
-                                                                       fromCollection,
-                                                                       InternalPlanner::FORWARD ) );
-
-
-        while ( true ) {
-            BSONObj obj;
-            PlanExecutor::ExecState state = exec->getNext(&obj, NULL);
-
-            switch( state ) {
-            case PlanExecutor::IS_EOF:
-                return Status::OK();
-            case PlanExecutor::DEAD:
-                db->dropCollection( txn, toNs );
-                return Status( ErrorCodes::InternalError, "executor turned dead while iterating" );
-            case PlanExecutor::EXEC_ERROR:
-                return Status( ErrorCodes::InternalError, "executor error while iterating" );
-            case PlanExecutor::ADVANCED:
-                if ( excessSize > 0 ) {
-                    excessSize -= ( 4 * obj.objsize() ); // 4x is for padding, power of 2, etc...
-                    continue;
-                }
-
-                WriteUnitOfWork wunit(txn);
-                toCollection->insertDocument( txn, obj, true );
-                if ( logForReplication )
-                    repl::logOp(txn, "i", toNs.c_str(), obj);
-                wunit.commit();
-            }
-        }
-
-        invariant( false ); // unreachable
-    }
-
-    /* convertToCapped seems to use this */
     class CmdCloneCollectionAsCapped : public Command {
     public:
         CmdCloneCollectionAsCapped() : Command( "cloneCollectionAsCapped" ) {}
@@ -150,7 +77,14 @@ namespace mongo {
                                              NamespaceString(dbname, collection)),
                                      targetActions));
         }
-        bool run(OperationContext* txn, const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
+        bool run(OperationContext* txn,
+                 const string& dbname,
+                 BSONObj& jsobj,
+                 int,
+                 string& errmsg,
+                 BSONObjBuilder& result,
+                 bool fromRepl) {
+            invariant(!fromRepl == txn->writesAreReplicated());
             string from = jsobj.getStringField( "cloneCollectionAsCapped" );
             string to = jsobj.getStringField( "toCollection" );
             double size = jsobj.getField( "size" ).number();
@@ -161,10 +95,25 @@ namespace mongo {
                 return false;
             }
 
-            Lock::DBLock dbXLock(txn->lockState(), dbname, MODE_X);
-            Client::Context ctx(txn, dbname);
+            ScopedTransaction transaction(txn, MODE_IX);
+            AutoGetDb autoDb(txn, dbname, MODE_X);
 
-            Status status = cloneCollectionAsCapped( txn, ctx.db(), from, to, size, temp, true );
+            if (!fromRepl &&
+                !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(dbname)) {
+                return appendCommandStatus(result, Status(ErrorCodes::NotMaster, str::stream()
+                    << "Not primary while cloning collection " << from << " to " << to
+                    << " (as capped)"));
+            }
+
+            Database* const db = autoDb.getDb();
+            if (!db) {
+                return appendCommandStatus(result,
+                                           Status(ErrorCodes::DatabaseNotFound,
+                                                  str::stream() << "database " << dbname
+                                                                << " not found"));
+            }
+
+            Status status = cloneCollectionAsCapped(txn, db, from, to, size, temp);
             return appendCommandStatus( result, status );
         }
     } cmdCloneCollectionAsCapped;
@@ -190,15 +139,12 @@ namespace mongo {
             out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
-        virtual std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
-                                                     Database* db,
-                                                     const BSONObj& cmdObj) {
-            std::string collName = cmdObj.firstElement().valuestr();
-            std::string ns = db->name() + "." + collName;
-
+        std::vector<BSONObj> stopIndexBuilds(OperationContext* opCtx,
+                                             Database* db,
+                                             const NamespaceString& ns) {
             IndexCatalog::IndexKillCriteria criteria;
             criteria.ns = ns;
-            Collection* coll = db->getCollection(opCtx, ns);
+            Collection* coll = db->getCollection(ns);
             if (coll) {
                 return IndexBuilder::killMatchingIndexBuilds(coll, criteria);
             }
@@ -212,56 +158,21 @@ namespace mongo {
                  string& errmsg,
                  BSONObjBuilder& result,
                  bool fromRepl ) {
-            // calls renamecollection which does a global lock, so we must too:
-            //
-            Lock::GlobalWrite globalWriteLock(txn->lockState());
-            Client::Context ctx(txn, dbname);
-
-            Database* db = ctx.db();
-
-            stopIndexBuilds(txn, db, jsobj);
-            BackgroundOperation::assertNoBgOpInProgForDb(dbname.c_str());
 
             string shortSource = jsobj.getStringField( "convertToCapped" );
-            string longSource = dbname + "." + shortSource;
             double size = jsobj.getField( "size" ).number();
 
-            if ( shortSource.empty() || size == 0 ) {
+            if (shortSource.empty() || size == 0) {
                 errmsg = "invalid command spec";
                 return false;
             }
 
-            string shortTmpName = str::stream() << "tmp.convertToCapped." << shortSource;
-            string longTmpName = str::stream() << dbname << "." << shortTmpName;
-
-            if ( db->getCollection( txn, longTmpName ) ) {
-                Status status = db->dropCollection( txn, longTmpName );
-                if ( !status.isOK() )
-                    return appendCommandStatus( result, status );
-            }
-
-            Status status = cloneCollectionAsCapped( txn, db, shortSource, shortTmpName, size, true, false );
-
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            verify( db->getCollection( txn, longTmpName ) );
-
-            WriteUnitOfWork wunit(txn);
-            status = db->dropCollection( txn, longSource );
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            status = db->renameCollection( txn, longTmpName, longSource, false );
-            if ( !status.isOK() )
-                return appendCommandStatus( result, status );
-
-            if (!fromRepl)
-                repl::logOp(txn, "c",(dbname + ".$cmd").c_str(), jsobj);
-
-            wunit.commit();
-            return true;
+            return appendCommandStatus(result,
+                                       convertToCapped(txn,
+                                                       NamespaceString(dbname, shortSource),
+                                                       size));
         }
+
     } cmdConvertToCapped;
 
 }

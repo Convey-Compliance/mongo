@@ -26,6 +26,8 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/base/init.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_type.h"
@@ -34,11 +36,16 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/config.h" // For config server and DBConfig and version refresh
+#include "mongo/s/chunk_manager.h"
+#include "mongo/s/config.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard.h"
 
 namespace mongo {
+
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     /**
      * Mongos-side command for merging chunks, passes command to appropriate shard.

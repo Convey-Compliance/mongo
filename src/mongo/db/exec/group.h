@@ -28,7 +28,10 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
 
@@ -70,9 +73,9 @@ namespace mongo {
     };
 
     /**
-     * Stage used by the group command.  Consumes input documents from its child stage, returns
-     * ADVANCED exactly once with the entire group result, then returns EOF.  Does not return
-     * NEED_TIME.
+     * Stage used by the group command.  Consumes input documents from its child stage (returning
+     * NEED_TIME once for each document produced by the child), returns ADVANCED exactly once with
+     * the entire group result, then returns EOF.
      *
      * Only created through the getExecutorGroup path.
      */
@@ -89,7 +92,7 @@ namespace mongo {
         virtual bool isEOF();
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -104,6 +107,32 @@ namespace mongo {
         static const char* kStageType;
 
     private:
+        /**
+         * Keeps track of what this group is currently doing so that it can do the right thing on
+         * the next call to work().
+         */
+        enum GroupState {
+            // Need to initialize the underlying Javascript machinery.
+            GroupState_Initializing,
+
+            // Retrieving the next document from the child stage and processing it.
+            GroupState_ReadingFromChild,
+
+            // Results have been returned.
+            GroupState_Done
+        };
+
+        // Initializes _scope, _reduceFunction and _keyFunction using the global scripting engine.
+        void initGroupScripting();
+
+        // Updates _groupMap and _scope to account for the group key associated with this object.
+        // Returns an error status if an error occurred, else Status::OK().
+        Status processObject(const BSONObj& obj);
+
+        // Finalize the results for this group operation.  Returns an owned BSONObj with the results
+        // array.
+        BSONObj finalizeResults();
+
         // Transactional context for read locks.  Not owned by us.
         OperationContext* _txn;
 
@@ -115,10 +144,26 @@ namespace mongo {
         CommonStats _commonStats;
         GroupStats _specificStats;
 
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
-        // Flag indicating whether results have been returned yet.
-        bool _groupCompleted;
+        // Current state for this stage.
+        GroupState _groupState;
+
+        // The Scope object that all script operations for this group stage will use.  Initialized
+        // by initGroupScripting().  Owned here.
+        std::auto_ptr<Scope> _scope;
+
+        // The reduce function for the group operation.  Initialized by initGroupScripting().  Owned
+        // by _scope.
+        ScriptingFunction _reduceFunction;
+
+        // The key function for the group operation if one was provided by the user, else 0.
+        // Initialized by initGroupScripting().  Owned by _scope.
+        ScriptingFunction _keyFunction;
+
+        // Map from group key => group index.  The group index is used to index into "$arr", a
+        // variable owned by _scope which contains the group data for this key.
+        std::map<BSONObj, int, BSONObjCmp> _groupMap;
     };
 
 }  // namespace mongo

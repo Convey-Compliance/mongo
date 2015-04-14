@@ -153,6 +153,11 @@ namespace repl {
         ~ReplicationExecutor();
 
         /**
+         * Returns diagnostic information.
+         */
+        std::string getDiagnosticString();
+
+        /**
          * Gets the current time as reported by the network interface.
          */
         Date_t now();
@@ -270,7 +275,7 @@ namespace repl {
         /**
          * Blocks until the executor finishes running the callback referenced by "cbHandle".
          *
-         * Becaue callbacks all run during shutdown if they weren't run beforehand, there is no need
+         * Because callbacks all run during shutdown if they weren't run beforehand, there is no need
          * to indicate the reason for returning from wait(CallbackHandle).  It is always that the
          * callback ran.
          *
@@ -300,6 +305,10 @@ namespace repl {
          */
         typedef stdx::list<Event> EventList;
 
+        /**
+         * Returns diagnostic info
+         */
+        std::string _getDiagnosticString_inlock() const;
         /**
          * Implementation of makeEvent() for use when _mutex is already held.
          */
@@ -459,7 +468,8 @@ namespace repl {
                              const BSONObj& theCmdObj,
                              const Milliseconds timeoutMillis = kNoTimeout);
 
-        std::string toString() const;
+        // Returns diagnostic info.
+        std::string getDiagnosticString();
 
         HostAndPort target;
         std::string dbname;
@@ -484,10 +494,19 @@ namespace repl {
     class ReplicationExecutor::NetworkInterface {
         MONGO_DISALLOW_COPYING(NetworkInterface);
     public:
+
+        // A flag to keep replication MessagingPorts open when all other sockets are disconnected.
+        static const unsigned int kMessagingPortKeepOpen = 1;
+
         typedef RemoteCommandResponse Response;
         typedef stdx::function<void (const ResponseStatus&)> RemoteCommandCompletionFn;
 
         virtual ~NetworkInterface();
+
+        /**
+         * Returns diagnostic info.
+         */
+        virtual std::string getDiagnosticString() = 0;
 
         /**
          * Starts up the network interface.

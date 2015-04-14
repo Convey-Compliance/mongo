@@ -30,7 +30,10 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
@@ -39,8 +42,11 @@
 #include "mongo/db/storage_options.h"
 #include "mongo/s/d_state.h"
 
-
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using boost::shared_ptr;
+    using std::string;
 
     DocumentSourceCursor::~DocumentSourceCursor() {
         dispose();
@@ -120,7 +126,7 @@ namespace mongo {
                 state != PlanExecutor::DEAD);
 
         uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
-                state != PlanExecutor::EXEC_ERROR);
+                state != PlanExecutor::FAILURE);
 
         massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
                 state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
@@ -158,7 +164,6 @@ namespace mongo {
 
         // Get planner-level explain info from the underlying PlanExecutor.
         BSONObjBuilder explainBuilder;
-        Status explainStatus(ErrorCodes::InternalError, "");
         {
             const NamespaceString nss(_ns);
             AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
@@ -166,9 +171,7 @@ namespace mongo {
             massert(17392, "No _exec. Were we disposed before explained?", _exec);
 
             _exec->restoreState(pExpCtx->opCtx);
-            explainStatus = Explain::explainStages(_exec.get(),
-                                                   ExplainCommon::QUERY_PLANNER,
-                                                   &explainBuilder);
+            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
             _exec->saveState();
         }
 
@@ -185,14 +188,9 @@ namespace mongo {
             out["fields"] = Value(_projection);
 
         // Add explain results from the query system into the agg explain output.
-        if (explainStatus.isOK()) {
-            BSONObj explainObj = explainBuilder.obj();
-            invariant(explainObj.hasField("queryPlanner"));
-            out["queryPlanner"] = Value(explainObj["queryPlanner"]);
-        }
-        else {
-            out["planError"] = Value(explainStatus.toString());
-        }
+        BSONObj explainObj = explainBuilder.obj();
+        invariant(explainObj.hasField("queryPlanner"));
+        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
 
         return Value(DOC(getSourceName() << out.freezeToValue()));
     }

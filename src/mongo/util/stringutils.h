@@ -36,6 +36,8 @@
 
 #include <boost/scoped_array.hpp>
 
+#include "mongo/base/string_data.h"
+
 namespace mongo {
 
     // see also mongoutils/str.h - perhaps move these there?
@@ -70,9 +72,9 @@ namespace mongo {
          * For convenience, character 255 is greater than anything else.
          * @param lexOnly - compare all characters lexically, including digits.
          */
-        static int cmp( const StringData& s1, const StringData& s2, bool lexOnly );
-        int cmp( const StringData& s1, const StringData& s2 ) const;
-        bool operator()( const StringData& s1, const StringData& s2 ) const;
+        static int cmp( StringData s1, StringData s2, bool lexOnly );
+        int cmp( StringData s1, StringData s2 ) const;
+        bool operator()( StringData s1, StringData s2 ) const;
     private:
         bool _lexOnly;
     };

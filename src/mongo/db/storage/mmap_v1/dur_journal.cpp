@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournaling
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournal
 
 #include "mongo/platform/basic.h"
 
@@ -39,16 +39,18 @@
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/base/init.h"
+#include "mongo/config.h"
 #include "mongo/db/client.h"
+#include "mongo/db/storage/mmap_v1/aligned_builder.h"
 #include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/db/storage/mmap_v1/dur_journalimpl.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/platform/random.h"
-#include "mongo/server.h"
-#include "mongo/util/alignedbuilder.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/file.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
@@ -56,6 +58,7 @@
 #include "mongo/util/mmap.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/listen.h" // getelapsedtimemillis
+#include "mongo/util/paths.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/timer.h"
 
@@ -63,8 +66,11 @@ using namespace mongoutils;
 
 namespace mongo {
 
-    class AlignedBuilder;
+    using std::endl;
+    using std::hex;
+    using std::string;
 
+    class AlignedBuilder;
 
     namespace dur {
         // Rotate after reaching this data size in a journal (j._<n>) file
@@ -73,7 +79,7 @@ namespace mongo {
         // work.  (and should as-is)
         // --smallfiles makes the limit small.
 
-#if defined(_DEBUG)
+#if defined(MONGO_CONFIG_DEBUG_BUILD)
         unsigned long long DataLimitPerJournalFile = 128 * 1024 * 1024;
 #elif defined(__APPLE__)
         // assuming a developer box if OS X
@@ -83,7 +89,7 @@ namespace mongo {
 #endif
 
         MONGO_INITIALIZER(InitializeJournalingParams)(InitializerContext* context) {
-            if (storageGlobalParams.smallfiles == true) {
+            if (mmapv1GlobalOptions.smallfiles == true) {
                 verify(dur::DataLimitPerJournalFile >= 128 * 1024 * 1024);
                 dur::DataLimitPerJournalFile = 128 * 1024 * 1024;
             }
@@ -154,9 +160,9 @@ namespace mongo {
 
         namespace {
             SecureRandom* mySecureRandom = NULL;
-            mongo::mutex mySecureRandomMutex( "JHeader-SecureRandom" );
+            mongo::mutex mySecureRandomMutex;
             int64_t getMySecureRandomNumber() {
-                scoped_lock lk( mySecureRandomMutex );
+                boost::lock_guard<boost::mutex> lk( mySecureRandomMutex );
                 if ( ! mySecureRandom )
                     mySecureRandom = SecureRandom::create();
                 return mySecureRandom->nextInt64();
@@ -387,11 +393,12 @@ namespace mongo {
                 boost::filesystem::path filepath = preallocPath(i);
 
                 unsigned long long limit = DataLimitPerJournalFile;
-                if( debug && i == 1 ) { 
-                    // moving 32->64, the prealloc files would be short.  that is "ok", but we want to exercise that 
-                    // case, so we force exercising here when _DEBUG is set by arbitrarily stopping prealloc at a low 
-                    // limit for a file.  also we want to be able to change in the future the constant without a lot of
-                    // work anyway.
+                if( kDebugBuild && i == 1 ) { 
+                    // moving 32->64, the prealloc files would be short.  that is "ok", but we
+                    // want to exercise that case, so we force exercising here when
+                    // MONGO_CONFIG_DEBUG_BUILD is set by arbitrarily stopping prealloc at a
+                    // low limit for a file.  also we want to be able to change in the future
+                    // the constant without a lot of work anyway.
                     limit = 16 * 1024 * 1024;
                 }
                 preallocateFile(filepath, limit);
@@ -418,12 +425,12 @@ namespace mongo {
         }
 
         void preallocateFiles() {
-            if (!(storageGlobalParams.durOptions & StorageGlobalParams::DurNoCheckSpace))
+            if (!(mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalNoCheckSpace))
                 checkFreeSpace();
 
             if( exists(preallocPath(0)) || // if enabled previously, keep using
                 exists(preallocPath(1)) ||
-                (storageGlobalParams.preallocj && preallocateIsFaster()) ) {
+                (mmapv1GlobalOptions.preallocj && preallocateIsFaster()) ) {
                     usingPreallocate = true;
                     try {
                         _preallocateFiles();
@@ -722,11 +729,12 @@ namespace mongo {
             @param uncompressed - a buffer that will be written to the journal after compression
             will not return until on disk
         */
-        void WRITETOJOURNAL(JSectHeader h, AlignedBuilder& uncompressed) {
+        void WRITETOJOURNAL(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             Timer t;
             j.journal(h, uncompressed);
-            stats.curr->_writeToJournalMicros += t.micros();
+            stats.curr()->_writeToJournalMicros += t.micros();
         }
+
         void Journal::journal(const JSectHeader& h, const AlignedBuilder& uncompressed) {
             static AlignedBuilder b(32*1024*1024);
             /* buffer to journal will be
@@ -774,11 +782,11 @@ namespace mongo {
                 // must already be open -- so that _curFileId is correct for previous buffer building
                 verify( _curLogFile );
 
-                stats.curr->_uncompressedBytes += uncompressed.len();
+                stats.curr()->_uncompressedBytes += uncompressed.len();
                 unsigned w = b.len();
                 _written += w;
                 verify( w <= L );
-                stats.curr->_journaledBytes += L;
+                stats.curr()->_journaledBytes += L;
                 _curLogFile->synchronousAppend((const void *) b.buf(), L);
                 _rotate();
             }

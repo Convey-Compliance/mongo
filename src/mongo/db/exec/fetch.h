@@ -28,20 +28,22 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/record_id.h"
 
 namespace mongo {
 
     /**
-     * This stage turns a DiskLoc into a BSONObj.
+     * This stage turns a RecordId into a BSONObj.
      *
      * In WorkingSetMember terms, it transitions from LOC_AND_IDX to LOC_AND_UNOWNED_OBJ by reading
      * the record at the provided loc.  Returns verbatim any data that already has an object.
      *
-     * Preconditions: Valid DiskLoc.
+     * Preconditions: Valid RecordId.
      */
     class FetchStage : public PlanStage {
     public:
@@ -58,7 +60,7 @@ namespace mongo {
 
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -89,10 +91,13 @@ namespace mongo {
 
         // _ws is not owned by us.
         WorkingSet* _ws;
-        scoped_ptr<PlanStage> _child;
+        boost::scoped_ptr<PlanStage> _child;
 
         // The filter is not owned by us.
         const MatchExpression* _filter;
+
+        // If not Null, we use this rather than asking our child what to do next.
+        WorkingSetID _idRetrying;
 
         // Stats
         CommonStats _commonStats;

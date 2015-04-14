@@ -26,12 +26,19 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::min;
+
     char DocumentSourceGeoNear::geoNearName[] = "$geoNear";
     const char *DocumentSourceGeoNear::getSourceName() const { return geoNearName; }
 
@@ -104,8 +111,6 @@ namespace mongo {
         if (includeLocs)
             result.setField("includeLocs", Value(includeLocs->getPath(false)));
 
-        result.setField("uniqueDocs", Value(uniqueDocs));
-
         return Value(DOC(getSourceName() << result.freeze()));
     }
 
@@ -135,8 +140,6 @@ namespace mongo {
 
         if (includeLocs)
             geoNear.append("includeLocs", true); // String in toBson
-
-        geoNear.append("uniqueDocs", uniqueDocs);
 
         return geoNear.obj();
     }
@@ -204,7 +207,8 @@ namespace mongo {
             includeLocs.reset(new FieldPath(options["includeLocs"].str()));
         }
 
-        uniqueDocs = options["uniqueDocs"].trueValue();
+        if (options.hasField("uniqueDocs"))
+            warning() << "ignoring deprecated uniqueDocs option in $geoNear aggregation stage";
     }
 
     DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext> &pExpCtx)
@@ -214,6 +218,5 @@ namespace mongo {
         , maxDistance(-1.0)
         , spherical(false)
         , distanceMultiplier(1.0)
-        , uniqueDocs(true)
     {}
 }

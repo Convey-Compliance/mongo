@@ -54,6 +54,8 @@ namespace mongo {
         virtual ~AuthzManagerExternalStateMongos();
 
         virtual Status initialize(OperationContext* txn);
+        std::unique_ptr<AuthzSessionExternalState> makeAuthzSessionExternalState(
+                AuthorizationManager* authzManager) override;
         virtual Status getStoredAuthorizationVersion(OperationContext* txn, int* outVersion);
         virtual Status getUserDescription(
                             OperationContext* txn, const UserName& userName, BSONObj* result);
@@ -105,20 +107,12 @@ namespace mongo {
                               const BSONObj& query,
                               const BSONObj& writeConcern,
                               int* numRemoved);
-        virtual Status createIndex(OperationContext* txn,
-                                   const NamespaceString& collectionName,
-                                   const BSONObj& pattern,
-                                   bool unique,
-                                   const BSONObj& writeConcern);
-        virtual Status dropIndexes(OperationContext* txn,
-                                   const NamespaceString& collectionName,
-                                   const BSONObj& writeConcern);
-        virtual bool tryAcquireAuthzUpdateLock(const StringData& why);
+        virtual bool tryAcquireAuthzUpdateLock(StringData why);
         virtual void releaseAuthzUpdateLock();
 
     private:
         boost::mutex _distLockGuard; // Guards access to _authzDataUpdateLock
-        scoped_ptr<ScopedDistributedLock> _authzDataUpdateLock;
+        boost::scoped_ptr<ScopedDistributedLock> _authzDataUpdateLock;
     };
 
 } // namespace mongo

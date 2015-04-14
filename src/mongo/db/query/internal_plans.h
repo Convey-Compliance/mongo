@@ -53,10 +53,10 @@ namespace mongo {
 
         enum IndexScanOptions {
             // The client is interested in the default outputs of an index scan: BSONObj of the key,
-            // DiskLoc of the record that's indexed.  The client does its own fetching if required.
+            // RecordId of the record that's indexed.  The client does its own fetching if required.
             IXSCAN_DEFAULT = 0,
 
-            // The client wants the fetched object and the DiskLoc that refers to it.  Delegating
+            // The client wants the fetched object and the RecordId that refers to it.  Delegating
             // the fetch to the runner allows fetching outside of a lock.
             IXSCAN_FETCH = 1,
         };
@@ -65,16 +65,16 @@ namespace mongo {
          * Return a collection scan.  Caller owns pointer.
          */
         static PlanExecutor* collectionScan(OperationContext* txn,
-                                            const StringData& ns,
+                                            StringData ns,
                                             Collection* collection,
                                             const Direction direction = FORWARD,
-                                            const DiskLoc startLoc = DiskLoc()) {
+                                            const RecordId startLoc = RecordId()) {
             WorkingSet* ws = new WorkingSet();
 
             if (NULL == collection) {
                 EOFStage* eof = new EOFStage();
                 PlanExecutor* exec;
-                // Takes ownership if 'ws' and 'eof'.
+                // Takes ownership of 'ws' and 'eof'.
                 Status execStatus =  PlanExecutor::make(txn,
                                                         ws,
                                                         eof,
@@ -85,7 +85,7 @@ namespace mongo {
                 return exec;
             }
 
-            dassert( ns == collection->ns().ns() );
+            invariant( ns == collection->ns().ns() );
 
             CollectionScanParams params;
             params.collection = collection;

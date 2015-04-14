@@ -29,9 +29,11 @@
 */
 
 #pragma once
-#include "mongo/pch.h"
+
+#include "mongo/base/status_with.h"
 #include "mongo/db/jsobj.h"
-#include "top.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/platform/basic.h"
 #include "mongo/util/background.h"
 
 /**
@@ -49,8 +51,6 @@ namespace mongo {
         void takeSnapshot();
 
         unsigned long long _created;
-        Top::CollectionData _globalUsage;
-        unsigned long long _totalWriteLockedTime; // micros of total time locked
         Top::UsageMap _usage;
 
         friend class SnapshotThread;
@@ -65,24 +65,10 @@ namespace mongo {
     public:
         SnapshotDelta( const SnapshotData& older , const SnapshotData& newer );
 
-        unsigned long long start() const {
-            return _older._created;
-        }
-
         unsigned long long elapsed() const {
             return _elapsed;
         }
 
-        unsigned long long timeInWriteLock() const {
-            return _newer._totalWriteLockedTime - _older._totalWriteLockedTime;
-        }
-        double percentWriteLocked() const {
-            double e = (double) elapsed();
-            double w = (double) timeInWriteLock();
-            return w/e;
-        }
-
-        Top::CollectionData globalUsageDiff();
         Top::UsageMap collectionUsageDiff();
 
     private:
@@ -92,23 +78,27 @@ namespace mongo {
         unsigned long long _elapsed;
     };
 
+    struct SnapshotDiff {
+        Top::UsageMap usageDiff;
+        unsigned long long timeElapsed;
+
+        SnapshotDiff() = default;
+        SnapshotDiff(Top::UsageMap map, unsigned long long elapsed)
+            : usageDiff(std::move(map)), timeElapsed(elapsed) {}
+    };
+
     class Snapshots {
     public:
-        Snapshots(int n=100);
+        Snapshots();
 
         const SnapshotData* takeSnapshot();
 
-        int numDeltas() const { return _stored-1; }
+        StatusWith<SnapshotDiff> computeDelta();
 
-        const SnapshotData& getPrev( int numBack = 0 );
-        std::auto_ptr<SnapshotDelta> computeDelta( int numBack = 0 );
-
-
-        void outputLockInfoHTML( std::stringstream& ss );
     private:
         mongo::mutex _lock;
-        int _n;
-        boost::scoped_array<SnapshotData> _snapshots;
+        static const int kNumSnapshots = 2;
+        SnapshotData _snapshots[kNumSnapshots];
         int _loc;
         int _stored;
     };

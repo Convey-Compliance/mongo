@@ -28,18 +28,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/db/matcher/expression_parser.h"
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsonobjiterator.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 
@@ -65,6 +61,8 @@ namespace {
 } // namespace
 
 namespace mongo {
+
+    using std::string;
 
     StatusWithMatchExpression MatchExpressionParser::_parseComparison( const char* name,
                                                                        ComparisonMatchExpression* cmp,
@@ -725,17 +723,14 @@ namespace mongo {
             return StatusWithMatchExpression( ErrorCodes::BadValue, "$all needs an array" );
 
         BSONObj arr = e.Obj();
+        std::auto_ptr<AndMatchExpression> myAnd( new AndMatchExpression() );
+        BSONObjIterator i( arr );
+
         if ( arr.firstElement().type() == Object &&
              mongoutils::str::equals( "$elemMatch",
                                       arr.firstElement().Obj().firstElement().fieldName() ) ) {
             // $all : [ { $elemMatch : {} } ... ]
 
-            std::auto_ptr<AllElemMatchOp> temp( new AllElemMatchOp() );
-            Status s = temp->init( name );
-            if ( !s.isOK() )
-                return StatusWithMatchExpression( s );
-
-            BSONObjIterator i( arr );
             while ( i.more() ) {
                 BSONElement hopefullyElemMatchElement = i.next();
 
@@ -754,17 +749,15 @@ namespace mongo {
                 }
 
                 StatusWithMatchExpression inner =
-                    _parseElemMatch( "", hopefullyElemMatchObj.firstElement(), level );
+                    _parseElemMatch( name, hopefullyElemMatchObj.firstElement(), level );
                 if ( !inner.isOK() )
                     return inner;
-                temp->add( static_cast<ArrayMatchingMatchExpression*>( inner.getValue() ) );
+                myAnd->add( inner.getValue() );
             }
 
-            return StatusWithMatchExpression( temp.release() );
+            return StatusWithMatchExpression( myAnd.release() );
         }
 
-        std::auto_ptr<AndMatchExpression> myAnd( new AndMatchExpression() );
-        BSONObjIterator i( arr );
         while ( i.more() ) {
             BSONElement e = i.next();
 

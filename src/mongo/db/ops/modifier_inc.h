@@ -73,7 +73,7 @@ namespace mongo {
          *  effects, handling upcasting and overflow as necessary.
          */
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
         /** Updates the node passed in prepare with the results of the $inc */
@@ -95,7 +95,7 @@ namespace mongo {
         SafeNum _val;
 
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
     };
 
 } // namespace mongo

@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/noncopyable.hpp>
 #include <boost/thread/tss.hpp>
 #include <string>
 
@@ -42,6 +43,7 @@ namespace mongo {
     static const char kUpsertedFieldName[] = "upserted";
     static const char kGLEStatsFieldName[] = "$gleStats";
     static const char kGLEStatsLastOpTimeFieldName[] = "lastOpTime";
+    static const char kGLEStatsLastOpTimeTermFieldName[] = "lastOpTimeTerm";
     static const char kGLEStatsElectionIdFieldName[] = "electionId";
 
     struct LastError {

@@ -28,10 +28,12 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/ops/update_request.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
@@ -60,7 +62,6 @@ namespace mongo {
         class ExecInsertsState;
 
         WriteBatchExecutor( OperationContext* txn,
-                            const BSONObj& defaultWriteConcern,
                             OpCounters* opCounters,
                             LastError* le );
 
@@ -95,6 +96,7 @@ namespace mongo {
          * times.
          */
         void execInserts( const BatchedCommandRequest& request,
+                          const WriteConcernOptions& originalWC,
                           std::vector<WriteErrorDetail*>* errors );
 
         /**
@@ -141,9 +143,6 @@ namespace mongo {
 
         OperationContext* _txn;
 
-        // Default write concern, if one isn't provide in the batches.
-        const BSONObj _defaultWriteConcern;
-
         // OpCounters object to update - needed for stats reporting
         // Not owned here.
         OpCounters* _opCounters;
@@ -153,7 +152,7 @@ namespace mongo {
         LastError* _le;
 
         // Stats
-        scoped_ptr<WriteBatchStats> _stats;
+        boost::scoped_ptr<WriteBatchStats> _stats;
     };
 
     /**

@@ -28,12 +28,15 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/base/init.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
 
     /**
      * Bogus no-op $where match expression to parse $where in mongos,
@@ -46,7 +49,7 @@ namespace mongo {
         WhereNoOpMatchExpression() : MatchExpression( WHERE ){ }
         virtual ~WhereNoOpMatchExpression(){}
 
-        Status init( const StringData& theCode );
+        Status init( StringData theCode );
 
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
             return false;
@@ -77,7 +80,7 @@ namespace mongo {
         string _code;
     };
 
-    Status WhereNoOpMatchExpression::init(const StringData& theCode ) {
+    Status WhereNoOpMatchExpression::init(StringData theCode ) {
         if ( theCode.size() == 0 )
             return Status( ErrorCodes::BadValue, "code for $where cannot be empty" );
 
@@ -113,6 +116,7 @@ namespace mongo {
     }
 
     StatusWithMatchExpression WhereCallbackNoop::parseWhere(const BSONElement& where) const {
+
 
         auto_ptr<WhereNoOpMatchExpression> exp( new WhereNoOpMatchExpression() );
         if ( where.type() == String || where.type() == Code ) {

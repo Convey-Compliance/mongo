@@ -28,10 +28,10 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/mmap_v1/catalog/index_details.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace.h"
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 
 namespace mongo {
 
@@ -152,12 +152,12 @@ namespace mongo {
         }
         /* add extra space for indexes when more than 10 */
         Extra* allocExtra( OperationContext* txn,
-                           const StringData& ns,
+                           StringData ns,
                            NamespaceIndex& ni,
                            int nindexessofar );
 
         void copyingFrom( OperationContext* txn,
-                          const StringData& thisns,
+                          StringData thisns,
                           NamespaceIndex& ni,
                           NamespaceDetails *src); // must be called when renaming a NS to fix up extra
 
@@ -207,7 +207,7 @@ namespace mongo {
          */
         int _catalogFindIndexByName(OperationContext* txn,
                                     const Collection* coll,
-                                    const StringData& name, 
+                                    StringData name,
                                     bool includeBackgroundInProgress) const;
 
     private:

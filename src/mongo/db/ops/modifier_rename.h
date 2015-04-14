@@ -70,7 +70,7 @@ namespace mongo {
          *   -- Neither 'to' nor 'from' have an array ancestor
          */
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
         /**
@@ -93,7 +93,7 @@ namespace mongo {
 
         // The state carried over from prepare for apply/log
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
     };
 
 } // namespace mongo

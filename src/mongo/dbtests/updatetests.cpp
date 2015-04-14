@@ -29,7 +29,9 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <iostream>
 
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/client/dbclientcursor.h"
@@ -42,6 +44,12 @@
 #include "mongo/dbtests/dbtests.h"
 
 namespace UpdateTests {
+
+    using std::auto_ptr;
+    using std::numeric_limits;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class ClientBase {
     public:
@@ -1632,7 +1640,7 @@ namespace UpdateTests {
     class IndexParentOfMod : public SetBase {
     public:
         void run() {
-            _client.ensureIndex( ns(), BSON( "a" << 1 ) );
+            ASSERT_OK(dbtests::createIndex( &_txn, ns(), BSON( "a" << 1 ) ));
             _client.insert( ns(), fromjson( "{'_id':0}" ) );
             _client.update( ns(), Query(), fromjson( "{$set:{'a.b':4}}" ) );
             ASSERT_EQUALS( fromjson( "{'_id':0,a:{b:4}}" ) , _client.findOne( ns(), Query() ) );
@@ -2030,7 +2038,9 @@ namespace UpdateTests {
             add< basic::unset >();
             add< basic::setswitchint >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace UpdateTests
 

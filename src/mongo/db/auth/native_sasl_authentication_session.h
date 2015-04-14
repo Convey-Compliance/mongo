@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
 #include <string>
 
 #include "mongo/base/disallow_copying.h"
@@ -50,14 +51,14 @@ namespace mongo {
         explicit NativeSaslAuthenticationSession(AuthorizationSession* authSession);
         virtual ~NativeSaslAuthenticationSession();
 
-        virtual Status start(const StringData& authenticationDatabase,
-                             const StringData& mechanism,
-                             const StringData& serviceName,
-                             const StringData& serviceHostname,
+        virtual Status start(StringData authenticationDatabase,
+                             StringData mechanism,
+                             StringData serviceName,
+                             StringData serviceHostname,
                              int64_t conversationId,
                              bool autoAuthorize);
 
-        virtual Status step(const StringData& inputData, std::string* outputData);
+        virtual Status step(StringData inputData, std::string* outputData);
 
         virtual std::string getPrincipalId() const;
 

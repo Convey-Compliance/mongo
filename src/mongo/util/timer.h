@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/client/export_macros.h"
 
 namespace mongo {
 
@@ -44,7 +43,7 @@ namespace mongo {
      * 2.5 years will be supported.  Since a typical tick duration will be under 10 per nanosecond,
      * if not below 1 per nanosecond, this should not be an issue.
      */
-    class MONGO_CLIENT_API Timer /*copyable*/ {
+    class Timer /*copyable*/ {
     public:
         static const long long millisPerSecond = 1000;
         static const long long microsPerSecond = 1000 * millisPerSecond;
@@ -62,29 +61,39 @@ namespace mongo {
         inline int millisReset() {
             const long long nextNow = now();
             const long long deltaMicros =
-                ((nextNow - _old) * microsPerSecond) / _countsPerSecond;
+                    static_cast<long long>((nextNow - _old) * _microsPerCount);
 
             _old = nextNow;
             return static_cast<int>(deltaMicros / 1000);
         }
 
         inline long long micros() const {
-            return ((now() - _old) * microsPerSecond) / _countsPerSecond;
+            return static_cast<long long>((now() - _old) * _microsPerCount);
         }
 
         inline void reset() { _old = now(); }
 
+        inline static void setCountsPerSecond(long long countsPerSecond) {
+            _countsPerSecond = countsPerSecond;
+            _microsPerCount = static_cast<double>(microsPerSecond) / _countsPerSecond;
+        }
+
+        inline static long long getCountsPerSecond() {
+            return _countsPerSecond;
+        }
+
+    private:
         /**
          * Internally, the timer counts platform-dependent ticks of some sort, and
          * must then convert those ticks to microseconds and their ilk.  This field
          * stores the frequency of the platform-dependent counter.
-         *
-         * This value is initialized at program startup, and never changed after.
-         * It should be treated as private.
          */
         static long long _countsPerSecond;
 
-    private:
+        // Derived value from _countsPerSecond. This represents the conversion ratio
+        // from clock ticks to microseconds.
+        static double _microsPerCount;
+
         long long now() const;
 
         long long _old;

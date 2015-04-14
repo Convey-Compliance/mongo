@@ -35,15 +35,21 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientmockcursor.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/collection_metadata.h"
-#include "mongo/s/range_arithmetic.h"
-#include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::make_pair;
+    using std::map;
+    using std::pair;
+    using std::string;
 
     /**
      * This is an adapter so we can use config diffs - mongos and mongod do them slightly
@@ -223,7 +229,7 @@ namespace mongo {
             if ( oldMetadata->getCollVersion().hasEqualEpoch( epoch ) ) {
 
                 fullReload = false;
-                dassert( oldMetadata->isValid() );
+                invariant( oldMetadata->isValid() );
 
                 versionMap[shard] = oldMetadata->_shardVersion;
                 metadata->_collVersion = oldMetadata->_collVersion;
@@ -285,7 +291,7 @@ namespace mongo {
                 metadata->fillRanges();
                 conn.done();
 
-                dassert( metadata->isValid() );
+                invariant( metadata->isValid() );
                 return Status::OK();
             }
             else if ( diffsApplied == 0 ) {

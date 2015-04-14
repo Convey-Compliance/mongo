@@ -38,7 +38,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
-#if defined(__freebsd__)
+#if defined(__FreeBSD__)
 #   include <sys/param.h>
 #   include <sys/mount.h>
 #endif
@@ -71,6 +71,11 @@ using namespace mongoutils;
 
 namespace mongo {
 
+    using std::endl;
+    using std::list;
+    using std::string;
+    using std::stringstream;
+
     // unique number for temporary file names
     unsigned long long FileAllocator::_uniqueNumber = 0;
     static SimpleMutex _uniqueNumberMutex( "uniqueNumberMutex" );
@@ -84,6 +89,18 @@ namespace mongo {
     static inline long lseek(int fd, long offset, int origin) { return _lseek(fd, offset, origin); }
     static inline int write(int fd, const void *data, int count) { return _write(fd, data, count); }
     static inline int close(int fd) { return _close(fd); }
+
+    typedef BOOL (CALLBACK *GetVolumeInformationByHandleWPtr)(HANDLE, LPWSTR, DWORD, LPDWORD, LPDWORD, LPDWORD, LPWSTR, DWORD);
+    GetVolumeInformationByHandleWPtr GetVolumeInformationByHandleWFunc;
+
+    MONGO_INITIALIZER(InitGetVolumeInformationByHandleW)(InitializerContext *context) {
+        HMODULE kernelLib = LoadLibraryA("kernel32.dll");
+        if (kernelLib) {
+            GetVolumeInformationByHandleWFunc = reinterpret_cast<GetVolumeInformationByHandleWPtr>
+                (GetProcAddress(kernelLib, "GetVolumeInformationByHandleW"));
+        }
+        return Status::OK();
+    }
 #endif
 
     boost::filesystem::path ensureParentDirCreated(const boost::filesystem::path& p){
@@ -100,9 +117,7 @@ namespace mongo {
         return parent;
     }
 
-    FileAllocator::FileAllocator()
-        : _pendingMutex("FileAllocator"), _failed() {
-    }
+    FileAllocator::FileAllocator() : _failed() {}
 
 
     void FileAllocator::start() {
@@ -110,7 +125,7 @@ namespace mongo {
     }
 
     void FileAllocator::requestAllocation( const string &name, long &size ) {
-        scoped_lock lk( _pendingMutex );
+        boost::lock_guard<boost::mutex> lk( _pendingMutex );
         if ( _failed )
             return;
         long oldSize = prevSize( name );
@@ -124,7 +139,7 @@ namespace mongo {
     }
 
     void FileAllocator::allocateAsap( const string &name, unsigned long long &size ) {
-        scoped_lock lk( _pendingMutex );
+        boost::unique_lock<boost::mutex> lk( _pendingMutex );
 
         // In case the allocator is in failed state, check once before starting so that subsequent
         // requests for the same database would fail fast after the first one has failed.
@@ -149,7 +164,7 @@ namespace mongo {
         _pendingUpdated.notify_all();
         while( inProgress( name ) ) {
             checkFailure();
-            _pendingUpdated.wait( lk.boost() );
+            _pendingUpdated.wait(lk);
         }
 
     }
@@ -157,15 +172,15 @@ namespace mongo {
     void FileAllocator::waitUntilFinished() const {
         if ( _failed )
             return;
-        scoped_lock lk( _pendingMutex );
+        boost::unique_lock<boost::mutex> lk( _pendingMutex );
         while( _pending.size() != 0 )
-            _pendingUpdated.wait( lk.boost() );
+            _pendingUpdated.wait(lk);
     }
 
     // TODO: pull this out to per-OS files once they exist
     static bool useSparseFiles(int fd) {
 
-#if defined(__linux__) || defined(__freebsd__)
+#if defined(__linux__) || defined(__FreeBSD__)
         struct statfs fs_stats;
         int ret = fstatfs(fd, &fs_stats);
         uassert(16062, "fstatfs failed: " + errnoWithDescription(), ret == 0);
@@ -174,16 +189,19 @@ namespace mongo {
 #if defined(__linux__)
 // these are from <linux/magic.h> but that isn't available on all systems
 # define NFS_SUPER_MAGIC 0x6969
+# define TMPFS_MAGIC 0x01021994
 
-        return (fs_stats.f_type == NFS_SUPER_MAGIC);
+        return (fs_stats.f_type == NFS_SUPER_MAGIC)
+            || (fs_stats.f_type == TMPFS_MAGIC)
+            ;
 
-#elif defined(__freebsd__)
+#elif defined(__FreeBSD__)
 
         return (str::equals(fs_stats.f_fstypename, "zfs") ||
             str::equals(fs_stats.f_fstypename, "nfs") ||
             str::equals(fs_stats.f_fstypename, "oldnfs"));
 
-#elif defined(__sunos__)
+#elif defined(__sun)
         // assume using ZFS which is copy-on-write so no benefit to zero-filling
         // TODO: check which fs we are using like we do elsewhere
         return true;
@@ -191,6 +209,30 @@ namespace mongo {
         return false;
 #endif
     }
+
+#if defined(_WIN32)
+    static bool isFileOnNTFSVolume(int fd) {
+        if (!GetVolumeInformationByHandleWFunc) {
+            warning() << "Could not retrieve pointer to GetVolumeInformationByHandleW function";
+            return false;
+        }
+
+        HANDLE fileHandle = (HANDLE)_get_osfhandle(fd);
+        if (fileHandle == INVALID_HANDLE_VALUE) {
+            warning() << "_get_osfhandle() failed with " << _strerror(NULL);
+            return false;
+        }
+
+        WCHAR fileSystemName[MAX_PATH + 1];
+        if (!GetVolumeInformationByHandleWFunc(fileHandle, NULL, 0, NULL, 0, NULL, fileSystemName, sizeof(fileSystemName))) {
+            DWORD gle = GetLastError();
+            warning() << "GetVolumeInformationByHandleW failed with " << errnoWithDescription(gle);
+            return false;
+        }
+
+        return lstrcmpW(fileSystemName, L"NTFS") == 0;
+    }
+#endif
 
     void FileAllocator::ensureLength(int fd , long size) {
         // Test running out of disk scenarios
@@ -236,6 +278,13 @@ namespace mongo {
             if (!ProcessInfo::isDataFileZeroingNeeded()) {
                 return;
             }
+
+#if defined(_WIN32)
+            if (!isFileOnNTFSVolume(fd)) {
+                log() << "No need to zero out datafile on non-NTFS volume" << endl;
+                return;
+            }
+#endif
 
             lseek(fd, 0, SEEK_SET);
 
@@ -298,7 +347,7 @@ namespace mongo {
               return fn;
         }
         return "";
-	}
+    }
 
     void FileAllocator::run( FileAllocator * fa ) {
         setThreadName( "FileAllocator" );
@@ -310,15 +359,15 @@ namespace mongo {
         }
         while( 1 ) {
             {
-                scoped_lock lk( fa->_pendingMutex );
+                boost::unique_lock<boost::mutex> lk( fa->_pendingMutex );
                 if ( fa->_pending.size() == 0 )
-                    fa->_pendingUpdated.wait( lk.boost() );
+                    fa->_pendingUpdated.wait(lk);
             }
             while( 1 ) {
                 string name;
                 long size = 0;
                 {
-                    scoped_lock lk( fa->_pendingMutex );
+                    boost::lock_guard<boost::mutex> lk( fa->_pendingMutex );
                     if ( fa->_pending.size() == 0 )
                         break;
                     name = fa->_pending.front();
@@ -390,7 +439,7 @@ namespace mongo {
                     }
 
                     {
-                        scoped_lock lk(fa->_pendingMutex);
+                        boost::lock_guard<boost::mutex> lk(fa->_pendingMutex);
                         fa->_failed = true;
 
                         // TODO: Should we remove the file from pending?
@@ -403,7 +452,7 @@ namespace mongo {
                 }
 
                 {
-                    scoped_lock lk( fa->_pendingMutex );
+                    boost::lock_guard<boost::mutex> lk( fa->_pendingMutex );
                     fa->_pendingSize.erase( name );
                     fa->_pending.pop_front();
                     fa->_pendingUpdated.notify_all();

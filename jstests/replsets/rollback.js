@@ -17,23 +17,23 @@
  * Finally, we expect either A or B to roll back its 3 divergent documents and acquire the other
  * node's.
  */
+load("jstests/replsets/rslib.js");
 
 (function () {
     "use strict";
     // helper function for verifying contents at the end of the test
     var checkFinalResults = function(db) {
-        assert.eq(5, db.bar.count(), "incorrect number of documents found");
         var x = db.bar.find().sort({q: 1}).toArray();
+        assert.eq(5, x.length, "incorrect number of documents found. Docs found: " + tojson(x));
         assert.eq(1, x[0].q);
         assert.eq(2, x[1].q);
         assert.eq(3, x[2].q);
         assert.eq(7, x[3].q);
         assert.eq(8, x[4].q);
-    }
+    };
 
     var replTest = new ReplSetTest({ name: 'unicomplex', nodes: 3, oplogSize: 1 });
     var nodes = replTest.nodeList();
-    //print(tojson(nodes));
 
     var conns = replTest.startSet();
     var r = replTest.initiate({ "_id": "unicomplex",
@@ -45,6 +45,7 @@
     replTest.bridge();
 
     // Make sure we have a master
+    replTest.waitForState(replTest.nodes[0], replTest.PRIMARY, 60 * 1000);
     var master = replTest.getMaster();
     var a_conn = conns[0];
     var A = a_conn.getDB("admin");
@@ -61,7 +62,7 @@
 
     /* force the oplog to roll */
     if (new Date() % 2 == 0) {
-        print("ROLLING OPLOG AS PART OF TEST (we only do this sometimes)");
+        jsTest.log("ROLLING OPLOG AS PART OF TEST (we only do this sometimes)");
         var pass = 1;
         var first = a.getSisterDB("local").oplog.rs.find().sort({ $natural: 1 }).limit(1)[0];
         a.roll.insert({ x: 1 });
@@ -70,7 +71,8 @@
             for (var i = 0; i < 1000; i++) {
                 bulk.find({}).update({ $inc: { x: 1 }});
             }
-            // unlikely secondary isn't keeping up, but let's avoid possible intermittent issues with that.
+            // unlikely secondary isn't keeping up, but let's avoid possible intermittent 
+            // issues with that.
             bulk.execute({ w: 2 });
 
             var op = a.getSisterDB("local").oplog.rs.find().sort({ $natural: 1 }).limit(1)[0];
@@ -81,10 +83,10 @@
             }
             pass++;
         }
-        print("PASSES FOR OPLOG ROLL: " + pass);
+        jsTest.log("PASSES FOR OPLOG ROLL: " + pass);
     }
     else {
-        print("NO ROLL");
+        jsTest.log("NO ROLL");
     }
 
     assert.writeOK(a.bar.insert({ q: 1, a: "foo" }));
@@ -105,27 +107,29 @@
 
     // a should not have the new data as it was partitioned.
     replTest.partition(1, 2);
-    print("*************** wait for server to reconnect ****************");
+    jsTest.log("*************** wait for server to reconnect ****************");
     replTest.unPartition(0, 2);
 
-    print("*************** B ****************");
+    jsTest.log("*************** B ****************");
     assert.soon(function () { try { return !B.isMaster().ismaster; } catch(e) { return false; } });
-    print("*************** A ****************");
+    jsTest.log("*************** A ****************");
     assert.soon(function () { try { return A.isMaster().ismaster; } catch(e) { return false; } });
 
     assert(a.bar.count() == 3, "t is 3");
-    a.bar.insert({ q: 7 });
-    a.bar.insert({ q: 8 });
+    assert.writeOK(a.bar.insert({ q: 7 }));
+    assert.writeOK(a.bar.insert({ q: 8 }));
+
     // A is 1 2 3 7 8
     // B is 1 2 3 4 5 6
 
     // bring B back online
     replTest.unPartition(0, 1);
     replTest.unPartition(1, 2);
+
+    awaitOpTime(b.getMongo(), getLatestOp(a_conn).ts);
     replTest.awaitReplication();
     checkFinalResults(a);
     checkFinalResults(b);
 
     replTest.stopSet(15);
 }());
-

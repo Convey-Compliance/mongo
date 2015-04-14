@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -36,24 +36,31 @@
 
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/head_manager.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::string;
 
     class HeadManagerImpl : public HeadManager {
     public:
         HeadManagerImpl(IndexCatalogEntry* ice) : _catalogEntry(ice) { }
         virtual ~HeadManagerImpl() { }
 
-        const DiskLoc getHead(OperationContext* txn) const {
+        const RecordId getHead(OperationContext* txn) const {
             return _catalogEntry->head(txn);
         }
 
-        void setHead(OperationContext* txn, const DiskLoc newHead) {
+        void setHead(OperationContext* txn, const RecordId newHead) {
             _catalogEntry->setHead(txn, newHead);
         }
 
@@ -62,7 +69,7 @@ namespace mongo {
         IndexCatalogEntry* _catalogEntry;
     };
 
-    IndexCatalogEntry::IndexCatalogEntry( const StringData& ns,
+    IndexCatalogEntry::IndexCatalogEntry( StringData ns,
                                           CollectionCatalogEntry* collection,
                                           IndexDescriptor* descriptor,
                                           CollectionInfoCache* infoCache )
@@ -74,6 +81,7 @@ namespace mongo {
           _headManager(new HeadManagerImpl(this)),
           _ordering( Ordering::make( descriptor->keyPattern() ) ),
           _isReady( false ) {
+
         _descriptor->_cachedEntry = this;
     }
 
@@ -93,9 +101,22 @@ namespace mongo {
         _isReady = _catalogIsReady( txn );
         _head = _catalogHead( txn );
         _isMultikey = _catalogIsMultikey( txn );
+
+        BSONElement filterElement = _descriptor->getInfoElement("filter");
+        if ( filterElement.type() ) {
+            invariant( filterElement.isABSONObj() );
+            BSONObj filter = filterElement.Obj();
+            StatusWithMatchExpression res = MatchExpressionParser::parse( filter );
+            // this should be checked in create, so can blow up here
+            invariantOK( res.getStatus() );
+            _filterExpression.reset( res.getValue() );
+            LOG(2) << "have filter expression for "
+                   << _ns << " " << _descriptor->indexName()
+                   << " " << filter;
+        }
     }
 
-    const DiskLoc& IndexCatalogEntry::head( OperationContext* txn ) const {
+    const RecordId& IndexCatalogEntry::head( OperationContext* txn ) const {
         DEV invariant( _head == _catalogHead( txn ) );
         return _head;
     }
@@ -105,8 +126,7 @@ namespace mongo {
         return _isReady;
     }
 
-    bool IndexCatalogEntry::isMultikey( OperationContext* txn ) const {
-        DEV invariant( _isMultikey == _catalogIsMultikey( txn ) );
+    bool IndexCatalogEntry::isMultikey() const {
         return _isMultikey;
     }
 
@@ -116,25 +136,96 @@ namespace mongo {
         _isReady = newIsReady;
     }
 
-    void IndexCatalogEntry::setHead( OperationContext* txn, DiskLoc newHead ) {
+    class IndexCatalogEntry::SetHeadChange : public RecoveryUnit::Change {
+    public:
+        SetHeadChange(IndexCatalogEntry* ice, RecordId oldHead) :_ice(ice), _oldHead(oldHead) {
+        }
+
+        virtual void commit() {}
+        virtual void rollback() { _ice->_head = _oldHead; }
+
+        IndexCatalogEntry* _ice;
+        const RecordId _oldHead;
+    };
+
+    void IndexCatalogEntry::setHead( OperationContext* txn, RecordId newHead ) {
         _collection->setIndexHead( txn,
                                    _descriptor->indexName(),
                                    newHead );
+
+        txn->recoveryUnit()->registerChange(new SetHeadChange(this, _head));
         _head = newHead;
     }
 
-    void IndexCatalogEntry::setMultikey( OperationContext* txn ) {
-        if ( isMultikey( txn ) )
-            return;
-        if ( _collection->setIndexIsMultikey( txn,
-                                              _descriptor->indexName(),
-                                              true ) ) {
-            if ( _infoCache ) {
-                LOG(1) << _ns << ": clearing plan cache - index "
-                       << _descriptor->keyPattern() << " set to multi key.";
-                _infoCache->clearQueryCache();
-            }
+
+    /**
+     * RAII class, which associates a new RecoveryUnit with an OperationContext for the purposes
+     * of simulating a sub-transaction. Takes ownership of the new recovery unit and frees it at
+     * destruction time.
+     */
+    class RecoveryUnitSwap {
+    public:
+        RecoveryUnitSwap(OperationContext* txn, RecoveryUnit* newRecoveryUnit)
+            : _txn(txn),
+              _oldRecoveryUnit(_txn->releaseRecoveryUnit()),
+              _newRecoveryUnit(newRecoveryUnit) {
+
+            _txn->setRecoveryUnit(_newRecoveryUnit.get());
         }
+
+        ~RecoveryUnitSwap() {
+            _txn->releaseRecoveryUnit();
+            _txn->setRecoveryUnit(_oldRecoveryUnit);
+        }
+
+    private:
+        // Not owned
+        OperationContext* const _txn;
+
+        // Owned, but life-time is not controlled
+        RecoveryUnit* const _oldRecoveryUnit;
+
+        // Owned and life-time is controlled
+        const boost::scoped_ptr<RecoveryUnit> _newRecoveryUnit;
+    };
+
+    void IndexCatalogEntry::setMultikey(OperationContext* txn) {
+        if (isMultikey()) {
+            return;
+        }
+
+        // Only one thread should set the multi-key value per collection, because the metadata for
+        // a collection is one large document.
+        Lock::ResourceLock collMDLock(txn->lockState(),
+                                      ResourceId(RESOURCE_METADATA, _ns),
+                                      MODE_X);
+
+        // Check again in case we blocked on the MD lock and another thread beat us to setting the
+        // multiKey metadata for this index.
+        if (isMultikey()) {
+            return;
+        }
+
+        // This effectively emulates a sub-transaction off the main transaction, which invoked
+        // setMultikey. The reason we need is to avoid artificial WriteConflicts, which happen
+        // with snapshot isolation.
+        {
+            StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+            RecoveryUnitSwap ruSwap(txn, storageEngine->newRecoveryUnit());
+
+            WriteUnitOfWork wuow(txn);
+
+            if (_collection->setIndexIsMultikey(txn, _descriptor->indexName())) {
+                if (_infoCache) {
+                    LOG(1) << _ns << ": clearing plan cache - index "
+                           << _descriptor->keyPattern() << " set to multi key.";
+                    _infoCache->clearQueryCache();
+                }
+            }
+
+            wuow.commit();
+        }
+
         _isMultikey = true;
     }
 
@@ -144,7 +235,7 @@ namespace mongo {
         return _collection->isIndexReady( txn, _descriptor->indexName() );
     }
 
-    DiskLoc IndexCatalogEntry::_catalogHead( OperationContext* txn ) const {
+    RecordId IndexCatalogEntry::_catalogHead( OperationContext* txn ) const {
         return _collection->getIndexHead( txn, _descriptor->indexName() );
     }
 
@@ -187,7 +278,7 @@ namespace mongo {
         return NULL;
     }
 
-    bool IndexCatalogEntryContainer::remove( const IndexDescriptor* desc ) {
+    IndexCatalogEntry* IndexCatalogEntryContainer::release( const IndexDescriptor* desc ) {
         for ( std::vector<IndexCatalogEntry*>::iterator i = _entries.mutableVector().begin();
               i != _entries.mutableVector().end();
               ++i ) {
@@ -195,10 +286,9 @@ namespace mongo {
             if ( e->descriptor() != desc )
                 continue;
             _entries.mutableVector().erase( i );
-            delete e;
-            return true;
+            return e;
         }
-        return false;
+        return NULL;
     }
 
 }  // namespace mongo

@@ -27,29 +27,46 @@ dd( "c" );
 /*
  * test createCollection
  */
- 
+
 db.getCollection( "test" ).drop();
 db.getCollectionNames().forEach( function(x) { assert(x != "test"); });
 
 dd( "d" );
- 
+
 db.createCollection("test");
 var found = false;
 db.getCollectionNames().forEach( function(x) { if (x == "test") found = true; });
-assert(found, "found test.test in system.namespaces");
+assert(found, "found test.test in collection infos");
+
+// storageEngine in collection options must:
+// - be a document
+// - all fields of the document:
+// -- must have names that are registered storage engines
+// -- must be objects
+db.getCollection('test').drop();
+var storageEngineName = db.serverStatus().storageEngine.name;
+assert.commandFailed(db.createCollection('test', {storageEngine: 'not a document'}));
+assert.commandWorked(db.createCollection('test', {storageEngine: {}}));
+assert.commandFailed(db.createCollection('test', {storageEngine: {unknownStorageEngine: {}}}));
+var invalidStorageEngineOptions = {}
+invalidStorageEngineOptions[storageEngineName] = 12345;
+assert.commandFailed(db.createCollection('test', {storageEngine: invalidStorageEngineOptions}));
 
 // Test round trip of storageEngine in collection options.
+// Assume that empty document for storageEngine-specific options is acceptable.
+var validStorageEngineOptions = {}
+validStorageEngineOptions[storageEngineName] = {};
 db.getCollection('test').drop();
-assert.commandWorked(db.createCollection('test', {storageEngine: {storageEngine1: {x: 1}}}));
-var result = assert.commandWorked(db.runCommand('listCollections'));
+assert.commandWorked(db.createCollection('test', {storageEngine: validStorageEngineOptions}));
+var collections = db.getCollectionInfos();
 found  = false;
-for (var i = 0; i < result.collections.length; ++i) {
-    var collection = result.collections[i];
+for (var i = 0; i < collections.length; ++i) {
+    var collection = collections[i];
     if (collection.name != 'test') {
         continue;
     }
     found = true;
-    assert.docEq({storageEngine1: {x: 1}}, collection.options.storageEngine,
+    assert.docEq(validStorageEngineOptions, collection.options.storageEngine,
                  'storage engine options not found in listCommands result');
 }
 assert(found, "'test' collection not created");

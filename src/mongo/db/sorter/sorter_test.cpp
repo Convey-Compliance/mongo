@@ -31,11 +31,13 @@
 #include "mongo/db/sorter/sorter.h"
 
 #include <boost/filesystem.hpp>
+#include <boost/make_shared.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread.hpp>
 
+#include "mongo/config.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/str.h"
 
 // Need access to internal classes
@@ -44,6 +46,7 @@
 namespace mongo {
     using namespace mongo::sorter;
     using boost::make_shared;
+    using std::pair;
 
     // Stub to avoid including the server_options library
     // TODO: This should go away once we can do these checks at compile time
@@ -339,7 +342,7 @@ namespace mongo {
 
                 // The debug builds are too slow to run these tests.
                 // Among other things, MSVC++ makes all heap functions O(N) not O(logN).
-#if !defined(_DEBUG)
+#if !defined(MONGO_CONFIG_DEBUG_BUILD)
                 { // merge all data ASC
                     boost::shared_ptr<IWSorter> sorters[] = {
                         makeSorter(opts, IWComparator(ASC)),
@@ -545,5 +548,7 @@ namespace mongo {
             add<SorterTests::LotsOfDataWithLimit<5000,/*random=*/false> >(); // spills
             add<SorterTests::LotsOfDataWithLimit<5000,/*random=*/true> >(); // spills
         }
-    } extSortTests;
+    };
+
+    mongo::unittest::SuiteInstance<SorterSuite> extSortTests;
 }

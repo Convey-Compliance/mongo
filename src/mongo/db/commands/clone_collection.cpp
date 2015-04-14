@@ -26,9 +26,9 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommands
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
@@ -49,12 +49,16 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/isself.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::string;
+    using std::stringstream;
+    using std::endl;
 
     class CmdCloneCollection : public Command {
     public:

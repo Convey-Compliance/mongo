@@ -61,7 +61,7 @@ namespace mongo {
                             bool* positional = NULL);
 
         virtual Status prepare(mutablebson::Element root,
-                               const StringData& matchedField,
+                               StringData matchedField,
                                ExecInfo* execInfo);
 
 
@@ -83,7 +83,7 @@ namespace mongo {
         // The instance of the field in the provided doc.
         // This data is valid after prepare, for use by log and apply
         struct PreparedState;
-        scoped_ptr<PreparedState> _preparedState;
+        boost::scoped_ptr<PreparedState> _preparedState;
     };
 
 } // namespace mongo

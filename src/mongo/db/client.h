@@ -36,36 +36,34 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/thread/thread.hpp>
+
 #include "mongo/db/client_basic.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/platform/unordered_set.h"
+#include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/concurrency/threadlocal.h"
-#include "mongo/util/paths.h"
-
 
 namespace mongo {
 
-    class AuthenticationInfo;
-    class Database;
-    class CurOp;
-    class Client;
     class Collection;
     class AbstractMessagingPort;
-
 
     TSP_DECLARE(Client, currentClient)
 
     typedef long long ConnectionId;
 
+    typedef unordered_set<Client*> ClientSet;
+
     /** the database's concept of an outside "client" */
     class Client : public ClientBasic {
     public:
-        // always be in clientsMutex when manipulating this. killop stuff uses these.
-        static std::set<Client*>& clients;
-        static mongo::mutex& clientsMutex;
+        // A set of currently active clients along with a mutex to protect the list
+        static boost::mutex clientsMutex;
+        static ClientSet clients;
 
         ~Client();
 
@@ -74,10 +72,23 @@ namespace mongo {
         */
         static void initThread(const char *desc, AbstractMessagingPort *mp = 0);
 
-        static void initThreadIfNotAlready(const char *desc) { 
-            if( currentClient.get() )
+        /**
+         * Inits a thread if that thread has not already been init'd, setting the thread name to
+         * "desc".
+         */
+        static void initThreadIfNotAlready(const char* desc) {
+            if (currentClient.get())
                 return;
             initThread(desc);
+        }
+
+        /**
+         * Inits a thread if that thread has not already been init'd, using the existing thread name
+         */
+        static void initThreadIfNotAlready() {
+            if (currentClient.get())
+                return;
+            initThread(getThreadName().c_str());
         }
 
         /** this has to be called as the client goes away, but before thread termination
@@ -85,182 +96,53 @@ namespace mongo {
          */
         bool shutdown();
 
-        std::string clientAddress(bool includePort=false) const;
-        CurOp* curop() const { return _curOp; }
-        const StringData desc() const { return _desc; }
-        void setLastOp( OpTime op ) { _lastOp = op; }
-        OpTime getLastOp() const { return _lastOp; }
+        std::string clientAddress(bool includePort = false) const;
+        const std::string& desc() const { return _desc; }
 
-        /* report what the last operation was.  used by getlasterror */
-        void appendLastOp( BSONObjBuilder& b ) const;
         void reportState(BSONObjBuilder& builder);
 
+        // Ensures stability of the client's OperationContext. When the client is locked,
+        // the OperationContext will not disappear.
+        void lock() { _lock.lock(); }
+        void unlock() { _lock.unlock(); }
+
+        // Changes the currently active operation context on this client. There can only be one
+        // active OperationContext at a time.
+        void setOperationContext(OperationContext* txn);
+        void resetOperationContext();
+        const OperationContext* getOperationContext() const { return _txn; }
+
         // TODO(spencer): SERVER-10228 SERVER-14779 Remove this/move it fully into OperationContext.
-        bool isGod() const { return _god; } /* this is for map/reduce writes */
-        bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
+        bool isInDirectClient() const { return _inDirectClient; }
+        void setInDirectClient(bool newVal) { _inDirectClient = newVal; }
 
-        void setRemoteID(const OID& rid) { _remoteId = rid;  }
-        OID getRemoteID() const { return _remoteId; }
         ConnectionId getConnectionId() const { return _connectionId; }
-        const std::string& getThreadId() const { return _threadId; }
-
-        // XXX(hk): this is per-thread mmapv1 recovery unit stuff, move into that
-        // impl of recovery unit
-        void writeHappened() { _hasWrittenSinceCheckpoint = true; }
-        bool hasWrittenSinceCheckpoint() const { return _hasWrittenSinceCheckpoint; }
-        void checkpointHappened() { _hasWrittenSinceCheckpoint = false; }
-
-        // XXX: this is really a method in the recovery unit iface to reset any state
-        void newTopLevelRequest() {
-            _hasWrittenSinceCheckpoint = false;
-        }
+        bool isFromUserConnection() const { return _connectionId > 0; }
 
     private:
-        Client(const std::string& desc, AbstractMessagingPort *p = 0);
-        friend class CurOp;
-        ConnectionId _connectionId; // > 0 for things "conn", 0 otherwise
-        std::string _threadId; // "" on non support systems
-        CurOp * _curOp;
-        bool _shutdown; // to track if Client::shutdown() gets called
-        std::string _desc;
-        bool _god;
-        OpTime _lastOp;
-        OID _remoteId; // Only used by master-slave
-
-        bool _hasWrittenSinceCheckpoint;
-        
-    public:
-
-        /* Set database we want to use, then, restores when we finish (are out of scope)
-           Note this is also helpful if an exception happens as the state if fixed up.
-        */
-        class Context {
-            MONGO_DISALLOW_COPYING(Context);
-        public:
-            /** this is probably what you want */
-            Context(OperationContext* txn, const std::string& ns, bool doVersion = true);
-
-            /** note: this does not call finishInit -- i.e., does not call 
-                      ensureShardVersionOKOrThrow for example.
-                see also: reset().
-            */
-            Context(OperationContext* txn, const std::string& ns, Database * db);
-
-            ~Context();
-            Client* getClient() const { return _client; }
-            Database* db() const { return _db; }
-            const char * ns() const { return _ns.c_str(); }
-
-            /** @return if the db was created by this Context */
-            bool justCreated() const { return _justCreated; }
-
-            /** call before unlocking, so clear any non-thread safe state
-             *  _db gets restored on the relock
-             */
-            void unlocked() { _db = 0; }
-
-            /** call after going back into the lock, will re-establish non-thread safe stuff */
-            void relocked() { _finishInit(); }
-
-        private:
-            friend class CurOp;
-            void _finishInit();
-            void checkNotStale() const;
-            void checkNsAccess( bool doauth );
-            void checkNsAccess( bool doauth, int lockState );
-            Client * const _client;
-            bool _justCreated;
-            bool _doVersion;
-            const std::string _ns;
-            Database * _db;
-            OperationContext* _txn;
-            
-            Timer _timer;
-        }; // class Client::Context
+        Client(const std::string& desc,
+               ServiceContext* serviceContext,
+               AbstractMessagingPort *p = 0);
 
 
-        class WriteContext : boost::noncopyable {
-        public:
-            WriteContext(OperationContext* opCtx, const std::string& ns);
+        // Description for the client (e.g. conn8)
+        const std::string _desc;
 
-            Database* db() const { return _c.db(); }
+        // OS id of the thread, which owns this client
+        const boost::thread::id _threadId;
 
-            Collection* getCollection() const {
-                return _c.db()->getCollection(_txn, _nss.ns());
-            }
+        // > 0 for things "conn", 0 otherwise
+        const ConnectionId _connectionId;
 
-            Context& ctx() { return _c; }
+        // Protects the contents of the Client (such as changing the OperationContext, etc)
+        mutable SpinLock _lock;
 
-        private:
-            OperationContext* _txn;
-            NamespaceString _nss;
-            Lock::DBLock _dblk;
-            Lock::CollectionLock _collk;
-            Context _c;
-        };
+        // Whether this client is running as DBDirectClient
+        bool _inDirectClient;
 
-    }; // class Client
-
-
-    /**
-     * RAII-style class, which acquires a lock on the specified database in the requested mode and
-     * obtains a reference to the database. Used as a shortcut for calls to dbHolder().get().
-     *
-     * It is guaranteed that locks will be released when this object goes out of scope, therefore
-     * the database reference returned by this class should not be retained.
-     *
-     * TODO: This should be moved outside of client.h (maybe dbhelpers.h)
-     */
-    class AutoGetDb {
-        MONGO_DISALLOW_COPYING(AutoGetDb);
-    public:
-        AutoGetDb(OperationContext* txn, const StringData& ns, LockMode mode);
-
-        Database* getDb() const {
-            return _db;
-        }
-
-    private:
-        const Lock::DBLock _dbLock;
-        Database* const _db;
+        // If != NULL, then contains the currently active OperationContext
+        OperationContext* _txn;
     };
-
-    /**
-     * RAII-style class, which would acquire the appropritate hierarchy of locks for obtaining
-     * a particular collection and would retrieve a reference to the collection.
-     *
-     * It is guaranteed that locks will be released when this object goes out of scope, therefore
-     * database and collection references returned by this class should not be retained.
-     *
-     * TODO: This should be moved outside of client.h (maybe dbhelpers.h)
-     */
-    class AutoGetCollectionForRead {
-        MONGO_DISALLOW_COPYING(AutoGetCollectionForRead);
-    public:
-        AutoGetCollectionForRead(OperationContext* txn, const std::string& ns);
-        AutoGetCollectionForRead(OperationContext* txn, const NamespaceString& nss);
-        ~AutoGetCollectionForRead();
-
-        Database* getDb() const {
-            return _db;
-        }
-
-        Collection* getCollection() const {
-            return _coll;
-        }
-
-    private:
-        void _init();
-
-        const Timer _timer;
-        OperationContext* const _txn;
-        const NamespaceString _nss;
-        const Lock::DBLock _dbLock;
-
-        Database* _db;
-        Collection* _coll;
-    };
-
 
     /** get the Client object for this thread. */
     inline Client& cc() {

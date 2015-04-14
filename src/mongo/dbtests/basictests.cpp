@@ -29,20 +29,35 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/db.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+#include <iostream>
+
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/compress.h"
 #include "mongo/util/paths.h"
+#include "mongo/util/ptr.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/stringutils.h"
 #include "mongo/util/text.h"
+#include "mongo/util/thread_safe_string.h"
 #include "mongo/util/time_support.h"
 
 namespace BasicTests {
+
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::cout;
+    using std::dec;
+    using std::endl;
+    using std::hex;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     class Rarely {
     public:
@@ -349,22 +364,6 @@ namespace BasicTests {
         }
     };
 
-
-    class DatabaseOwnsNS {
-    public:
-        void run() {
-            OperationContextImpl txn;
-            Lock::GlobalWrite lk(txn.lockState());
-
-            Database db("dbtests_basictests_ownsns", NULL );
-
-            ASSERT( db.ownsNS( "dbtests_basictests_ownsns.x" ) );
-            ASSERT( db.ownsNS( "dbtests_basictests_ownsns.x.y" ) );
-            ASSERT( !db.ownsNS( "dbtests_basictests_ownsn.x.y" ) );
-            ASSERT( !db.ownsNS( "dbtests_basictests_ownsnsa.x.y" ) );
-        }
-    };
-
     class PtrTests {
     public:
         void run() {
@@ -553,8 +552,6 @@ namespace BasicTests {
             add< SleepBackoffTest >();
             add< AssertTests >();
 
-            add< DatabaseOwnsNS >();
-
             add< PtrTests >();
 
             add< StringSplitterTest >();
@@ -570,7 +567,9 @@ namespace BasicTests {
             add< CompressionTest1 >();
 
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 
 } // namespace BasicTests
 

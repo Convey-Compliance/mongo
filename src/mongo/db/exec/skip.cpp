@@ -33,6 +33,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* SkipStage::kStageType = "SKIP";
 
@@ -79,13 +82,16 @@ namespace mongo {
             }
             return status;
         }
-        else {
-            if (PlanStage::NEED_TIME == status) {
-                ++_commonStats.needTime;
-            }
-            // NEED_TIME/YIELD, ERROR, IS_EOF
-            return status;
+        else if (PlanStage::NEED_TIME == status) {
+            ++_commonStats.needTime;
         }
+        else if (PlanStage::NEED_YIELD == status) {
+            ++_commonStats.needYield;
+            *out = id;
+        }
+
+        // NEED_TIME, NEED_YIELD, ERROR, IS_EOF
+        return status;
     }
 
     void SkipStage::saveState() {
@@ -98,9 +104,9 @@ namespace mongo {
         _child->restoreState(opCtx);
     }
 
-    void SkipStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void SkipStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
     }
 
     vector<PlanStage*> SkipStage::getChildren() const {

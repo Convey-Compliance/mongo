@@ -26,7 +26,7 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
@@ -35,6 +35,10 @@
 #include "mongo/db/pipeline/value.h"
 
 namespace mongo {
+
+    using boost::intrusive_ptr;
+    using std::string;
+    using std::vector;
 
     /** Helper class to unwind array from a single document. */
     class DocumentSourceUnwind::Unwinder {
@@ -83,17 +87,11 @@ namespace mongo {
             return;
         }
 
-        // The target field must be an array to unwind.
-        uassert(15978, str::stream() << "Value at end of $unwind field path '"
-                << _unwindPath.getPath(true) << "' must be an Array, but is a "
-                << typeName(pathValue.getType()),
-                pathValue.getType() == Array);
-
         _inputArray = pathValue;
     }
 
     boost::optional<Document> DocumentSourceUnwind::Unwinder::getNext() {
-        if (_inputArray.missing() || _index == _inputArray.getArrayLength())
+        if (_inputArray.missing())
             return boost::none;
 
         // If needed, this will automatically clone all the documents along the
@@ -103,7 +101,17 @@ namespace mongo {
         // along the path leading to that will be replaced in order not to share
         // that change with any other clones (or the original).
 
-        _output.setNestedField(_unwindPathFieldIndexes, _inputArray[_index]);
+        if (_inputArray.getType() == Array) {
+            if (_index == _inputArray.getArrayLength())
+                return boost::none;
+            _output.setNestedField(_unwindPathFieldIndexes, _inputArray[_index]);
+        }
+        else if (_index > 0) {
+            return boost::none;
+        }
+        else {
+            //_output.setNestedField(_unwindPathFieldIndexes, _inputArray);
+        }
         _index++;
         return _output.peek();
     }

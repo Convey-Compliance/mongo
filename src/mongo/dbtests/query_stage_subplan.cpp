@@ -28,6 +28,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/jsobj.h"
@@ -45,12 +46,12 @@ namespace QueryStageSubplan {
             : _client(&_txn) { }
 
         virtual ~QueryStageSubplanBase() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             _client.dropCollection(ns());
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         void insert(const BSONObj& doc) {
@@ -75,30 +76,83 @@ namespace QueryStageSubplan {
     class QueryStageSubplanGeo2dOr : public QueryStageSubplanBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             addIndex(BSON("a" << "2d" << "b" << 1));
             addIndex(BSON("a" << "2d"));
 
             BSONObj query = fromjson("{$or: [{a: {$geoWithin: {$centerSphere: [[0,0],10]}}},"
                                             "{a: {$geoWithin: {$centerSphere: [[1,1],10]}}}]}");
 
-            CanonicalQuery* cq;
-            ASSERT_OK(CanonicalQuery::canonicalize(ns(), query, &cq));
-            boost::scoped_ptr<CanonicalQuery> killCq(cq);
+            CanonicalQuery* rawCq;
+            ASSERT_OK(CanonicalQuery::canonicalize(ns(), query, &rawCq));
+            boost::scoped_ptr<CanonicalQuery> cq(rawCq);
 
             Collection* collection = ctx.getCollection();
 
             // Get planner params.
             QueryPlannerParams plannerParams;
-            fillOutPlannerParams(&_txn, collection, cq, &plannerParams);
+            fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
 
             WorkingSet ws;
             boost::scoped_ptr<SubplanStage> subplan(new SubplanStage(&_txn, collection, &ws,
-                                                                     plannerParams, cq));
+                                                                     plannerParams, cq.get()));
 
-            // NULL means that 'subplan' will not yield during plan selection. Plan selection
-            // should succeed due to falling back on regular planning.
-            ASSERT_OK(subplan->pickBestPlan(NULL));
+            // Plan selection should succeed due to falling back on regular planning.
+            PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+            ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+        }
+    };
+
+    /**
+     * Test the SubplanStage's ability to plan an individual branch using the plan cache.
+     */
+    class QueryStageSubplanPlanFromCache : public QueryStageSubplanBase {
+    public:
+        void run() {
+            OldClientWriteContext ctx(&_txn, ns());
+
+            addIndex(BSON("a" << 1 << "b" << 1));
+            addIndex(BSON("a" << 1 << "c" << 1));
+
+            for (int i = 0; i < 10; i++) {
+                insert(BSON("a" << 1 << "b" << i << "c" << i));
+            }
+
+            // This query should result in a plan cache entry for the first branch. The second
+            // branch should tie, meaning that nothing is inserted into the plan cache.
+            BSONObj query = fromjson("{$or: [{a: 1, b: 3}, {a: 1}]}");
+
+            Collection* collection = ctx.getCollection();
+
+            CanonicalQuery* rawCq;
+            ASSERT_OK(CanonicalQuery::canonicalize(ns(), query, &rawCq));
+            boost::scoped_ptr<CanonicalQuery> cq(rawCq);
+
+            // Get planner params.
+            QueryPlannerParams plannerParams;
+            fillOutPlannerParams(&_txn, collection, cq.get(), &plannerParams);
+
+            WorkingSet ws;
+            boost::scoped_ptr<SubplanStage> subplan(new SubplanStage(&_txn, collection, &ws,
+                                                                     plannerParams, cq.get()));
+
+            PlanYieldPolicy yieldPolicy(NULL, PlanExecutor::YIELD_MANUAL);
+            ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+            // Nothing is in the cache yet, so neither branch should have been planned from
+            // the plan cache.
+            ASSERT_FALSE(subplan->branchPlannedFromCache(0));
+            ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+
+            // If we repeat the same query, then the first branch should come from the cache,
+            // but the second is re-planned due to tying on the first run.
+            ws.clear();
+            subplan.reset(new SubplanStage(&_txn, collection, &ws, plannerParams, cq.get()));
+
+            ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
+
+            ASSERT_TRUE(subplan->branchPlannedFromCache(0));
+            ASSERT_FALSE(subplan->branchPlannedFromCache(1));
         }
     };
 
@@ -108,7 +162,10 @@ namespace QueryStageSubplan {
 
         void setupTests() {
             add<QueryStageSubplanGeo2dOr>();
+            add<QueryStageSubplanPlanFromCache>();
         }
-    } all;
+    };
+
+    SuiteInstance<All> all;
 
 } // namespace QueryStageSubplan

@@ -30,53 +30,83 @@
 
 #include "mongo/db/query/plan_yield_policy.h"
 
-#include "mongo/db/concurrency/yield.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_yield.h"
 
 namespace mongo {
 
-    // Yield every 128 cycles or 10ms.  These values were inherited from v2.6, which just copied
-    // them from v2.4.
-    PlanYieldPolicy::PlanYieldPolicy(PlanExecutor* exec)
-        : _elapsedTracker(128, 10),
+    PlanYieldPolicy::PlanYieldPolicy(PlanExecutor* exec, PlanExecutor::YieldPolicy policy)
+        : _policy(policy),
+          _forceYield(false),
+          _elapsedTracker(internalQueryExecYieldIterations, internalQueryExecYieldPeriodMS),
           _planYielding(exec) { }
 
     bool PlanYieldPolicy::shouldYield() {
+        if (!allowedToYield()) return false;
+        invariant(!_planYielding->getOpCtx()->lockState()->inAWriteUnitOfWork());
+        if (_forceYield) return true;
         return _elapsedTracker.intervalHasElapsed();
     }
 
-    bool PlanYieldPolicy::yield(bool registerPlan) {
-        // This is a no-op if document-level locking is supported. Doc-level locking systems
-        // should not need to yield.
-        if (supportsDocLocking()) {
-            return true;
-        }
+    void PlanYieldPolicy::resetTimer() {
+        _elapsedTracker.resetLastTime();
+    }
 
-        // No need to yield if the collection is NULL.
-        if (NULL == _planYielding->collection()) {
-            return true;
-        }
-
+    bool PlanYieldPolicy::yield(RecordFetcher* fetcher) {
         invariant(_planYielding);
+        invariant(allowedToYield());
 
-        if (registerPlan) {
-            _planYielding->registerExec();
-        }
+        _forceYield = false;
 
         OperationContext* opCtx = _planYielding->getOpCtx();
         invariant(opCtx);
+        invariant(!opCtx->lockState()->inAWriteUnitOfWork());
 
-        _planYielding->saveState();
+        // Can't use MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN/END since we need to call saveState
+        // before reseting the transaction.
+        for (int attempt = 1; true; attempt++) {
+            try {
+                // All YIELD_AUTO plans will get here eventually when the elapsed tracker triggers
+                // that it's time to yield. Whether or not we will actually yield, we need to check
+                // if this operation has been interrupted. Throws if the interrupt flag is set.
+                if (_policy == PlanExecutor::YIELD_AUTO) {
+                    opCtx->checkForInterrupt();
+                }
 
-        // Note that this call checks for interrupt, and thus can throw if interrupt flag is set.
-        Yield::yieldAllLocks(opCtx, 1);
-        _elapsedTracker.resetLastTime();
+                // No need to yield if the collection is NULL.
+                if (NULL == _planYielding->collection()) {
+                    return true;
+                }
 
-        if (registerPlan) {
-            _planYielding->deregisterExec();
+                try {
+                    _planYielding->saveState();
+                }
+                catch (const WriteConflictException& wce) {
+                    invariant(!"WriteConflictException not allowed in saveState");
+                }
+
+                if (_policy == PlanExecutor::WRITE_CONFLICT_RETRY_ONLY) {
+                    // Just reset the snapshot. Leave all LockManager locks alone.
+                    opCtx->recoveryUnit()->commitAndRestart();
+                }
+                else {
+                    // Release and reacquire locks.
+                    QueryYield::yieldAllLocks(opCtx, fetcher);
+                }
+
+                return _planYielding->restoreStateWithoutRetrying(opCtx);
+            }
+            catch (const WriteConflictException& wce) {
+                opCtx->getCurOp()->debug().writeConflicts++;
+                WriteConflictException::logAndBackoff(attempt,
+                                                      "plan execution restoreState",
+                                                      _planYielding->collection()->ns().ns());
+                // retry
+            }
         }
-
-        return _planYielding->restoreState(opCtx);
     }
 
 } // namespace mongo

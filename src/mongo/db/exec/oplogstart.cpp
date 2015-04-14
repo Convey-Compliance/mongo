@@ -31,8 +31,11 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 
 namespace mongo {
+
+    using std::vector;
 
     // Does not take ownership.
     OplogStart::OplogStart(OperationContext* txn,
@@ -57,6 +60,7 @@ namespace mongo {
             params.collection = _collection;
             params.direction = CollectionScanParams::BACKWARD;
             _cs.reset(new CollectionScan(_txn, params, _workingSet, NULL));
+
             _needInit = false;
             _backwardsScanning = true;
             _timer.reset();
@@ -69,7 +73,16 @@ namespace mongo {
             if (_timer.seconds() < _backwardsScanTime) {
                 return workBackwardsScan(out);
             }
-            switchToExtentHopping();
+
+            try {
+                // If this throws WCE, it leave us in a state were the next call to work will retry.
+                switchToExtentHopping();
+            }
+            catch (const WriteConflictException& wce) {
+                _subIterators.clear();
+                *out = WorkingSet::INVALID_ID;
+                return NEED_YIELD;
+            }
         }
 
         // Don't find it in time?  Swing from extent to extent like tarzan.com.
@@ -83,33 +96,36 @@ namespace mongo {
         }
 
         // we work from the back to the front since the back has the newest data.
-        const DiskLoc loc = _subIterators.back()->getNext();
-        _subIterators.popAndDeleteBack();
+        const RecordId loc = _subIterators.back()->curr();
+        if (loc.isNull()) return PlanStage::NEED_TIME;
 
-        if (!loc.isNull() && !_filter->matchesBSON(_collection->docFor(_txn, loc))) {
+        // TODO: should we ever try and return NEED_YIELD here?
+        const BSONObj obj = _subIterators.back()->dataFor(loc).releaseToBson();
+        if (!_filter->matchesBSON(obj)) {
             _done = true;
             WorkingSetID id = _workingSet->allocate();
             WorkingSetMember* member = _workingSet->get(id);
             member->loc = loc;
-            member->obj = _collection->docFor(_txn, member->loc);
+            member->obj = Snapshotted<BSONObj>(_txn->recoveryUnit()->getSnapshotId(), obj);
             member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
             *out = id;
             return PlanStage::ADVANCED;
         }
 
+        _subIterators.popAndDeleteBack();
         return PlanStage::NEED_TIME;
     }
 
     void OplogStart::switchToExtentHopping() {
+        // Set up our extent hopping state.
+        _subIterators = _collection->getManyIterators(_txn);
+
         // Transition from backwards scanning to extent hopping.
         _backwardsScanning = false;
         _extentHopping = true;
 
         // Toss the collection scan we were using.
         _cs.reset();
-
-        // Set up our extent hopping state.
-        _subIterators = _collection->getManyIterators(_txn);
     }
 
     PlanStage::StageState OplogStart::workBackwardsScan(WorkingSetID* out) {
@@ -127,9 +143,9 @@ namespace mongo {
         verify(member->hasObj());
         verify(member->hasLoc());
 
-        if (!_filter->matchesBSON(member->obj)) {
+        if (!_filter->matchesBSON(member->obj.value())) {
             _done = true;
-            // DiskLoc is returned in *out.
+            // RecordId is returned in *out.
             return PlanStage::ADVANCED;
         }
         else {
@@ -140,13 +156,13 @@ namespace mongo {
 
     bool OplogStart::isEOF() { return _done; }
 
-    void OplogStart::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void OplogStart::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         if (_needInit) { return; }
 
         if (INVALIDATION_DELETION != type) { return; }
 
         if (_cs) {
-            _cs->invalidate(dl, type);
+            _cs->invalidate(txn, dl, type);
         }
 
         for (size_t i = 0; i < _subIterators.size(); i++) {
@@ -155,6 +171,7 @@ namespace mongo {
     }
 
     void OplogStart::saveState() {
+        _txn = NULL;
         if (_cs) {
             _cs->saveState();
         }
@@ -165,6 +182,7 @@ namespace mongo {
     }
 
     void OplogStart::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
         _txn = opCtx;
         if (_cs) {
             _cs->restoreState(opCtx);

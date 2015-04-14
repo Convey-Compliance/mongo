@@ -31,6 +31,10 @@
 
 #include "mongo/bson/bsonelement.h"
 
+#include <cmath>
+#include <boost/functional/hash.hpp>
+
+#include "mongo/base/compare_numbers.h"
 #include "mongo/base/data_cursor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/base64.h"
@@ -38,12 +42,14 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
-namespace mongo {  
+namespace mongo {
     namespace str = mongoutils::str;
 
-    string BSONElement::jsonString( JsonStringFormat format, bool includeFieldNames, int pretty ) const {
-        int sign;
+    using std::dec;
+    using std::hex;
+    using std::string;
 
+    string BSONElement::jsonString( JsonStringFormat format, bool includeFieldNames, int pretty ) const {
         std::stringstream s;
         if ( includeFieldNames )
             s << '"' << escape( fieldName() ) << "\" : ";
@@ -74,11 +80,11 @@ namespace mongo {
             // This is not valid JSON, but according to RFC-4627, "Numeric values that cannot be
             // represented as sequences of digits (such as Infinity and NaN) are not permitted." so
             // we are accepting the fact that if we have such values we cannot output valid JSON.
-            else if ( mongo::isNaN(number()) ) {
+            else if ( std::isnan(number()) ) {
                 s << "NaN";
             }
-            else if ( mongo::isInf(number(), &sign) ) {
-                s << ( sign == 1 ? "Infinity" : "-Infinity");
+            else if ( std::isinf(number()) ) {
+                s << ( number() > 0 ? "Infinity" : "-Infinity");
             }
             else {
                 StringBuilder ss;
@@ -258,7 +264,7 @@ namespace mongo {
             s << "\"" << escape(_asCode()) << "\"";
             break;
 
-        case Timestamp:
+        case bsonTimestamp:
             if ( format == TenGen ) {
                 s << "Timestamp( " << ( timestampTime() / 1000 ) << ", " << timestampInc() << " )";
             }
@@ -416,7 +422,7 @@ namespace mongo {
         return b.obj();
     }
 
-    BSONObj BSONElement::wrap( const StringData& newName ) const {
+    BSONObj BSONElement::wrap( StringData newName ) const {
         BSONObjBuilder b(size() + 6 + newName.size());
         b.appendAs(*this,newName);
         return b.obj();
@@ -455,7 +461,7 @@ namespace mongo {
         case NumberInt:
             x = 4;
             break;
-        case Timestamp:
+        case bsonTimestamp:
         case mongo::Date:
         case NumberDouble:
         case NumberLong:
@@ -490,8 +496,8 @@ namespace mongo {
             break;
         case RegEx: {
             const char *p = value();
-            size_t len1 = ( maxLen == -1 ) ? strlen( p ) : (size_t)mongo::strnlen( p, remain );
-            //massert( 10318 ,  "Invalid regex string", len1 != -1 ); // ERH - 4/28/10 - don't think this does anything
+            size_t len1 = ( maxLen == -1 ) ? strlen( p ) : strnlen( p, remain );
+            massert( 10318 ,  "Invalid regex string", maxLen == -1 || len1 < size_t(remain) );
             p = p + len1 + 1;
             size_t len2;
             if( maxLen == -1 )
@@ -499,9 +505,9 @@ namespace mongo {
             else {
                 size_t x = remain - len1 - 1;
                 verify( x <= 0x7fffffff );
-                len2 = mongo::strnlen( p, (int) x );
+                len2 = strnlen( p,  x );
+                massert( 10319 ,  "Invalid regex options string", len2 < x );
             }
-            //massert( 10319 ,  "Invalid regex options string", len2 != -1 ); // ERH - 4/28/10 - don't think this does anything
             x = (int) (len1 + 1 + len2 + 1);
         }
         break;
@@ -535,7 +541,7 @@ namespace mongo {
         case NumberInt:
             x = 4;
             break;
-        case Timestamp:
+        case bsonTimestamp:
         case mongo::Date:
         case NumberDouble:
         case NumberLong:
@@ -694,7 +700,7 @@ namespace mongo {
                 }
             }
             break;
-        case Timestamp:
+        case bsonTimestamp:
             s << "Timestamp " << timestampTime() << "|" << timestampInc();
             break;
         default:
@@ -737,6 +743,13 @@ namespace mongo {
         if ( !isNumber() )
             return false;
         *out = numberInt();
+        return true;
+    }
+
+    template<> bool BSONElement::coerce<long long>( long long* out ) const {
+        if ( !isNumber() )
+            return false;
+        *out = numberLong();
         return true;
     }
 
@@ -813,9 +826,9 @@ namespace mongo {
         return ret.str();
     }
 
-    /* must be same type when called, unless both sides are #s 
-       this large function is in header to facilitate inline-only use of bson
-    */
+    /**
+     * l and r must be same canonicalType when called.
+     */
     int compareElementValues(const BSONElement& l, const BSONElement& r) {
         int f;
 
@@ -830,12 +843,13 @@ namespace mongo {
             return f==0 ? 0 : 1;
         case Bool:
             return *l.value() - *r.value();
-        case Timestamp:
+        case bsonTimestamp:
             // unsigned compare for timestamps - note they are not really dates but (ordinal + time_t)
             if ( l.date() < r.date() )
                 return -1;
             return l.date() == r.date() ? 0 : 1;
         case Date:
+            // Signed comparisons for Dates.
             {
                 long long a = (long long) l.Date().millis;
                 long long b = (long long) r.Date().millis;
@@ -843,36 +857,36 @@ namespace mongo {
                     return -1;
                 return a == b ? 0 : 1;
             }
-        case NumberLong:
-            if( r.type() == NumberLong ) {
-                long long L = l._numberLong();
-                long long R = r._numberLong();
-                if( L < R ) return -1;
-                if( L == R ) return 0;
-                return 1;
+
+        case NumberInt: {
+            // All types can precisely represent all NumberInts, so it is safe to simply convert to
+            // whatever rhs's type is.
+            switch (r.type()) {
+            case NumberInt: return compareInts(l._numberInt(), r._numberInt());
+            case NumberLong: return compareLongs(l._numberInt(), r._numberLong());
+            case NumberDouble: return compareDoubles(l._numberInt(), r._numberDouble());
+            default: invariant(false);
             }
-            goto dodouble;
-        case NumberInt:
-            if( r.type() == NumberInt ) {
-                int L = l._numberInt();
-                int R = r._numberInt();
-                if( L < R ) return -1;
-                return L == R ? 0 : 1;
+        }
+
+        case NumberLong: {
+            switch (r.type()) {
+            case NumberLong: return compareLongs(l._numberLong(), r._numberLong());
+            case NumberInt: return compareLongs(l._numberLong(), r._numberInt());
+            case NumberDouble: return compareLongToDouble(l._numberLong(), r._numberDouble());
+            default: invariant(false);
             }
-            // else fall through
-        case NumberDouble: 
-dodouble:
-            {
-                double left = l.number();
-                double right = r.number();
-                if( left < right ) 
-                    return -1;
-                if( left == right )
-                    return 0;
-                if( isNaN(left) )
-                    return isNaN(right) ? 0 : -1;
-                return 1;
+        }
+
+        case NumberDouble: {
+            switch (r.type()) {
+            case NumberDouble: return compareDoubles(l._numberDouble(), r._numberDouble());
+            case NumberInt: return compareDoubles(l._numberDouble(), r._numberInt());
+            case NumberLong: return compareDoubleToLong(l._numberDouble(), r._numberLong());
+            default: invariant(false);
             }
+        }
+
         case jstOID:
             return memcmp(l.value(), r.value(), OID::kOIDSize);
         case Code:
@@ -912,16 +926,11 @@ dodouble:
             return strcmp(l.regexFlags(), r.regexFlags());
         }
         case CodeWScope : {
-            f = l.canonicalType() - r.canonicalType();
-            if ( f )
-                return f;
-            f = strcmp( l.codeWScopeCode() , r.codeWScopeCode() );
-            if ( f )
-                return f;
-            f = strcmp( l.codeWScopeScopeDataUnsafe() , r.codeWScopeScopeDataUnsafe() );
-            if ( f )
-                return f;
-            return 0;
+            int cmp = StringData(l.codeWScopeCode(), l.codeWScopeCodeLen() - 1).compare(
+                      StringData(r.codeWScopeCode(), r.codeWScopeCodeLen() - 1));
+            if (cmp) return cmp;
+
+            return l.codeWScopeObject().woCompare(r.codeWScopeObject());
         }
         default:
             verify( false);
@@ -929,5 +938,92 @@ dodouble:
         return -1;
     }
  
+    size_t BSONElement::Hasher::operator()(const BSONElement& elem) const {
+        size_t hash = 0;
+
+        boost::hash_combine(hash, elem.canonicalType());
+
+        const StringData fieldName = elem.fieldNameStringData();
+        if (!fieldName.empty()) {
+            boost::hash_combine(hash, StringData::Hasher()(fieldName));
+        }
+
+        switch (elem.type()) {
+            // Order of types is the same as in compareElementValues().
+
+        case mongo::EOO:
+        case mongo::Undefined:
+        case mongo::jstNULL:
+        case mongo::MaxKey:
+        case mongo::MinKey:
+            // These are valueless types
+            break;
+
+        case mongo::Bool:
+            boost::hash_combine(hash, elem.boolean());
+            break;
+
+        case mongo::bsonTimestamp:
+            boost::hash_combine(hash, elem.timestamp().asULL());
+            break;
+
+        case mongo::Date:
+            boost::hash_combine(hash, elem.date().asInt64());
+            break;
+
+        case mongo::NumberDouble:
+        case mongo::NumberLong:
+        case mongo::NumberInt: {
+            // This converts all numbers to doubles, which ignores the low-order bits of
+            // NumberLongs > 2**53, but that is ok since the hash will still be the same for
+            // equal numbers and is still likely to be different for different numbers.
+            // SERVER-16851
+            const double dbl = elem.numberDouble();
+            if (std::isnan(dbl)) {
+                boost::hash_combine(hash, std::numeric_limits<double>::quiet_NaN());
+            }
+            else {
+                boost::hash_combine(hash, dbl);
+            }
+            break;
+        }
+
+        case mongo::jstOID:
+            elem.__oid().hash_combine(hash);
+            break;
+
+        case mongo::Code:
+        case mongo::Symbol:
+        case mongo::String:
+            boost::hash_combine(hash, StringData::Hasher()(elem.valueStringData()));
+            break;
+
+        case mongo::Object:
+        case mongo::Array:
+            boost::hash_combine(hash, BSONObj::Hasher()(elem.embeddedObject()));
+            break;
+
+        case mongo::DBRef:
+        case mongo::BinData:
+            // All bytes of the value are required to be identical.
+            boost::hash_combine(hash, StringData::Hasher()(StringData(elem.value(),
+                                                                      elem.valuesize())));
+            break;
+
+        case mongo::RegEx:
+            boost::hash_combine(hash, StringData::Hasher()(elem.regex()));
+            boost::hash_combine(hash, StringData::Hasher()(elem.regexFlags()));
+            break;
+
+        case mongo::CodeWScope: {
+            boost::hash_combine(hash, StringData::Hasher()(
+                                        StringData(elem.codeWScopeCode(),
+                                                   elem.codeWScopeCodeLen())));
+            boost::hash_combine(hash, BSONObj::Hasher()(elem.codeWScopeObject()));
+            break;
+        }
+        }
+        return hash;
+    }
 
 } // namespace mongo

@@ -32,6 +32,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::string;
+
     /**
      * Parses the projection 'spec' and checks its validity with respect to the query 'query'.
      * Puts covering information into 'out'.
@@ -149,7 +152,7 @@ namespace mongo {
                     }
 
                     if (e2.valuestr() != LiteParsedQuery::metaTextScore
-                        && e2.valuestr() != LiteParsedQuery::metaDiskLoc
+                        && e2.valuestr() != LiteParsedQuery::metaRecordId
                         && e2.valuestr() != LiteParsedQuery::metaIndexKey
                         && e2.valuestr() != LiteParsedQuery::metaGeoNearDistance
                         && e2.valuestr() != LiteParsedQuery::metaGeoNearPoint) {

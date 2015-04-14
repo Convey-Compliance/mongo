@@ -26,20 +26,23 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/curop.h"
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/haystack_access_method.h"
-#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/commands.h"
 
 /**
  * Examines all documents in a given radius of a given point.
@@ -50,6 +53,9 @@
  * Don't use when you want to find the closest open restaurants.
  */
 namespace mongo {
+
+    using std::string;
+    using std::vector;
 
     class GeoHaystackSearchCommand : public Command {
     public:
@@ -69,7 +75,8 @@ namespace mongo {
 
         bool run(OperationContext* txn, const string& dbname, BSONObj& cmdObj, int,
                  string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            const string ns = dbname + "." + cmdObj.firstElement().valuestr();
+            const std::string ns = parseNsCollectionRequired(dbname, cmdObj);
+
             AutoGetCollectionForRead ctx(txn, ns);
 
             Collection* collection = ctx.getCollection();

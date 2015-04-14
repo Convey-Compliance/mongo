@@ -30,7 +30,6 @@
 #pragma once
 
 #include <cfloat>
-#include <iostream>
 #include <sstream>
 #include <stdio.h>
 #include <string>
@@ -126,6 +125,7 @@ namespace mongo {
                 data = 0;
             }
             l = 0;
+            reservedBytes = 0;
         }
         ~_BufBuilder() { kill(); }
 
@@ -138,9 +138,11 @@ namespace mongo {
 
         void reset() {
             l = 0;
+            reservedBytes = 0;
         }
         void reset( int maxSize ) {
             l = 0;
+            reservedBytes = 0;
             if ( maxSize && size > maxSize ) {
                 al.Free(data);
                 data = (char*)al.Malloc(maxSize);
@@ -185,13 +187,7 @@ namespace mongo {
         }
 
         // Bool does not have a well defined encoding.
-#if __cplusplus >= 201103L
         void appendNum(bool j) = delete;
-#else
-        void appendNum(bool j) {
-            invariant(false);
-        }
-#endif
 
         void appendNum(double j) {
             BOOST_STATIC_ASSERT(sizeof(double) == 8);
@@ -214,7 +210,7 @@ namespace mongo {
             appendBuf(&s, sizeof(T));
         }
 
-        void appendStr(const StringData &str , bool includeEndingNull = true ) {
+        void appendStr(StringData str , bool includeEndingNull = true ) {
             const int len = str.size() + ( includeEndingNull ? 1 : 0 );
             str.copyTo( grow(len), includeEndingNull );
         }
@@ -229,11 +225,34 @@ namespace mongo {
         inline char* grow(int by) {
             int oldlen = l;
             int newLen = l + by;
-            if ( newLen > size ) {
-                grow_reallocate(newLen);
+            int minSize = newLen + reservedBytes;
+            if ( minSize > size ) {
+                grow_reallocate(minSize);
             }
             l = newLen;
             return data + oldlen;
+        }
+
+        /**
+         * Reserve room for some number of bytes to be claimed at a later time.
+         */
+        void reserveBytes(int bytes) {
+            int minSize = l + reservedBytes + bytes;
+            if (minSize > size)
+                grow_reallocate(minSize);
+
+            // This must happen *after* any attempt to grow.
+            reservedBytes += bytes;
+        }
+
+        /**
+         * Claim an earlier reservation of some number of bytes. These bytes must already have been
+         * reserved. Appends of up to this many bytes immediately following a claim are
+         * guaranteed to succeed without a need to reallocate.
+         */
+        void claimReservedBytes(int bytes) {
+            invariant(reservedBytes >= bytes);
+            reservedBytes -= bytes;
         }
 
     private:
@@ -248,10 +267,11 @@ namespace mongo {
 
 
         /* "slow" portion of 'grow()'  */
-        void NOINLINE_DECL grow_reallocate(int newLen) {
+        void NOINLINE_DECL grow_reallocate(int minSize) {
             int a = 64;
-            while( a < newLen ) 
+            while (a < minSize)
                 a = a * 2;
+
             if ( a > BufferMaxSize ) {
                 std::stringstream ss;
                 ss << "BufBuilder attempted to grow() to " << a << " bytes, past the 64MB limit.";
@@ -266,6 +286,7 @@ namespace mongo {
         char *data;
         int l;
         int size;
+        int reservedBytes; // eagerly grow_reallocate to keep this many bytes of spare room.
 
         friend class StringBuilderImpl<Allocator>;
     };
@@ -285,7 +306,7 @@ namespace mongo {
         void decouple(); // not allowed. not implemented.
     };
 
-#if defined(_WIN32)
+#if defined(_WIN32) && _MSC_VER < 1900
 #pragma push_macro("snprintf")
 #define snprintf _snprintf
 #endif
@@ -344,7 +365,7 @@ namespace mongo {
         StringBuilderImpl& operator<<(const char* str) {
             return *this << StringData(str);
         }
-        StringBuilderImpl& operator<<(const StringData& str) {
+        StringBuilderImpl& operator<<(StringData str) {
             append(str);
             return *this;
         }
@@ -364,7 +385,7 @@ namespace mongo {
 
         void write( const char* buf, int len) { memcpy( _buf.grow( len ) , buf , len ); }
 
-        void append( const StringData& str ) { str.copyTo( _buf.grow( str.size() ), false ); }
+        void append( StringData str ) { str.copyTo( _buf.grow( str.size() ), false ); }
 
         void reset( int maxSize = 0 ) { _buf.reset( maxSize ); }
 
@@ -394,7 +415,7 @@ namespace mongo {
     typedef StringBuilderImpl<TrivialAllocator> StringBuilder;
     typedef StringBuilderImpl<StackAllocator> StackStringBuilder;
 
-#if defined(_WIN32)
+#if defined(_WIN32) && _MSC_VER < 1900
 #undef snprintf
 #pragma pop_macro("snprintf")
 #endif

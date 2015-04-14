@@ -28,7 +28,7 @@
 *    then also delete it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -44,6 +44,9 @@
 #include "mongo/util/version_reporting.h"
 
 namespace mongo {
+
+    using std::cout;
+    using std::endl;
 
     bool is32bit() {
         return ( sizeof(int*) == 4 );

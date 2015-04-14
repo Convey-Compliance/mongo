@@ -38,6 +38,8 @@
 
 namespace mongo {
 
+    using std::vector;
+
     namespace mb = mutablebson;
     namespace str = mongoutils::str;
 
@@ -135,7 +137,7 @@ namespace mongo {
     }
 
     Status ModifierPullAll::prepare(mutablebson::Element root,
-                                    const StringData& matchedField,
+                                    StringData matchedField,
                                     ExecInfo* execInfo) {
 
         _preparedState.reset(new PreparedState(&root.getDocument()));

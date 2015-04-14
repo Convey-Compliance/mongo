@@ -28,27 +28,83 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/auth/authz_manager_external_state_s.h"
 
 #include <boost/thread/mutex.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <string>
 
-#include "mongo/client/auth_helpers.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authz_session_external_state_s.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/s/cluster_write.h"
+#include "mongo/s/catalog/catalog_manager.h"
 #include "mongo/s/config.h"
 #include "mongo/s/distlock.h"
-#include "mongo/s/type_database.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::vector;
+
+namespace {
+
+    ScopedDbConnection* getConnectionForAuthzCollection(const NamespaceString& ns) {
+        //
+        // Note: The connection mechanism here is *not* ideal, and should not be used elsewhere.
+        // If the primary for the collection moves, this approach may throw rather than handle
+        // version exceptions.
+        //
+
+        DBConfigPtr config = grid.getDBConfig(ns.ns());
+        Shard s = config->getShard(ns.ns());
+
+        return new ScopedDbConnection(s.getConnString(), 30.0);
+    }
+
+    Status getRemoteStoredAuthorizationVersion(DBClientBase* conn, int* outVersion) {
+        try {
+            BSONObj cmdResult;
+            conn->runCommand(
+                    "admin",
+                    BSON("getParameter" << 1 << authSchemaVersionServerParameter << 1),
+                    cmdResult);
+            if (!cmdResult["ok"].trueValue()) {
+                std::string errmsg = cmdResult["errmsg"].str();
+                if (errmsg == "no option found to get" ||
+                    StringData(errmsg).startsWith("no such cmd")) {
+
+                    *outVersion = 1;
+                    return Status::OK();
+                }
+                int code = cmdResult["code"].numberInt();
+                if (code == 0) {
+                    code = ErrorCodes::UnknownError;
+                }
+                return Status(ErrorCodes::Error(code), errmsg);
+            }
+            BSONElement versionElement = cmdResult[authSchemaVersionServerParameter];
+            if (versionElement.eoo())
+                return Status(ErrorCodes::UnknownError, "getParameter misbehaved.");
+            *outVersion = versionElement.numberInt();
+            return Status::OK();
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+    }
+
+} // namespace
 
     AuthzManagerExternalStateMongos::AuthzManagerExternalStateMongos() {}
 
@@ -58,28 +114,25 @@ namespace mongo {
         return Status::OK();
     }
 
-    namespace {
-        ScopedDbConnection* getConnectionForAuthzCollection(const NamespaceString& ns) {
-            //
-            // Note: The connection mechanism here is *not* ideal, and should not be used elsewhere.
-            // If the primary for the collection moves, this approach may throw rather than handle
-            // version exceptions.
-            //
+    std::unique_ptr<AuthzSessionExternalState>
+    AuthzManagerExternalStateMongos::makeAuthzSessionExternalState(
+            AuthorizationManager* authzManager) {
 
-            DBConfigPtr config = grid.getDBConfig(ns.ns());
-            Shard s = config->getShard(ns.ns());
-
-            return new ScopedDbConnection(s.getConnString(), 30.0);
-        }
+        return stdx::make_unique<AuthzSessionExternalStateMongos>(authzManager);
     }
 
     Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(
                                                 OperationContext* txn, int* outVersion) {
-        scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(
-                AuthorizationManager::usersCollectionNamespace));
-        Status status = auth::getRemoteStoredAuthorizationVersion(conn->get(), outVersion);
-        conn->done();
-        return status;
+        try {
+            scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(
+                    AuthorizationManager::usersCollectionNamespace));
+            Status status = getRemoteStoredAuthorizationVersion(conn->get(), outVersion);
+            conn->done();
+            return status;
+        }
+        catch (const DBException& ex) {
+            return ex.toStatus();
+        }
     }
 
     Status AuthzManagerExternalStateMongos::getUserDescription(
@@ -236,7 +289,8 @@ namespace mongo {
             const NamespaceString& collectionName,
             const BSONObj& document,
             const BSONObj& writeConcern) {
-        return clusterInsert(collectionName, document, writeConcern, NULL);
+
+        return grid.catalogManager()->insert(collectionName, document, NULL);
     }
 
     Status AuthzManagerExternalStateMongos::update(OperationContext* txn,
@@ -247,15 +301,14 @@ namespace mongo {
                                                    bool multi,
                                                    const BSONObj& writeConcern,
                                                    int* nMatched) {
-        BatchedCommandResponse response;
-        Status res = clusterUpdate(collectionName,
-                query,
-                updatePattern,
-                upsert,
-                multi,
-                writeConcern,
-                &response);
 
+        BatchedCommandResponse response;
+        Status res = grid.catalogManager()->update(collectionName,
+                                                   query,
+                                                   updatePattern,
+                                                   upsert,
+                                                   multi,
+                                                   &response);
         if (res.isOK()) {
             *nMatched = response.getN();
         }
@@ -269,9 +322,10 @@ namespace mongo {
             const BSONObj& query,
             const BSONObj& writeConcern,
             int* numRemoved) {
-        BatchedCommandResponse response;
-        Status res = clusterDelete(collectionName, query, 0 /* limit */, writeConcern, &response);
 
+        BatchedCommandResponse response;
+
+        Status res = grid.catalogManager()->remove(collectionName, query, 0, &response);
         if (res.isOK()) {
             *numRemoved = response.getN();
         }
@@ -279,42 +333,7 @@ namespace mongo {
         return res;
     }
 
-    Status AuthzManagerExternalStateMongos::createIndex(
-            OperationContext* txn,
-            const NamespaceString& collectionName,
-            const BSONObj& pattern,
-            bool unique,
-            const BSONObj& writeConcern) {
-        return clusterCreateIndex(collectionName, pattern, unique, writeConcern, NULL);
-    }
-
-    Status AuthzManagerExternalStateMongos::dropIndexes(
-            OperationContext* txn,
-            const NamespaceString& collectionName,
-            const BSONObj& writeConcern) {
-
-        scoped_ptr<ScopedDbConnection> conn(getConnectionForAuthzCollection(collectionName));
-        try {
-            conn->get()->dropIndexes(collectionName.ns());
-            BSONObjBuilder gleBuilder;
-            gleBuilder.append("getLastError", 1);
-            gleBuilder.appendElements(writeConcern);
-            BSONObj res;
-            conn->get()->runCommand("admin", gleBuilder.done(), res);
-            string errstr = conn->get()->getLastErrorString(res);
-            if (!errstr.empty()) {
-                conn->done();
-                return Status(ErrorCodes::UnknownError, errstr);
-            }
-            conn->done();
-            return Status::OK();
-        }
-        catch (const DBException& ex) {
-            return ex.toStatus();
-        }
-    }
-
-    bool AuthzManagerExternalStateMongos::tryAcquireAuthzUpdateLock(const StringData& why) {
+    bool AuthzManagerExternalStateMongos::tryAcquireAuthzUpdateLock(StringData why) {
         boost::lock_guard<boost::mutex> lkLocal(_distLockGuard);
         if (_authzDataUpdateLock.get()) {
             return false;

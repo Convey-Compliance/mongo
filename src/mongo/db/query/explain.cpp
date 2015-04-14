@@ -30,11 +30,14 @@
 
 #include "mongo/db/query/explain.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/db/query/query_settings.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/server_options.h"
@@ -45,6 +48,10 @@
 namespace {
 
     using namespace mongo;
+    using boost::scoped_ptr;
+    using std::auto_ptr;
+    using std::string;
+    using std::vector;
 
     /**
      * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
@@ -114,7 +121,7 @@ namespace {
             const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
             return spec->keysExamined;
         }
-        else if (STAGE_DISTINCT == type) {
+        else if (STAGE_DISTINCT_SCAN == type) {
             const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
             return spec->keysExamined;
         }
@@ -166,7 +173,7 @@ namespace {
             const CountScanStats* spec = static_cast<const CountScanStats*>(specific);
             ss << " " << spec->keyPattern;
         }
-        else if (STAGE_DISTINCT == stage->stageType()) {
+        else if (STAGE_DISTINCT_SCAN == stage->stageType()) {
             const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
             ss << " " << spec->keyPattern;
         }
@@ -224,6 +231,7 @@ namespace mongo {
             bob->appendNumber("works", stats.common.works);
             bob->appendNumber("advanced", stats.common.advanced);
             bob->appendNumber("needTime", stats.common.needTime);
+            bob->appendNumber("needYield", stats.common.needYield);
             bob->appendNumber("saveState", stats.common.yields);
             bob->appendNumber("restoreState", stats.common.unyields);
             bob->appendNumber("isEOF", stats.common.isEOF);
@@ -281,13 +289,16 @@ namespace mongo {
             }
 
             bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
             bob->appendBool("isMultiKey", spec->isMultiKey);
+            bob->append("indexVersion", spec->indexVersion);
         }
         else if (STAGE_DELETE == stats.stageType) {
             DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nWouldDelete", spec->docsDeleted);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
             }
         }
         else if (STAGE_FETCH == stats.stageType) {
@@ -295,6 +306,25 @@ namespace mongo {
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("docsExamined", spec->docsExamined);
                 bob->appendNumber("alreadyHasObj", spec->alreadyHasObj);
+            }
+        }
+        else if (STAGE_GEO_NEAR_2D == stats.stageType
+                || STAGE_GEO_NEAR_2DSPHERE == stats.stageType) {
+            NearStats* spec = static_cast<NearStats*>(stats.specific.get());
+
+            bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
+
+            if (verbosity >= ExplainCommon::EXEC_STATS) {
+                BSONArrayBuilder intervalsBob(bob->subarrayStart("searchIntervals"));
+                for (vector<IntervalStats>::const_iterator it = spec->intervalStats.begin();
+                        it != spec->intervalStats.end(); ++it) {
+                    BSONObjBuilder intervalBob(intervalsBob.subobjStart());
+                    intervalBob.append("minDistance", it->minDistanceAllowed);
+                    intervalBob.append("maxDistance", it->maxDistanceAllowed);
+                    intervalBob.append("maxInclusive", it->inclusiveMaxDistanceAllowed);
+                }
+                intervalsBob.doneFast();
             }
         }
         else if (STAGE_GROUP == stats.stageType) {
@@ -314,12 +344,17 @@ namespace mongo {
             IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
 
             bob->append("keyPattern", spec->keyPattern);
+            bob->append("indexName", spec->indexName);
             bob->appendBool("isMultiKey", spec->isMultiKey);
+            bob->append("indexVersion", spec->indexVersion);
             bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
-            // Bounds can get large. Truncate to 1 MB.
-            static const int kMaxBoundsSize = 1024 * 1024;
-            bob->append("indexBounds", spec->indexBoundsVerbose.substr(0, kMaxBoundsSize));
+            if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxStatsBSONSize) {
+                bob->append("warning", "index bounds omitted due to BSON size limit");
+            }
+            else {
+                bob->append("indexBounds", spec->indexBounds);
+            }
 
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("keysExamined", spec->keysExamined);
@@ -392,6 +427,7 @@ namespace mongo {
             }
 
             bob->append("indexPrefix", spec->indexPrefix);
+            bob->append("indexName", spec->indexName);
             bob->append("parsedTextQuery", spec->parsedTextQuery);
         }
         else if (STAGE_UPDATE == stats.stageType) {
@@ -400,10 +436,8 @@ namespace mongo {
             if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendNumber("nMatched", spec->nMatched);
                 bob->appendNumber("nWouldModify", spec->nModified);
+                bob->appendNumber("nInvalidateSkips", spec->nInvalidateSkips);
                 bob->appendBool("wouldInsert", spec->inserted);
-            }
-
-            if (verbosity >= ExplainCommon::EXEC_STATS) {
                 bob->appendBool("fastmod", spec->fastmod);
                 bob->appendBool("fastmodinsert", spec->fastmodinsert);
             }
@@ -451,13 +485,31 @@ namespace mongo {
     }
 
     // static
-    void Explain::generatePlannerInfo(CanonicalQuery* query,
+    void Explain::generatePlannerInfo(PlanExecutor* exec,
                                       PlanStageStats* winnerStats,
                                       const vector<PlanStageStats*>& rejectedStats,
                                       BSONObjBuilder* out) {
+        CanonicalQuery* query = exec->getCanonicalQuery();
+
         BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));;
 
         plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
+        plannerBob.append("namespace", exec->ns());
+
+        // Find whether there is an index filter set for the query shape. The 'indexFilterSet'
+        // field will always be false in the case of EOF or idhack plans.
+        bool indexFilterSet = false;
+        if (exec->collection() && exec->getCanonicalQuery()) {
+            const Collection* collection = exec->collection();
+            QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
+            AllowedIndices* allowedIndicesRaw;
+            if (querySettings->getAllowedIndices(*exec->getCanonicalQuery(), &allowedIndicesRaw)) {
+                // Found an index filter set on the query shape.
+                boost::scoped_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
+                indexFilterSet = true;
+            }
+        }
+        plannerBob.append("indexFilterSet", indexFilterSet);
 
         // In general we should have a canonical query, but sometimes we may avoid
         // creating a canonical query as an optimization (specifically, the update system
@@ -535,9 +587,9 @@ namespace mongo {
     }
 
     // static
-    Status Explain::explainStages(PlanExecutor* exec,
-                                  ExplainCommon::Verbosity verbosity,
-                                  BSONObjBuilder* out) {
+    void Explain::explainStages(PlanExecutor* exec,
+                                ExplainCommon::Verbosity verbosity,
+                                BSONObjBuilder* out) {
         //
         // Step 1: run the stages as required by the verbosity level.
         //
@@ -554,11 +606,9 @@ namespace mongo {
         }
 
         // If we need execution stats, then run the plan in order to gather the stats.
+        Status executePlanStatus = Status::OK();
         if (verbosity >= ExplainCommon::EXEC_STATS) {
-            Status s = exec->executePlan();
-            if (!s.isOK()) {
-                return s;
-            }
+            executePlanStatus = exec->executePlan();
         }
 
         //
@@ -578,13 +628,20 @@ namespace mongo {
         // Step 3: use the stats trees to produce explain BSON.
         //
 
-        CanonicalQuery* query = exec->getCanonicalQuery();
         if (verbosity >= ExplainCommon::QUERY_PLANNER) {
-            generatePlannerInfo(query, winningStats.get(), allPlansStats.vector(), out);
+            generatePlannerInfo(exec, winningStats.get(), allPlansStats.vector(), out);
         }
 
         if (verbosity >= ExplainCommon::EXEC_STATS) {
             BSONObjBuilder execBob(out->subobjStart("executionStats"));
+
+            // If there is an execution error while running the query, the error is reported under
+            // the "executionStats" section and the explain as a whole succeeds.
+            execBob.append("executionSuccess", executePlanStatus.isOK());
+            if (!executePlanStatus.isOK()) {
+                execBob.append("errorMessage", executePlanStatus.reason());
+                execBob.append("errorCode", executePlanStatus.code());
+            }
 
             // Generate exec stats BSON for the winning plan.
             OperationContext* opCtx = exec->getOpCtx();
@@ -616,8 +673,6 @@ namespace mongo {
         }
 
         generateServerInfo(out);
-
-        return Status::OK();
     }
 
     // static
@@ -662,9 +717,6 @@ namespace mongo {
         const CommonStats* common = root->getCommonStats();
         statsOut->nReturned = common->advanced;
         statsOut->executionTimeMillis = common->executionTimeMillis;
-
-        // Generate the plan summary string.
-        statsOut->summaryStr = getPlanSummary(root);
 
         // The other fields are aggregations over the stages in the plan tree. We flatten
         // the tree into a list and then compute these aggregations.

@@ -36,10 +36,12 @@
 
 #include <pcrecpp.h>
 
+#include <boost/noncopyable.hpp>
+#include <boost/shared_ptr.hpp>
 #include <boost/thread/thread.hpp>
+#include <iostream>
 
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context_noop.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/scripting/bson_template_evaluator.h"
 #include "mongo/scripting/engine.h"
@@ -48,7 +50,6 @@
 #include "mongo/util/timer.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
-
 
 // ---------------------------------
 // ---- benchmarking system --------
@@ -73,6 +74,11 @@ namespace {
 }
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::cout;
+    using std::endl;
+    using std::map;
 
     BenchRunEventCounter::BenchRunEventCounter() {
         reset();
@@ -189,25 +195,25 @@ namespace mongo {
         if ( ! args["trapPattern"].eoo() ){
             const char* regex = args["trapPattern"].regex();
             const char* flags = args["trapPattern"].regexFlags();
-            this->trapPattern = shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
+            this->trapPattern = boost::shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
         }
 
         if ( ! args["noTrapPattern"].eoo() ){
             const char* regex = args["noTrapPattern"].regex();
             const char* flags = args["noTrapPattern"].regexFlags();
-            this->noTrapPattern = shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
+            this->noTrapPattern = boost::shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
         }
 
         if ( ! args["watchPattern"].eoo() ){
             const char* regex = args["watchPattern"].regex();
             const char* flags = args["watchPattern"].regexFlags();
-            this->watchPattern = shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
+            this->watchPattern = boost::shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
         }
 
         if ( ! args["noWatchPattern"].eoo() ){
             const char* regex = args["noWatchPattern"].regex();
             const char* flags = args["noWatchPattern"].regexFlags();
-            this->noWatchPattern = shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
+            this->noWatchPattern = boost::shared_ptr< pcrecpp::RE >( new pcrecpp::RE( regex, flags2options( flags ) ) );
         }
 
         this->ops = args["ops"].Obj().getOwned();
@@ -234,7 +240,7 @@ namespace mongo {
     }
 
     void BenchRunState::waitForState(State awaitedState) {
-        boost::mutex::scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
 
         switch ( awaitedState ) {
         case BRS_RUNNING:
@@ -258,7 +264,7 @@ namespace mongo {
     }
 
     void BenchRunState::assertFinished() {
-        boost::mutex::scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         verify(0 == _numUnstartedWorkers + _numActiveWorkers);
     }
 
@@ -267,7 +273,7 @@ namespace mongo {
     }
 
     void BenchRunState::onWorkerStarted() {
-        boost::mutex::scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         verify( _numUnstartedWorkers > 0 );
         --_numUnstartedWorkers;
         ++_numActiveWorkers;
@@ -277,7 +283,7 @@ namespace mongo {
     }
 
     void BenchRunState::onWorkerFinished() {
-        boost::mutex::scoped_lock lk(_mutex);
+        boost::lock_guard<boost::mutex> lk(_mutex);
         verify( _numActiveWorkers > 0 );
         --_numActiveWorkers;
         if (_numActiveWorkers + _numUnstartedWorkers == 0) {
@@ -370,8 +376,7 @@ namespace mongo {
                 bool check = ! e["check"].eoo();
                 if( check ){
                     if ( e["check"].type() == CodeWScope || e["check"].type() == Code || e["check"].type() == String ) {
-                        OperationContextNoop txn;
-                        scope = globalScriptEngine->getPooledScope(&txn, ns, "benchrun");
+                        scope = globalScriptEngine->getPooledScope(NULL, ns, "benchrun");
                         verify( scope.get() );
 
                         if ( e.type() == CodeWScope ) {
@@ -726,15 +731,14 @@ namespace mongo {
     }  // namespace
 
     void BenchRunWorker::run() {
-        BenchRunWorkerStateGuard _workerStateGuard( _brState );
-
-        boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
-
         try {
+            BenchRunWorkerStateGuard _workerStateGuard( _brState );
+            boost::scoped_ptr<DBClientBase> conn( _config->createConnection() );
             if ( !_config->username.empty() ) {
                 string errmsg;
                 if (!conn->auth("admin", _config->username, _config->password, errmsg)) {
-                    uasserted(15932, "Authenticating to connection for benchThread failed: " + errmsg);
+                    uasserted(15932,
+                              "Authenticating to connection for benchThread failed: " + errmsg);
                 }
             }
             generateLoadOnConnection( conn.get() );
@@ -755,7 +759,7 @@ namespace mongo {
           _config(config) {
 
         _oid.init();
-        boost::mutex::scoped_lock lk(_staticMutex);
+        boost::lock_guard<boost::mutex> lk(_staticMutex);
          _activeRuns[_oid] = this;
      }
 
@@ -819,7 +823,7 @@ namespace mongo {
          }
 
          {
-             boost::mutex::scoped_lock lk(_staticMutex);
+             boost::lock_guard<boost::mutex> lk(_staticMutex);
              _activeRuns.erase( _oid );
          }
      }
@@ -830,7 +834,7 @@ namespace mongo {
      }
 
      BenchRunner* BenchRunner::get( OID oid ) {
-         boost::mutex::scoped_lock lk(_staticMutex);
+         boost::lock_guard<boost::mutex> lk(_staticMutex);
          return _activeRuns[ oid ];
      }
 

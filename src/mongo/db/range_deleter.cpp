@@ -35,16 +35,18 @@
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <memory>
 
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 using std::auto_ptr;
+using std::endl;
 using std::set;
 using std::pair;
 using std::string;
@@ -156,11 +158,8 @@ namespace mongo {
 
     RangeDeleter::RangeDeleter(RangeDeleterEnv* env):
         _env(env), // ownership xfer
-        _stopMutex("stopRangeDeleter"),
         _stopRequested(false),
-        _queueMutex("RangeDeleter"),
-        _deletesInProgress(0),
-        _statsHistoryMutex("RangeDeleterStatsHistory") {
+        _deletesInProgress(0) {
     }
 
     RangeDeleter::~RangeDeleter() {
@@ -198,7 +197,7 @@ namespace mongo {
 
     void RangeDeleter::stopWorkers() {
         {
-            scoped_lock sl(_stopMutex);
+            boost::lock_guard<boost::mutex> sl(_stopMutex);
             _stopRequested = true;
         }
 
@@ -206,13 +205,14 @@ namespace mongo {
             _worker->join();
         }
 
-        scoped_lock sl(_queueMutex);
+        boost::unique_lock<boost::mutex> sl(_queueMutex);
         while (_deletesInProgress > 0) {
-            _nothingInProgressCV.wait(sl.boost());
+            _nothingInProgressCV.wait(sl);
         }
     }
 
-    bool RangeDeleter::queueDelete(const RangeDeleterOptions& options,
+    bool RangeDeleter::queueDelete(OperationContext* txn,
+                                   const RangeDeleterOptions& options,
                                    Notification* notifyDone,
                                    std::string* errMsg) {
         string dummy;
@@ -227,7 +227,7 @@ namespace mongo {
         toDelete->notifyDone = notifyDone;
 
         {
-            scoped_lock sl(_queueMutex);
+            boost::lock_guard<boost::mutex> sl(_queueMutex);
             if (_stopRequested) {
                 *errMsg = "deleter is already stopped.";
                 return false;
@@ -241,8 +241,7 @@ namespace mongo {
         }
 
         if (options.waitForOpenCursors) {
-            boost::scoped_ptr<OperationContext> txn(getGlobalEnvironment()->newOpCtx());
-            _env->getCursorIds(txn.get(), ns, &toDelete->cursorsToWait);
+            _env->getCursorIds(txn, ns, &toDelete->cursorsToWait);
         }
 
         toDelete->stats.queueStartTS = jsTime();
@@ -251,7 +250,7 @@ namespace mongo {
             logCursorsWaiting(toDelete.get());
 
         {
-            scoped_lock sl(_queueMutex);
+            boost::lock_guard<boost::mutex> sl(_queueMutex);
 
             if (toDelete->cursorsToWait.empty()) {
                 toDelete->stats.queueEndTS = jsTime();
@@ -280,18 +279,18 @@ namespace {
         repl::ReplicationCoordinator::Milliseconds elapsedTime = replStatus.duration;
         if (replStatus.status.code() == ErrorCodes::ExceededTimeLimit) {
             *errMsg = str::stream() << "rangeDeleter timed out after "
-                                    << elapsedTime.seconds() << " seconds while waiting"
+                                    << elapsedTime.total_seconds() << " seconds while waiting"
                                     << " for deletions to be replicated to majority nodes";
             log() << *errMsg;
         }
         else if (replStatus.status.code() == ErrorCodes::NotMaster) {
             *errMsg = str::stream() << "rangeDeleter no longer PRIMARY after "
-                                    << elapsedTime.seconds() << " seconds while waiting"
+                                    << elapsedTime.total_seconds() << " seconds while waiting"
                                     << " for deletions to be replicated to majority nodes";
         }
         else {
-            LOG(elapsedTime.seconds() < 30 ? 1 : 0)
-                << "rangeDeleter took " << elapsedTime.seconds() << " seconds "
+            LOG(elapsedTime.total_seconds() < 30 ? 1 : 0)
+                << "rangeDeleter took " << elapsedTime.total_seconds() << " seconds "
                 << " waiting for deletes to be replicated to majority nodes";
 
             fassert(18512, replStatus.status);
@@ -318,7 +317,7 @@ namespace {
 
         NSMinMax deleteRange(ns, min, max);
         {
-            scoped_lock sl(_queueMutex);
+            boost::lock_guard<boost::mutex> sl(_queueMutex);
             if (!canEnqueue_inlock(ns, min, max, errMsg)) {
                 return false;
             }
@@ -360,7 +359,7 @@ namespace {
             if (stopRequested()) {
                 *errMsg = "deleter was stopped.";
 
-                scoped_lock sl(_queueMutex);
+                boost::lock_guard<boost::mutex> sl(_queueMutex);
                 _deleteSet.erase(&deleteRange);
 
                 _deletesInProgress--;
@@ -393,7 +392,7 @@ namespace {
         }
 
         {
-            scoped_lock sl(_queueMutex);
+            boost::lock_guard<boost::mutex> sl(_queueMutex);
             _deleteSet.erase(&deleteRange);
 
             _deletesInProgress--;
@@ -411,15 +410,15 @@ namespace {
         stats->clear();
         stats->reserve(kDeleteJobsHistory);
 
-        scoped_lock sl(_statsHistoryMutex);
-        for (deque<DeleteJobStats*>::const_iterator it = _statsHistory.begin();
+        boost::lock_guard<boost::mutex> sl(_statsHistoryMutex);
+        for (std::deque<DeleteJobStats*>::const_iterator it = _statsHistory.begin();
                 it != _statsHistory.end(); ++it) {
             stats->push_back(new DeleteJobStats(**it));
         }
     }
 
     BSONObj RangeDeleter::toBSON() const {
-        scoped_lock sl(_queueMutex);
+        boost::lock_guard<boost::mutex> sl(_queueMutex);
 
         BSONObjBuilder builder;
 
@@ -446,13 +445,15 @@ namespace {
         while (!inShutdown() && !stopRequested()) {
             string errMsg;
 
+            boost::scoped_ptr<OperationContext> txn(getGlobalServiceContext()->newOpCtx());
+
             RangeDeleteEntry* nextTask = NULL;
 
             {
-                scoped_lock sl(_queueMutex);
+                boost::unique_lock<boost::mutex> sl(_queueMutex);
                 while (_taskQueue.empty()) {
                     _taskQueueNotEmptyCV.timed_wait(
-                        sl.boost(), duration::milliseconds(kNotEmptyTimeoutMillis));
+                        sl, duration::milliseconds(kNotEmptyTimeoutMillis));
 
                     if (stopRequested()) {
                         log() << "stopping range deleter worker" << endl;
@@ -469,8 +470,6 @@ namespace {
 
                             set<CursorId> cursorsNow;
                             {
-                                boost::scoped_ptr<OperationContext> txn(
-                                        getGlobalEnvironment()->newOpCtx());
                                 if (entry->options.waitForOpenCursors) {
                                     _env->getCursorIds(txn.get(),
                                                        entry->options.range.ns,
@@ -514,8 +513,6 @@ namespace {
             }
 
             {
-                boost::scoped_ptr<OperationContext> txn(getGlobalEnvironment()->newOpCtx());
-
                 nextTask->stats.deleteStartTS = jsTime();
                 bool delResult = _env->deleteRange(txn.get(),
                                                    *nextTask,
@@ -539,7 +536,7 @@ namespace {
             }
 
             {
-                scoped_lock sl(_queueMutex);
+                boost::lock_guard<boost::mutex> sl(_queueMutex);
 
                 NSMinMax setEntry(nextTask->options.range.ns,
                                   nextTask->options.range.minKey,
@@ -558,7 +555,7 @@ namespace {
         }
     }
 
-    bool RangeDeleter::canEnqueue_inlock(const StringData& ns,
+    bool RangeDeleter::canEnqueue_inlock(StringData ns,
                                          const BSONObj& min,
                                          const BSONObj& max,
                                          string* errMsg) const {
@@ -574,27 +571,27 @@ namespace {
     }
 
     bool RangeDeleter::stopRequested() const {
-        scoped_lock sl(_stopMutex);
+        boost::lock_guard<boost::mutex> sl(_stopMutex);
         return _stopRequested;
     }
 
     size_t RangeDeleter::getTotalDeletes() const {
-        scoped_lock sl(_queueMutex);
+        boost::lock_guard<boost::mutex> sl(_queueMutex);
         return _deleteSet.size();
     }
 
     size_t RangeDeleter::getPendingDeletes() const {
-        scoped_lock sl(_queueMutex);
+        boost::lock_guard<boost::mutex> sl(_queueMutex);
         return _notReadyQueue.size() + _taskQueue.size();
     }
 
     size_t RangeDeleter::getDeletesInProgress() const {
-        scoped_lock sl(_queueMutex);
+        boost::lock_guard<boost::mutex> sl(_queueMutex);
         return _deletesInProgress;
     }
 
     void RangeDeleter::recordDelStats(DeleteJobStats* newStat) {
-        scoped_lock sl(_statsHistoryMutex);
+        boost::lock_guard<boost::mutex> sl(_statsHistoryMutex);
         if (_statsHistory.size() == kDeleteJobsHistory) {
             delete _statsHistory.front();
             _statsHistory.pop_front();

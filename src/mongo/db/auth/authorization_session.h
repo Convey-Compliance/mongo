@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -63,7 +64,7 @@ namespace mongo {
     public:
 
         // Takes ownership of the externalState.
-        explicit AuthorizationSession(AuthzSessionExternalState* externalState);
+        explicit AuthorizationSession(std::unique_ptr<AuthzSessionExternalState> externalState);
         ~AuthorizationSession();
 
         AuthorizationManager& getAuthorizationManager();
@@ -114,8 +115,9 @@ namespace mongo {
         // given namespace.
         Status checkAuthForQuery(const NamespaceString& ns, const BSONObj& query);
 
-        // Checks if this connection has the privileges necessary to perform a getMore on the given
-        // cursor in the given namespace.
+        // Checks if this connection has the privileges necessary to perform a getMore operation on
+        // the identified cursor, supposing that cursor is associated with the supplied namespace
+        // identifier.
         Status checkAuthForGetMore(const NamespaceString& ns, long long cursorID);
 
         // Checks if this connection has the privileges necessary to perform the given update on the
@@ -134,6 +136,11 @@ namespace mongo {
         // namespace.
         Status checkAuthForDelete(const NamespaceString& ns, const BSONObj& query);
 
+        // Checks if this connection has the privileges necessary to perform a killCursor on
+        // the identified cursor, supposing that cursor is associated with the supplied namespace
+        // identifier.
+        Status checkAuthForKillCursors(const NamespaceString& ns, long long cursorID);
+
         // Checks if this connection has the privileges necessary to grant the given privilege
         // to a role.
         Status checkAuthorizedToGrantPrivilege(const Privilege& privilege);
@@ -149,6 +156,9 @@ namespace mongo {
         // Utility function for isAuthorizedForActionsOnResource(
         //         ResourcePattern::forDatabaseName(role.getDB()), ActionType::grantAnyRole)
         bool isAuthorizedToRevokeRole(const RoleName& role);
+
+        // Utility function for isAuthorizedToChangeOwnPasswordAsUser and isAuthorizedToChangeOwnCustomDataAsUser
+        bool isAuthorizedToChangeAsUser(const UserName& userName, ActionType actionType);
 
         // Returns true if the current session is authenticated as the given user and that user
         // is allowed to change his/her own password
@@ -222,7 +232,7 @@ namespace mongo {
         // lock on the admin database (to update out-of-date user privilege information).
         bool _isAuthorizedForPrivilege(const Privilege& privilege);
 
-        scoped_ptr<AuthzSessionExternalState> _externalState;
+        std::unique_ptr<AuthzSessionExternalState> _externalState;
 
         // All Users who have been authenticated on this connection.
         UserSet _authenticatedUsers;

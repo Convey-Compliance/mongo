@@ -33,6 +33,7 @@
 
 namespace mongo {
 
+    using std::string;
     using std::vector;
 
     namespace {
@@ -184,60 +185,6 @@ namespace mongo {
         return ss;
     }
 
-    BSONObj IndexBounds::toLegacyBSON() const {
-        BSONObjBuilder builder;
-        if (isSimpleRange) {
-            // TODO
-        }
-        else {
-            for (vector<OrderedIntervalList>::const_iterator itField = fields.begin();
-                 itField != fields.end();
-                 ++itField) {
-                BSONArrayBuilder fieldBuilder(builder.subarrayStart(itField->name));
-                for (vector<Interval>::const_iterator itInterval = itField->intervals.begin();
-                     itInterval != itField->intervals.end();
-                     ++itInterval) {
-                    BSONArrayBuilder intervalBuilder;
-
-                    // Careful to output $minElement/$maxElement if we don't have bounds.
-                    if (itInterval->start.eoo()) {
-                        BSONObjBuilder minBuilder;
-                        minBuilder.appendMinKey("");
-                        BSONObj minKeyObj = minBuilder.obj();
-                        intervalBuilder.append(minKeyObj.firstElement());
-                    }
-                    else {
-                        intervalBuilder.append(itInterval->start);
-                    }
-
-                    if (itInterval->end.eoo()) {
-                        BSONObjBuilder maxBuilder;
-                        maxBuilder.appendMaxKey("");
-                        BSONObj maxKeyObj = maxBuilder.obj();
-                        intervalBuilder.append(maxKeyObj.firstElement());
-                    }
-                    else {
-                        intervalBuilder.append(itInterval->end);
-                    }
-
-                    fieldBuilder.append(
-                        static_cast<BSONArray>(intervalBuilder.arr().clientReadable()));
-
-                    // If the bounds object gets too large, truncate it.
-                    static const int kMaxBoundsSize = 1024 * 1024;
-                    if (builder.len() > kMaxBoundsSize) {
-                        intervalBuilder.doneFast();
-                        fieldBuilder.append(BSON("warning" << "bounds obj exceeds 1 MB"));
-                        fieldBuilder.doneFast();
-                        return builder.obj();
-                    }
-                }
-            }
-        }
-
-        return builder.obj();
-    }
-
     BSONObj IndexBounds::toBSON() const {
         BSONObjBuilder bob;
         vector<OrderedIntervalList>::const_iterator itField;
@@ -248,7 +195,16 @@ namespace mongo {
             for (itInterval = itField->intervals.begin()
                     ; itInterval != itField->intervals.end()
                     ; ++itInterval) {
-                fieldBuilder.append(itInterval->toString());
+                std::string intervalStr = itInterval->toString();
+
+                // Insulate against hitting BSON size limit.
+                if ((bob.len() + (int)intervalStr.size()) > BSONObjMaxUserSize) {
+                    fieldBuilder.append("warning: bounds truncated due to BSON size limit");
+                    fieldBuilder.doneFast();
+                    return bob.obj();
+                }
+
+                fieldBuilder.append(intervalStr);
             }
 
             fieldBuilder.doneFast();
@@ -335,17 +291,18 @@ namespace mongo {
         }
     }
 
-    bool IndexBoundsChecker::getStartKey(vector<const BSONElement*>* valueOut,
-                                         vector<bool>* inclusiveOut) {
-        verify(valueOut->size() == _bounds->fields.size());
-        verify(inclusiveOut->size() == _bounds->fields.size());
+    bool IndexBoundsChecker::getStartSeekPoint(IndexSeekPoint* out) {
+        out->prefixLen = 0;
+        out->prefixExclusive = false;
+        out->keySuffix.resize(_bounds->fields.size());
+        out->suffixInclusive.resize(_bounds->fields.size());
 
         for (size_t i = 0; i < _bounds->fields.size(); ++i) {
             if (0 == _bounds->fields[i].intervals.size()) {
                 return false;
             }
-            (*valueOut)[i] = &_bounds->fields[i].intervals[0].start;
-            (*inclusiveOut)[i] = _bounds->fields[i].intervals[0].startInclusive;
+            out->keySuffix[i] = &_bounds->fields[i].intervals[0].start;
+            out->suffixInclusive[i] = _bounds->fields[i].intervals[0].startInclusive;
         }
 
         return true;
@@ -418,13 +375,10 @@ namespace mongo {
     }
 
     IndexBoundsChecker::KeyState IndexBoundsChecker::checkKey(const BSONObj& key,
-                                                                int* keyEltsToUse,
-                                                                bool* movePastKeyElts,
-                                                                vector<const BSONElement*>* out,
-                                                                vector<bool>* incOut) {
+                                                              IndexSeekPoint* out) {
         verify(_curInterval.size() > 0);
-        verify(out->size() == _curInterval.size());
-        verify(incOut->size() == _curInterval.size());
+        out->keySuffix.resize(_curInterval.size());
+        out->suffixInclusive.resize(_curInterval.size());
 
         // It's useful later to go from a field number to the value for that field.  Store these.
         // TODO: on optimization pass, populate the vector as-needed and keep the vector around as a
@@ -463,13 +417,14 @@ namespace mongo {
         // Field number 'firstNonContainedField' of the index key is before all current intervals.
         if (BEHIND == orientation) {
             // Tell the caller to move forward to the start of the current interval.
-            *keyEltsToUse = firstNonContainedField;
-            *movePastKeyElts = false;
+            out->keyPrefix = key.getOwned();
+            out->prefixLen = firstNonContainedField;
+            out->prefixExclusive = false;
 
             for (size_t j = firstNonContainedField; j < _curInterval.size(); ++j) {
                 const OrderedIntervalList& oil = _bounds->fields[j];
-                (*out)[j] = &oil.intervals[_curInterval[j]].start;
-                (*incOut)[j] = oil.intervals[_curInterval[j]].startInclusive;
+                out->keySuffix[j] = &oil.intervals[_curInterval[j]].start;
+                out->suffixInclusive[j] = oil.intervals[_curInterval[j]].startInclusive;
             }
 
             return MUST_ADVANCE;
@@ -507,13 +462,13 @@ namespace mongo {
                     _curInterval[i] = 0;
                 }
 
-                *keyEltsToUse = firstNonContainedField;
-                *movePastKeyElts = false;
-
+                out->keyPrefix = key.getOwned();
+                out->prefixLen = firstNonContainedField;
+                out->prefixExclusive = false;
                 for (size_t i = firstNonContainedField; i < _curInterval.size(); ++i) {
                     const OrderedIntervalList& oil = _bounds->fields[i];
-                    (*out)[i] = &oil.intervals[_curInterval[i]].start;
-                    (*incOut)[i] = oil.intervals[_curInterval[i]].startInclusive;
+                    out->keySuffix[i] = &oil.intervals[_curInterval[i]].start;
+                    out->suffixInclusive[i] = oil.intervals[_curInterval[i]].startInclusive;
                 }
 
                 return MUST_ADVANCE;
@@ -530,8 +485,9 @@ namespace mongo {
                     return DONE;
                 }
 
-                *keyEltsToUse = firstNonContainedField;
-                *movePastKeyElts = true;
+                out->keyPrefix = key.getOwned();
+                out->prefixLen = firstNonContainedField;
+                out->prefixExclusive = true;
 
                 for (size_t i = firstNonContainedField; i < _curInterval.size(); ++i) {
                     _curInterval[i] = 0;

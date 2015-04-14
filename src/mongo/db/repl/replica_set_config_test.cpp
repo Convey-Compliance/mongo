@@ -52,6 +52,34 @@ namespace {
         ASSERT_EQUALS("", config.getDefaultWriteConcern().wMode);
         ASSERT_EQUALS(10, config.getHeartbeatTimeoutPeriod().total_seconds());
         ASSERT_TRUE(config.isChainingAllowed());
+        ASSERT_EQUALS(0, config.getProtocolVersion());
+    }
+
+    TEST(ReplicaSetConfig, ParseLargeConfigAndCheckAccessors) {
+        ReplicaSetConfig config;
+        ASSERT_OK(config.initialize(
+                          BSON("_id" << "rs0" <<
+                               "version" << 1234 <<
+                               "members" << BSON_ARRAY(BSON("_id" << 234 <<
+                                                            "host" << "localhost:12345" <<
+                                                            "tags" << BSON("NYC" << "NY"))) <<
+                               "settings" << BSON("getLastErrorDefaults" <<
+                                                  BSON("w" << "majority") <<
+                                                  "getLastErrorModes" << BSON("eastCoast" <<
+                                                                              BSON("NYC" << 1 )) <<
+                                                  "chainingAllowed" << false <<
+                                                  "heartbeatTimeoutSecs" << 120) <<
+                               "protocolVersion" << 2)));
+        ASSERT_OK(config.validate());
+        ASSERT_EQUALS("rs0", config.getReplSetName());
+        ASSERT_EQUALS(1234, config.getConfigVersion());
+        ASSERT_EQUALS(1, config.getNumMembers());
+        ASSERT_EQUALS(234, config.membersBegin()->getId());
+        ASSERT_EQUALS(0, config.getDefaultWriteConcern().wNumNodes);
+        ASSERT_EQUALS("majority", config.getDefaultWriteConcern().wMode);
+        ASSERT_FALSE(config.isChainingAllowed());
+        ASSERT_EQUALS(120, config.getHeartbeatTimeoutPeriod().total_seconds());
+        ASSERT_EQUALS(2, config.getProtocolVersion());
     }
 
     TEST(ReplicaSetConfig, MajorityCalculationThreeVotersNoArbiters) {
@@ -66,7 +94,81 @@ namespace {
                                        BSON("_id" << 4 << "host" << "h4:1" << "votes" << 0) <<
                                        BSON("_id" << 5 << "host" << "h5:1" << "votes" << 0)))));
         ASSERT_OK(config.validate());
-        ASSERT_EQUALS(2, config.getMajorityVoteCount());
+
+        ASSERT_EQUALS(2, config.getWriteMajority());
+    }
+
+    TEST(ReplicaSetConfig, MajorityCalculationNearlyHalfArbiters) {
+        ReplicaSetConfig config;
+        ASSERT_OK(config.initialize(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0) <<
+                                             BSON("host" << "node2:12345" << "_id" << 1) <<
+                                             BSON("host" << "node3:12345" << "_id" << 2) <<
+                                             BSON("host" << "node4:12345" <<
+                                                  "_id" << 3 <<
+                                                  "arbiterOnly" << true) <<
+                                             BSON("host" << "node5:12345" <<
+                                                  "_id" << 4 <<
+                                                  "arbiterOnly" << true)))));
+        ASSERT_OK(config.validate());
+        ASSERT_EQUALS(3, config.getWriteMajority());
+    }
+
+    TEST(ReplicaSetConfig, MajorityCalculationNearlyHalfArbitersOthersNoVote) {
+        ReplicaSetConfig config;
+        ASSERT_OK(config.initialize(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" <<
+                                                  "_id" << 0 <<
+                                                  "votes" << 0) <<
+                                             BSON("host" << "node2:12345" <<
+                                                  "_id" << 1 <<
+                                                  "votes" << 0) <<
+                                             BSON("host" << "node3:12345" <<
+                                                  "_id" << 2 <<
+                                                  "votes" << 0) <<
+                                             BSON("host" << "node4:12345" <<
+                                                  "_id" << 3 <<
+                                                  "arbiterOnly" << true) <<
+                                             BSON("host" << "node5:12345" <<
+                                                  "_id" << 4 <<
+                                                  "arbiterOnly" << true)))));
+        ASSERT_OK(config.validate());
+        ASSERT_EQUALS(0, config.getWriteMajority());
+    }
+
+    TEST(ReplicaSetConfig, MajorityCalculationEvenNumberOfMembers) {
+        ReplicaSetConfig config;
+        ASSERT_OK(config.initialize(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0) <<
+                                             BSON("host" << "node2:12345" << "_id" << 1) <<
+                                             BSON("host" << "node3:12345" << "_id" << 2) <<
+                                             BSON("host" << "node4:12345" << "_id" << 3)))));
+        ASSERT_OK(config.validate());
+        ASSERT_EQUALS(3, config.getWriteMajority());
+    }
+
+    TEST(ReplicaSetConfig, MajorityCalculationNearlyHalfSecondariesNoVotes) {
+        ReplicaSetConfig config;
+        ASSERT_OK(config.initialize(
+                BSON("_id" << "mySet" <<
+                     "version" << 2 <<
+                     "members" << BSON_ARRAY(BSON("host" << "node1:12345" << "_id" << 0) <<
+                                             BSON("host" << "node2:12345" <<
+                                                  "_id" << 1 <<
+                                                  "votes" << 0) <<
+                                             BSON("host" << "node3:12345" <<
+                                                  "_id" << 2 <<
+                                                  "votes" << 0) <<
+                                             BSON("host" << "node4:12345" << "_id" << 3) <<
+                                             BSON("host" << "node5:12345" << "_id" << 4)))));
+        ASSERT_OK(config.validate());
+        ASSERT_EQUALS(2, config.getWriteMajority());
     }
 
     TEST(ReplicaSetConfig, ParseFailsWithBadOrMissingIdField) {
@@ -537,6 +639,15 @@ namespace {
                           BSON("_id" << "rs0" <<
                                "version" << 1 <<
                                "members" << BSON_ARRAY(BSON("_id" << 0 <<
+                                                            "host" << "localhost:12345")) <<
+                               "settings" << BSON(
+                                       "getLastErrorDefaults" << BSON("w" << 0)))));
+        ASSERT_EQUALS(ErrorCodes::BadValue, config.validate());
+
+        ASSERT_OK(config.initialize(
+                          BSON("_id" << "rs0" <<
+                               "version" << 1 <<
+                               "members" << BSON_ARRAY(BSON("_id" << 0 <<
                                                             "host" << "localhost:12345" <<
                                                             "tags" << BSON("a" << "v"))) <<
                                "settings" << BSON(
@@ -612,12 +723,13 @@ namespace {
 
         // simple comparisons
         return a.getReplSetName() == b.getReplSetName() &&
-                a.getConfigVersion() == b.getConfigVersion() &&
-                a.getNumMembers() == b.getNumMembers() &&
-                a.getHeartbeatTimeoutPeriod() == b.getHeartbeatTimeoutPeriod() &&
-                a.isChainingAllowed() == b.isChainingAllowed() &&
-                a.getDefaultWriteConcern().wNumNodes == b.getDefaultWriteConcern().wNumNodes &&
-                a.getDefaultWriteConcern().wMode == b.getDefaultWriteConcern().wMode;
+            a.getConfigVersion() == b.getConfigVersion() &&
+            a.getNumMembers() == b.getNumMembers() &&
+            a.getHeartbeatTimeoutPeriod() == b.getHeartbeatTimeoutPeriod() &&
+            a.isChainingAllowed() == b.isChainingAllowed() &&
+            a.getDefaultWriteConcern().wNumNodes == b.getDefaultWriteConcern().wNumNodes &&
+            a.getDefaultWriteConcern().wMode == b.getDefaultWriteConcern().wMode &&
+            a.getProtocolVersion() == b.getProtocolVersion();
     }
 
     TEST(ReplicaSetConfig, toBSONRoundTripAbility) {

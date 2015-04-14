@@ -44,6 +44,9 @@ sh.help = function() {
     print( "\tsh.getBalancerState()                     return true if enabled" );
     print( "\tsh.isBalancerRunning()                    return true if the balancer has work in progress on any mongos" );
 
+    print( "\tsh.disableBalancing(coll)                 disable balancing on one collection" );
+    print( "\tsh.enableBalancing(coll)                  re-enable balancing on one collection" );
+
     print( "\tsh.addShardTag(shard,tag)                 adds the tag to the shard" );
     print( "\tsh.removeShardTag(shard,tag)              removes the tag from the shard" );
     print( "\tsh.addTagRange(fullName,min,max,tag)      tags the specified range of the given collection" );
@@ -258,12 +261,18 @@ sh.waitForBalancer = function( onOrNot, timeout, interval ){
 }
 
 sh.disableBalancing = function( coll ){
+    if (coll === undefined) {
+        throw Error("Must specify collection");
+    }
     var dbase = db
     if( coll instanceof DBCollection ) dbase = coll.getDB()
     dbase.getSisterDB( "config" ).collections.update({ _id : coll + "" }, { $set : { "noBalance" : true } })
 }
 
 sh.enableBalancing = function( coll ){
+    if (coll === undefined) {
+        throw Error("Must specify collection");
+    }
     var dbase = db
     if( coll instanceof DBCollection ) dbase = coll.getDB()
     dbase.getSisterDB( "config" ).collections.update({ _id : coll + "" }, { $set : { "noBalance" : false } })
@@ -373,24 +382,24 @@ sh.getBalancerLockDetails = function() {
     var configDB = db.getSiblingDB('config');
     var lock = configDB.locks.findOne({ _id : 'balancer' });
     if (lock == null) {
-        return false;
+        return null;
     }
     if (lock.state == 0){
-        return false;
+        return null;
     }
-    return lock.state;
+    return lock;
 }
 
 sh.getBalancerWindow = function() {
     var configDB = db.getSiblingDB('config');
     var settings = configDB.settings.findOne({ _id : 'balancer' });
     if ( settings == null ) {
-        return false;
+        return null;
     }
     if (settings.hasOwnProperty("activeWindow")){
         return settings.activeWindow;
     }
-    return false;
+    return null
 }
 
 sh.getActiveMigrations = function() {
@@ -421,22 +430,72 @@ sh.getRecentFailedRounds = function() {
     return result;
 }
 
+/**
+ * Returns a summary of chunk migrations that was completed either successfully or not
+ * since yesterday. The format is an array of 2 arrays, where the first array contains
+ * the successful cases, and the second array contains the failure cases.
+ */
 sh.getRecentMigrations = function() {
     var configDB = db.getSiblingDB('config');
     var yesterday = new Date( new Date() - 24 * 60 * 60 * 1000 );
-    var result = []
-    result = result.concat(configDB.changelog.aggregate( [
-        { $match : { time : { $gt : yesterday }, what : "moveChunk.from", "details.errmsg" : {
-            "$exists" : false } } },
-        { $group : { _id: { msg: "$details.errmsg" }, count : { "$sum":1 } } },
-        { $project : { _id : { $ifNull: [ "$_id.msg", "Success" ] }, count : "$count" } }
-    ] ).toArray());
-    result = result.concat(configDB.changelog.aggregate( [
-        { $match : { time : { $gt : yesterday }, what : "moveChunk.from", "details.errmsg" : {
-            "$exists" : true } } },
-        { $group : { _id: { msg: "$details.errmsg", from : "$details.from", to: "$details.to" },
-            count : { "$sum":1 } } },
-        { $project : { _id : "$_id.msg" , from : "$_id.from", to : "$_id.to" , count : "$count" } }
-    ] ).toArray());
+
+    // Successful migrations.
+    var result = configDB.changelog.aggregate([
+        {
+            $match: {
+                time: { $gt: yesterday },
+                what: "moveChunk.from",
+                'details.errmsg': { $exists: false },
+                'details.note': 'success'
+            }
+        },
+        {
+            $group: {
+                _id: {
+                    msg: "$details.errmsg"
+                },
+                count : { $sum: 1 }
+            }
+        },
+        {
+            $project: {
+                _id: { $ifNull: [ "$_id.msg", "Success" ] },
+                count: "$count"
+            }
+        }
+    ]).toArray();
+
+    // Failed migrations.
+    result = result.concat(configDB.changelog.aggregate([
+        {
+            $match: {
+                time: { $gt: yesterday },
+                what : "moveChunk.from",
+                $or: [
+                    { 'details.errmsg': { $exists: true }},
+                    { 'details.note': { $ne: 'success' }}
+                ]
+            }
+        },
+        {
+            $group: {
+                _id: {
+                    msg: "$details.errmsg",
+                    from : "$details.from",
+                    to: "$details.to"
+                },
+                count: { $sum: 1 }
+            }
+        },
+        {
+            $project: {
+                _id: { $ifNull: [ '$_id.msg', 'aborted' ]},
+                from: "$_id.from",
+                to: "$_id.to",
+                count: "$count"
+            }
+        }
+    ]).toArray());
+
     return result;
-}
+};

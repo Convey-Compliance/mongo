@@ -28,41 +28,46 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournaling
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kJournal
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/mmap_v1/dur_recover.h"
 
-#include <boost/filesystem/operations.hpp>
 #include <fcntl.h>
 #include <iomanip>
+#include <iostream>
 #include <sys/stat.h>
 
-#include "mongo/db/curop.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/db.h"
 #include "mongo/db/operation_context_impl.h"
-#include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/storage/mmap_v1/catalog/namespace.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/dur_commitjob.h"
 #include "mongo/db/storage/mmap_v1/dur_journal.h"
 #include "mongo/db/storage/mmap_v1/dur_journalformat.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/storage/mmap_v1/durop.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
-#include "mongo/db/storage_options.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/startup_test.h"
 
-using namespace mongoutils;
-
 namespace mongo {
+
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::endl;
+    using std::hex;
+    using std::map;
+    using std::pair;
+    using std::setw;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     /**
      * Thrown when a journal section is corrupt. This is considered OK as long as it occurs while
@@ -75,6 +80,14 @@ namespace mongo {
 
     namespace dur {
 
+        // The singleton recovery job object
+        RecoveryJob& RecoveryJob::_instance = *(new RecoveryJob());
+
+
+        void removeJournalFiles();
+        boost::filesystem::path getJournalDir();
+
+
         struct ParsedJournalEntry { /*copyable*/
             ParsedJournalEntry() : e(0) { }
 
@@ -86,13 +99,13 @@ namespace mongo {
             const JEntry *e;  // local db sentinel is already parsed out here into dbName
 
             // if not one of the two simple JEntry's above, this is the operation:
-            shared_ptr<DurOp> op;
+            boost::shared_ptr<DurOp> op;
         };
 
-        void removeJournalFiles();
-        boost::filesystem::path getJournalDir();
 
-        /** get journal filenames, in order. throws if unexpected content found */
+        /**
+         * Get journal filenames, in order. Throws if unexpected content found.
+         */
         static void getFiles(boost::filesystem::path dir, vector<boost::filesystem::path>& files) {
             map<unsigned,boost::filesystem::path> m;
             for ( boost::filesystem::directory_iterator i( dir );
@@ -121,39 +134,40 @@ namespace mongo {
         /** read through the memory mapped data of a journal file (journal/j._<n> file)
             throws
         */
-        class JournalSectionIterator : boost::noncopyable {
-            auto_ptr<BufReader> _entries;
-            const JSectHeader _h;
-            const char *_lastDbName; // pointer into mmaped journal file
-            const bool _doDurOps;
-            string _uncompressed;
+        class JournalSectionIterator {
+            MONGO_DISALLOW_COPYING(JournalSectionIterator);
         public:
-            JournalSectionIterator(const JSectHeader& h, const void *compressed, unsigned compressedLen, bool doDurOpsRecovering) :
-                _h(h),
-                _lastDbName(0)
-                , _doDurOps(doDurOpsRecovering)
-            {
-                verify( doDurOpsRecovering );
-                bool ok = uncompress((const char *)compressed, compressedLen, &_uncompressed);
-                if( !ok ) { 
+            JournalSectionIterator(const JSectHeader& h,
+                                   const void *compressed,
+                                   unsigned compressedLen,
+                                   bool doDurOpsRecovering)
+                : _h(h),
+                  _lastDbName(0),
+                  _doDurOps(doDurOpsRecovering) {
+
+                verify(doDurOpsRecovering);
+
+                if (!uncompress((const char *)compressed, compressedLen, &_uncompressed)) {
                     // We check the checksum before we uncompress, but this may still fail as the
                     // checksum isn't foolproof.
                     log() << "couldn't uncompress journal section" << endl;
                     throw JournalSectionCorruptException();
                 }
+
                 const char *p = _uncompressed.c_str();
-                verify( compressedLen == _h.sectionLen() - sizeof(JSectFooter) - sizeof(JSectHeader) );
-                _entries = auto_ptr<BufReader>( new BufReader(p, _uncompressed.size()) );
+                verify(compressedLen == _h.sectionLen() - sizeof(JSectFooter) - sizeof(JSectHeader));
+
+                _entries = auto_ptr<BufReader>(new BufReader(p, _uncompressed.size()));
             }
 
-            // we work with the uncompressed buffer when doing a WRITETODATAFILES (for speed)
-            JournalSectionIterator(const JSectHeader &h, const void *p, unsigned len) :
-                _entries( new BufReader((const char *) p, len) ),
-                _h(h),
-                _lastDbName(0)
-                , _doDurOps(false)
+            // We work with the uncompressed buffer when doing a WRITETODATAFILES (for speed)
+            JournalSectionIterator(const JSectHeader &h, const void *p, unsigned len)
+                : _entries(new BufReader((const char *)p, len)),
+                  _h(h),
+                  _lastDbName(0),
+                  _doDurOps(false) {
 
-                { }
+            }
 
             bool atEof() const { return _entries->atEof(); }
 
@@ -185,8 +199,7 @@ namespace mongo {
 
                     case JEntry::OpCode_DbContext: {
                         _lastDbName = (const char*) _entries->pos();
-                        const unsigned limit = std::min((unsigned)Namespace::MaxNsLenWithNUL,
-                                                        _entries->remaining());
+                        const unsigned limit = _entries->remaining();
                         const unsigned len = strnlen(_lastDbName, limit);
                         if (_lastDbName[len] != '\0') {
                             log() << "problem processing journal file during recovery";
@@ -213,7 +226,15 @@ namespace mongo {
                 _entries->skip(e.e->len);
             }
 
+
+        private:
+            auto_ptr<BufReader> _entries;
+            const JSectHeader _h;
+            const char *_lastDbName; // pointer into mmaped journal file
+            const bool _doDurOps;
+            string _uncompressed;
         };
+
 
         static string fileName(const char* dbName, int fileNo) {
             stringstream ss;
@@ -230,15 +251,23 @@ namespace mongo {
             return full.string();
         }
 
+
+        RecoveryJob::RecoveryJob()
+            : _recovering(false),
+              _lastDataSyncedFromLastRun(0),
+              _lastSeqMentionedInConsoleLog(1) {
+
+        }
+
         RecoveryJob::~RecoveryJob() {
             DESTRUCTOR_GUARD(
-                if( !_mmfs.empty() )
+                if (!_mmfs.empty()) {}
                     close();
             )
         }
 
         void RecoveryJob::close() {
-            scoped_lock lk(_mx);
+            boost::lock_guard<boost::mutex> lk(_mx);
             _close();
         }
 
@@ -248,7 +277,7 @@ namespace mongo {
         }
 
         RecoveryJob::Last::Last() : mmf(NULL), fileNo(-1) { 
-            // we are keeping invariants so we need to be sure things aren't disappearing out from under us:
+            // Make sure the files list does not change from underneath
             LockMongoFilesShared::assertAtLeastReadLocked();
         }
 
@@ -289,7 +318,6 @@ namespace mongo {
             //TODO(mathias): look into making some of these dasserts
             verify(entry.e);
             verify(entry.dbName);
-            verify((size_t)strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
 
             DurableMappedFile *mmf = last.newEntry(entry, *this);
 
@@ -299,7 +327,7 @@ namespace mongo {
 
                 void* dest = (char*)mmf->view_write() + entry.e->ofs;
                 memcpy(dest, entry.e->srcData(), entry.e->len);
-                stats.curr->_writeToDataFilesBytes += entry.e->len;
+                stats.curr()->_writeToDataFilesBytes += entry.e->len;
             }
             else {
                 massert(13622, "Trying to write past end of file in WRITETODATAFILES", _recovering);
@@ -337,56 +365,29 @@ namespace mongo {
             }
         }
 
-        DurableMappedFile* RecoveryJob::getDurableMappedFile(const ParsedJournalEntry& entry) {
-            verify(entry.dbName);
-            verify((size_t)strnlen(entry.dbName, MaxDatabaseNameLen) < MaxDatabaseNameLen);
-
-            const string fn = fileName(entry.dbName, entry.e->getFileNo());
-            MongoFile* file;
-            {
-                MongoFileFinder finder; // must release lock before creating new DurableMappedFile
-                file = finder.findByPath(fn);
-            }
-
-            DurableMappedFile* mmf;
-            if (file) {
-                verify(file->isDurableMappedFile());
-                mmf = (DurableMappedFile*)file;
-            }
-            else {
-                if( !_recovering ) {
-                    log() << "journal error applying writes, file " << fn << " is not open" << endl;
-                    verify(false);
-                }
-                boost::shared_ptr<DurableMappedFile> sp (new DurableMappedFile);
-                verify(sp->open(fn, false));
-                _mmfs.push_back(sp);
-                mmf = sp.get();
-            }
-
-            return mmf;
-        }
-
         void RecoveryJob::applyEntries(const vector<ParsedJournalEntry> &entries) {
-            bool apply = (storageGlobalParams.durOptions &
-                          StorageGlobalParams::DurScanOnly) == 0;
-            bool dump = storageGlobalParams.durOptions &
-                        StorageGlobalParams::DurDumpJournal;
-            if( dump )
+            const bool apply =
+                (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalScanOnly) == 0;
+            const bool dump =
+                (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal);
+
+            if (dump) {
                 log() << "BEGIN section" << endl;
+            }
 
             Last last;
-            for( vector<ParsedJournalEntry>::const_iterator i = entries.begin(); i != entries.end(); ++i ) {
+            for (vector<ParsedJournalEntry>::const_iterator i = entries.begin(); i != entries.end(); ++i) {
                 applyEntry(last, *i, apply, dump);
             }
 
-            if( dump )
+            if (dump) {
                 log() << "END section" << endl;
+            }
         }
 
         void RecoveryJob::processSection(const JSectHeader *h, const void *p, unsigned len, const JSectFooter *f) {
             LockMongoFilesShared lkFiles; // for RecoveryJob::Last
-            scoped_lock lk(_mx);
+            boost::lock_guard<boost::mutex> lk(_mx);
 
             // Check the footer checksum before doing anything else.
             if (_recovering) {
@@ -474,8 +475,8 @@ namespace mongo {
                         uasserted(13536, str::stream() << "journal version number mismatch " << h._version);
                     }
                     fileId = h.fileId;
-                    if (storageGlobalParams.durOptions &
-                        StorageGlobalParams::DurDumpJournal) {
+                    if (mmapv1GlobalOptions.journalOptions &
+                        MMAPV1Options::JournalDumpJournal) {
                         log() << "JHeader::fileId=" << fileId << endl;
                     }
                 }
@@ -485,8 +486,8 @@ namespace mongo {
                     JSectHeader h;
                     br.peek(h);
                     if( h.fileId != fileId ) {
-                        if (debug || (storageGlobalParams.durOptions &
-                                      StorageGlobalParams::DurDumpJournal)) {
+                        if (kDebugBuild || (mmapv1GlobalOptions.journalOptions &
+                                            MMAPV1Options::JournalDumpJournal)) {
                             log() << "Ending processFileBuffer at differing fileId want:" << fileId << " got:" << h.fileId << endl;
                             log() << "  sect len:" << h.sectionLen() << " seqnum:" << h.seqNumber << endl;
                         }
@@ -504,12 +505,12 @@ namespace mongo {
                 }
             }
             catch (const BufReader::eof&) {
-                if (storageGlobalParams.durOptions & StorageGlobalParams::DurDumpJournal)
+                if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)
                     log() << "ABRUPT END" << endl;
                 return true; // abrupt end
             }
             catch (const JournalSectionCorruptException&) {
-                if (storageGlobalParams.durOptions & StorageGlobalParams::DurDumpJournal)
+                if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalDumpJournal)
                     log() << "ABRUPT END" << endl;
                 return true; // abrupt end
             }
@@ -558,9 +559,9 @@ namespace mongo {
 
             close();
 
-            if (storageGlobalParams.durOptions & StorageGlobalParams::DurScanOnly) {
+            if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalScanOnly) {
                 uasserted(13545, str::stream() << "--durOptions "
-                                               << (int) StorageGlobalParams::DurScanOnly
+                                               << (int) MMAPV1Options::JournalScanOnly
                                                << " (scan only) specified");
             }
 
@@ -601,13 +602,8 @@ namespace mongo {
             // we use a lock so that exitCleanly will wait for us
             // to finish (or at least to notice what is up and stop)
             OperationContextImpl txn;
+            ScopedTransaction transaction(&txn, MODE_X);
             Lock::GlobalWrite lk(txn.lockState());
-
-            // can't lock groupCommitMutex here as
-            //   DurableMappedFile::close()->closingFileNotication()->groupCommit() will lock it
-            //   and that would be recursive.
-            //
-            // SimpleMutex::scoped_lock lk2(commitJob.groupCommitMutex);
 
             _recover(); // throws on interruption
         }
@@ -627,10 +623,6 @@ namespace mongo {
             }
         } brunittest;
 
-        // can't free at termination because order of destruction of global vars is arbitrary
-        RecoveryJob &RecoveryJob::_instance = *(new RecoveryJob());
-
     } // namespace dur
-
 } // namespace mongo
 

@@ -33,6 +33,8 @@
 #include <climits>
 
 #include "mongo/db/repl/member_heartbeat_data.h"
+#include "mongo/db/repl/rslog.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -45,15 +47,13 @@ namespace repl {
         _authIssue(false) {
 
         _lastResponse.setState(MemberState::RS_UNKNOWN);
-        _lastResponse.setElectionTime(OpTime());
-        _lastResponse.setOpTime(OpTime());
+        _lastResponse.setElectionTime(Timestamp());
+        _lastResponse.setOpTime(Timestamp());
     }
 
-    void MemberHeartbeatData::setState(MemberState newState) {
-        _lastResponse.setState(newState);
-    }
-
-    void MemberHeartbeatData::setUpValues(Date_t now, ReplSetHeartbeatResponse hbResponse) {
+    void MemberHeartbeatData::setUpValues(Date_t now,
+                                          const HostAndPort& host,
+                                          ReplSetHeartbeatResponse hbResponse) {
         _health = 1;
         if (_upSince == 0) {
             _upSince = now;
@@ -70,6 +70,12 @@ namespace repl {
             hbResponse.setOpTime(_lastResponse.getOpTime());
         }
 
+        // Log if the state changes
+        if (_lastResponse.getState() != hbResponse.getState()){
+            log() << "Member " << host.toString() << " is now in state "
+                  << hbResponse.getState().toString() << rsLog;
+        }
+
         _lastResponse = hbResponse;
     }
 
@@ -82,8 +88,8 @@ namespace repl {
 
         _lastResponse = ReplSetHeartbeatResponse();
         _lastResponse.setState(MemberState::RS_DOWN);
-        _lastResponse.setElectionTime(OpTime());
-        _lastResponse.setOpTime(OpTime());
+        _lastResponse.setElectionTime(Timestamp());
+        _lastResponse.setOpTime(Timestamp());
         _lastResponse.setHbMsg(heartbeatMessage);
         _lastResponse.setSyncingTo("");
     }
@@ -96,8 +102,8 @@ namespace repl {
 
         _lastResponse = ReplSetHeartbeatResponse();
         _lastResponse.setState(MemberState::RS_UNKNOWN);
-        _lastResponse.setElectionTime(OpTime());
-        _lastResponse.setOpTime(OpTime());
+        _lastResponse.setElectionTime(Timestamp());
+        _lastResponse.setOpTime(Timestamp());
         _lastResponse.setHbMsg("");
         _lastResponse.setSyncingTo("");
     }

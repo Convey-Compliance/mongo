@@ -50,17 +50,40 @@ namespace {
         _networkInterface(netInterface),
         _totalEventWaiters(0),
         _inShutdown(false),
-        _dblockWorkers(threadpool::ThreadPool::DoNotStartThreadsTag(), 1),
+        _dblockWorkers(threadpool::ThreadPool::DoNotStartThreadsTag(),
+                       1,
+                       "replCallbackWithGlobalLock-"),
         _nextId(0) {
     }
 
     ReplicationExecutor::~ReplicationExecutor() {}
+
+    std::string ReplicationExecutor::getDiagnosticString() {
+        boost::lock_guard<boost::mutex> lk(_mutex);
+        return _getDiagnosticString_inlock();
+    }
+
+    std::string ReplicationExecutor::_getDiagnosticString_inlock() const {
+        str::stream output;
+        output << "ReplicationExecutor";
+        output << " networkInProgress:" << _networkInProgressQueue.size();
+        output << " exclusiveInProgress:" << _exclusiveLockInProgressQueue.size();
+        output << " sleeperQueue:" << _sleepersQueue.size();
+        output << " ready:" << _readyQueue.size();
+        output << " free:" << _freeQueue.size();
+        output << " unsignaledEvents:" << _unsignaledEvents.size();
+        output << " eventWaiters:" << _totalEventWaiters;
+        output << " shuttingDown:" << _inShutdown;
+        output << " networkInterface:" << _networkInterface->getDiagnosticString();
+        return output;
+    }
 
     Date_t ReplicationExecutor::now() {
         return _networkInterface->now();
     }
 
     void ReplicationExecutor::run() {
+        setThreadName("ReplicationExecutor");
         _networkInterface->startup();
         _dblockWorkers.startThreads();
         std::pair<WorkItem, CallbackHandle> work;
@@ -480,7 +503,7 @@ namespace {
         }
     }
 
-    std::string ReplicationExecutor::RemoteCommandRequest::toString() const {
+    std::string ReplicationExecutor::RemoteCommandRequest::getDiagnosticString() {
         str::stream out;
         out << "RemoteCommand -- target:" << target.toString() << " db:" << dbname;
 
@@ -511,6 +534,12 @@ namespace {
         isSignaled(false),
         isSignaledCondition(new boost::condition_variable) {
     }
+
+    // This is a bitmask with the first bit set. It's used to mark connections that should be kept
+    // open during stepdowns.
+#ifndef _MSC_EXTENSIONS
+    const unsigned int ReplicationExecutor::NetworkInterface::kMessagingPortKeepOpen;
+#endif // _MSC_EXTENSIONS
 
     ReplicationExecutor::NetworkInterface::NetworkInterface() {}
     ReplicationExecutor::NetworkInterface::~NetworkInterface() {}

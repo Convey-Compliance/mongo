@@ -31,13 +31,15 @@
 
 #include "mongo/db/jsobj.h"
 
+#include <boost/functional/hash.hpp>
+
 #include "mongo/bson/bson_validate.h"
 #include "mongo/db/json.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-#include "mongo/util/md5.hpp"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
     using namespace std;
@@ -82,19 +84,6 @@ namespace mongo {
         if ( isOwned() )
             return *this;
         return copy();
-    }
-
-    BSONObjIterator BSONObj::begin() const {
-        return BSONObjIterator(*this);
-    }
-
-    string BSONObj::md5() const {
-        md5digest d;
-        md5_state_t st;
-        md5_init(&st);
-        md5_append( &st , (const md5_byte_t*)_objdata , objsize() );
-        md5_finish(&st, d);
-        return digestToString( d );
     }
 
     string BSONObj::jsonString( JsonStringFormat format, int pretty, bool isArray ) const {
@@ -244,6 +233,14 @@ namespace mongo {
         return -1;
     }
 
+    size_t BSONObj::Hasher::operator()(const BSONObj& obj) const {
+        size_t hash = 0;
+        BSONForEach(elem, obj) {
+            boost::hash_combine(hash, BSONElement::Hasher()(elem));
+        }
+        return hash;
+    }
+
     bool BSONObj::isPrefixOf( const BSONObj& otherObj ) const {
         BSONObjIterator a( *this );
         BSONObjIterator b( otherObj );
@@ -274,7 +271,7 @@ namespace mongo {
     }
 
     template <typename BSONElementColl>
-    void _getFieldsDotted( const BSONObj* obj, const StringData& name, BSONElementColl &ret, bool expandLastArray ) {
+    void _getFieldsDotted( const BSONObj* obj, StringData name, BSONElementColl &ret, bool expandLastArray ) {
         BSONElement e = obj->getField( name );
 
         if ( e.eoo() ) {
@@ -325,10 +322,10 @@ namespace mongo {
         }
     }
 
-    void BSONObj::getFieldsDotted(const StringData& name, BSONElementSet &ret, bool expandLastArray ) const {
+    void BSONObj::getFieldsDotted(StringData name, BSONElementSet &ret, bool expandLastArray ) const {
         _getFieldsDotted( this, name, ret, expandLastArray );
     }
-    void BSONObj::getFieldsDotted(const StringData& name, BSONElementMSet &ret, bool expandLastArray ) const {
+    void BSONObj::getFieldsDotted(StringData name, BSONElementMSet &ret, bool expandLastArray ) const {
         _getFieldsDotted( this, name, ret, expandLastArray );
     }
 
@@ -403,7 +400,7 @@ namespace mongo {
         return b.obj();
     }
 
-    BSONElement BSONObj::getFieldUsingIndexNames(const StringData& fieldName,
+    BSONElement BSONObj::getFieldUsingIndexNames(StringData fieldName,
                                                  const BSONObj &indexKey) const {
         BSONObjIterator i( indexKey );
         int j = 0;
@@ -653,27 +650,31 @@ namespace mongo {
         }
     }
 
-    BSONElement BSONObj::getField(const StringData& name) const {
+    BSONElement BSONObj::getField(StringData name) const {
         BSONObjIterator i(*this);
         while ( i.more() ) {
             BSONElement e = i.next();
-            if ( name == e.fieldName() )
+            // We know that e has a cached field length since BSONObjIterator::next internally
+            // called BSONElement::size on the BSONElement that it returned, so it is more
+            // efficient to re-use that information by obtaining the field name as a
+            // StringData, which will be pre-populated with the cached length.
+            if ( name == e.fieldNameStringData() )
                 return e;
         }
         return BSONElement();
     }
 
-    int BSONObj::getIntField(const StringData& name) const {
+    int BSONObj::getIntField(StringData name) const {
         BSONElement e = getField(name);
         return e.isNumber() ? (int) e.number() : std::numeric_limits< int >::min();
     }
 
-    bool BSONObj::getBoolField(const StringData& name) const {
+    bool BSONObj::getBoolField(StringData name) const {
         BSONElement e = getField(name);
         return e.type() == Bool ? e.boolean() : false;
     }
 
-    const char * BSONObj::getStringField(const StringData& name) const {
+    const char * BSONObj::getStringField(StringData name) const {
         BSONElement e = getField(name);
         return e.type() == String ? e.valuestr() : "";
     }
@@ -687,7 +688,7 @@ namespace mongo {
         return false;
     }
 
-    BSONObj BSONObj::removeField(const StringData& name) const {
+    BSONObj BSONObj::removeField(StringData name) const {
         BSONObjBuilder b;
         BSONObjIterator i(*this);
         while ( i.more() ) {
@@ -731,7 +732,7 @@ namespace mongo {
     /* return has eoo() true if no match
        supports "." notation to reach into embedded objects
     */
-    BSONElement BSONObj::getFieldDotted(const StringData& name) const {
+    BSONElement BSONObj::getFieldDotted(StringData name) const {
         BSONElement e = getField(name);
         if (e.eoo()) {
             size_t dot_offset = name.find('.');
@@ -746,7 +747,7 @@ namespace mongo {
         return e;
     }
 
-    BSONObj BSONObj::getObjectField(const StringData& name) const {
+    BSONObj BSONObj::getObjectField(StringData name) const {
         BSONElement e = getField(name);
         BSONType t = e.type();
         return t == Object || t == Array ? e.embeddedObject() : BSONObj();
@@ -808,6 +809,46 @@ namespace mongo {
     StringBuilder& operator<<( StringBuilder &s, const BSONObj &o ) {
         o.toString( s );
         return s;
+    }
+
+    /** Compare two bson elements, provided as const char *'s, by field name. */
+    class BSONIteratorSorted::ElementFieldCmp {
+    public:
+        ElementFieldCmp( bool isArray );
+        bool operator()( const char *s1, const char *s2 ) const;
+    private:
+        LexNumCmp _cmp;
+    };
+
+    BSONIteratorSorted::ElementFieldCmp::ElementFieldCmp( bool isArray ) :
+    _cmp( !isArray ) {
+    }
+
+    bool BSONIteratorSorted::ElementFieldCmp::operator()( const char *s1, const char *s2 )
+    const {
+        // Skip the type byte and compare field names.
+        return _cmp( s1 + 1, s2 + 1 );
+    }
+
+    BSONIteratorSorted::BSONIteratorSorted( const BSONObj &o, const ElementFieldCmp &cmp )
+        : _nfields(o.nFields()), _fields(new const char*[_nfields]) {
+        int x = 0;
+        BSONObjIterator i( o );
+        while ( i.more() ) {
+            _fields[x++] = i.next().rawdata();
+            verify( _fields[x-1] );
+        }
+        verify( x == _nfields );
+        std::sort( _fields.get() , _fields.get() + _nfields , cmp );
+        _cur = 0;
+    }
+
+    BSONObjIteratorSorted::BSONObjIteratorSorted( const BSONObj &object ) :
+    BSONIteratorSorted( object, ElementFieldCmp( false ) ) {
+    }
+
+    BSONArrayIteratorSorted::BSONArrayIteratorSorted( const BSONArray &array ) :
+    BSONIteratorSorted( array, ElementFieldCmp( true ) ) {
     }
 
 } // namespace mongo

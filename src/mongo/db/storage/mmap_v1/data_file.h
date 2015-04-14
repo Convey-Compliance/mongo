@@ -30,12 +30,11 @@
 
 #pragma once
 
-#include "mongo/db/diskloc.h"
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 
 namespace mongo {
 
-    class ExtentManager;
     class OperationContext;
 
 #pragma pack(1)
@@ -71,7 +70,7 @@ namespace mongo {
         bool mayHave28Freelist() const { return _minor & kMayHave28Freelist; }
         void setMayHave28Freelist() { _minor |= kMayHave28Freelist; }
 
-        uint32_t major() const { return _major; }
+        uint32_t majorRaw() const { return _major; }
         uint32_t minorRaw() const { return _minor; }
 
     private:
@@ -80,7 +79,7 @@ namespace mongo {
         // minor layout:
         // first 4 bits - index plugin cleanliness.
         //    see IndexCatalog::_upgradeDatabaseMinorVersionIfNeeded for details
-        // 5th bit - 1 if started with 2.8-style freelist implementation (SERVER-14081)
+        // 5th bit - 1 if started with 3.0-style freelist implementation (SERVER-14081)
         // 6th through 31st bit - reserved and must be set to 0.
         static const uint32_t kIndexPluginMask = 0xf;
         static const uint32_t kIndexes22AndOlder = 5;
@@ -127,7 +126,7 @@ namespace mongo {
 
         enum { HeaderSize = 8192 };
 
-        bool uninitialized() const { return version.major() == 0; }
+        bool uninitialized() const { return version.majorRaw() == 0; }
 
         void init(OperationContext* txn, int fileno, int filelength, const char* filename);
 
@@ -141,10 +140,10 @@ namespace mongo {
 
 
     class DataFile {
-        friend class BasicCursor;
-        friend class MmapV1ExtentManager;
     public:
-        DataFile(int fn) : _mb(0), fileNo(fn) { }
+        DataFile(int fn) : _fileNo(fn), _mb(NULL) {
+
+        }
 
         /** @return true if found and opened. if uninitialized (prealloc only) does not open. */
         Status openExisting(const char *filename );
@@ -170,8 +169,11 @@ namespace mongo {
         void flush( bool sync );
 
     private:
+        friend class MmapV1ExtentManager;
+
+
         void badOfs(int) const;
-        int defaultSize( const char *filename ) const;
+        int _defaultSize() const;
 
         void grow(DiskLoc dl, int size);
 
@@ -179,9 +181,11 @@ namespace mongo {
         DataFileHeader* header() { return static_cast<DataFileHeader*>( _mb ); }
         const DataFileHeader* header() const { return static_cast<DataFileHeader*>( _mb ); }
 
+
+        const int _fileNo;
+
         DurableMappedFile mmf;
         void *_mb; // the memory mapped view
-        int fileNo;
     };
 
 

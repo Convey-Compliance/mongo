@@ -29,7 +29,9 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
+
+#include <iostream>
 
 #include "mongo/db/db.h"
 #include "mongo/db/dbdirectclient.h"
@@ -40,6 +42,9 @@
 #include "mongo/util/timer.h"
 
 namespace DirectClientTests {
+
+    using std::auto_ptr;
+    using std::vector;
 
     class ClientBase {
     public:
@@ -129,7 +134,7 @@ namespace DirectClientTests {
             ASSERT(cursor->more());
             BSONObj result = cursor->next().getOwned();
             ASSERT( result.hasField( "$err" ));
-            ASSERT_EQUALS(result["code"].Int(), 16332);
+            ASSERT_EQUALS(result["code"].Int(), 16256);
         }
     };
 
@@ -194,5 +199,7 @@ namespace DirectClientTests {
             add< BadNSUpdate >();
             add< BadNSRemove >();
         }
-    } myall;
+    };
+
+    SuiteInstance<All> myall;
 }

@@ -28,17 +28,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/db/matcher/expression_array.h"
 
 #include "mongo/db/field_ref.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-    Status ArrayMatchingMatchExpression::initPath( const StringData& path ) {
+    Status ArrayMatchingMatchExpression::initPath( StringData path ) {
         _path = path;
         Status s = _elementPath.init( _path );
         _elementPath.setTraverseLeafArray( false );
@@ -95,7 +92,7 @@ namespace mongo {
 
     // -------
 
-    Status ElemMatchObjectMatchExpression::init( const StringData& path, MatchExpression* sub ) {
+    Status ElemMatchObjectMatchExpression::init( StringData path, MatchExpression* sub ) {
         _sub.reset( sub );
         return initPath( path );
     }
@@ -149,13 +146,13 @@ namespace mongo {
         _subs.clear();
     }
 
-    Status ElemMatchValueMatchExpression::init( const StringData& path, MatchExpression* sub ) {
+    Status ElemMatchValueMatchExpression::init( StringData path, MatchExpression* sub ) {
         init( path );
         add( sub );
         return Status::OK();
     }
 
-    Status ElemMatchValueMatchExpression::init( const StringData& path ) {
+    Status ElemMatchValueMatchExpression::init( StringData path ) {
         return initPath( path );
     }
 
@@ -217,106 +214,9 @@ namespace mongo {
     }
 
 
-    // ------
-
-    AllElemMatchOp::~AllElemMatchOp() {
-        for ( unsigned i = 0; i < _list.size(); i++ )
-            delete _list[i];
-        _list.clear();
-    }
-
-    Status AllElemMatchOp::init( const StringData& path ) {
-        _path = path;
-        Status s = _elementPath.init( _path );
-        _elementPath.setTraverseLeafArray( false );
-        return s;
-    }
-
-    void AllElemMatchOp::add( ArrayMatchingMatchExpression* expr ) {
-        verify( expr );
-        _list.push_back( expr );
-    }
-
-    bool AllElemMatchOp::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
-        while ( cursor->more() ) {
-            ElementIterator::Context e = cursor->next();
-            if ( e.element().type() != Array )
-                continue;
-            if ( _allMatch( e.element().Obj() ) )
-                return true;
-        }
-        return false;
-    }
-
-    bool AllElemMatchOp::matchesSingleElement( const BSONElement& e ) const {
-        if ( e.type() != Array )
-            return false;
-
-        return _allMatch( e.Obj() );
-    }
-
-    bool AllElemMatchOp::_allMatch( const BSONObj& anArray ) const {
-        if ( _list.size() == 0 )
-            return false;
-        for ( unsigned i = 0; i < _list.size(); i++ ) {
-            if ( !static_cast<ArrayMatchingMatchExpression*>(_list[i])->matchesArray(
-                     anArray, NULL ) )
-                return false;
-        }
-        return true;
-    }
-
-
-    void AllElemMatchOp::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << _path << " AllElemMatchOp:";
-        MatchExpression::TagData* td = getTag();
-        if (NULL != td) {
-            debug << " ";
-            td->debugString(&debug);
-        }
-        debug << "\n";
-        for ( size_t i = 0; i < _list.size(); i++ ) {
-            _list[i]->debugString( debug, level + 1);
-        }
-    }
-
-    void AllElemMatchOp::toBSON(BSONObjBuilder* out) const {
-        BSONObjBuilder allBob(out->subobjStart(path()));
-
-        BSONArrayBuilder arrBob(allBob.subarrayStart("$all"));
-        for (unsigned i = 0; i < _list.size(); i++) {
-            BSONObjBuilder childBob(arrBob.subobjStart());
-            _list[i]->toBSON(&childBob);
-        }
-        arrBob.doneFast();
-
-        allBob.doneFast();
-    }
-
-    bool AllElemMatchOp::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
-
-        const AllElemMatchOp* realOther = static_cast<const AllElemMatchOp*>( other );
-        if ( _path != realOther->_path )
-            return false;
-
-        if ( _list.size() != realOther->_list.size() )
-            return false;
-
-        for ( unsigned i = 0; i < _list.size(); i++ )
-            if ( !_list[i]->equivalent( realOther->_list[i] ) )
-                return false;
-
-        return true;
-    }
-
-
     // ---------
 
-    Status SizeMatchExpression::init( const StringData& path, int size ) {
+    Status SizeMatchExpression::init( StringData path, int size ) {
         _size = size;
         return initPath( path );
     }

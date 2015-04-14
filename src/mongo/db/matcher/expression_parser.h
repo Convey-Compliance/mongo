@@ -65,8 +65,9 @@ namespace mongo {
          * caller has to maintain ownership obj
          * the tree has views (BSONElement) into obj
          */
-        static StatusWithMatchExpression parse(const BSONObj& obj,
-                                        const WhereCallback& whereCallback = WhereCallback()) {
+        static StatusWithMatchExpression parse(
+                                            const BSONObj& obj,
+                                            const WhereCallback& whereCallback = WhereCallback()) {
             // The 0 initializes the match expression tree depth.
             return MatchExpressionParser(&whereCallback)._parse(obj, 0);
         }
@@ -182,13 +183,13 @@ namespace mongo {
          * any $where parsers, which this callback generates. Therefore, the op context must only
          * be destroyed after these parsers and their clones (shallowClone) have been destroyed.
          */
-        WhereCallbackReal(OperationContext* txn, const StringData& dbName);
+        WhereCallbackReal(OperationContext* txn, StringData dbName);
 
         virtual StatusWithMatchExpression parseWhere(const BSONElement& where) const;
 
     private:
-        // 
-        OperationContext* _txn;
+        // Not owned here
+        OperationContext* const _txn;
         const StringData _dbName;
     };
 

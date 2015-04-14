@@ -31,12 +31,11 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/diskloc.h"
-#include "mongo/db/index/btree_index_cursor.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/record_id.h"
 #include "mongo/platform/unordered_set.h"
 
 namespace mongo {
@@ -75,7 +74,7 @@ namespace mongo {
         virtual bool isEOF();
         virtual void saveState();
         virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(const DiskLoc& dl, InvalidationType type);
+        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
 
         virtual std::vector<PlanStage*> getChildren() const;
 
@@ -90,16 +89,6 @@ namespace mongo {
         static const char* kStageType;
 
     private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
-
-        /**
-         * See if we've hit the end yet.
-         */
-        void checkEnd();
-
         // transactional context for read locks. Not owned by us
         OperationContext* _txn;
 
@@ -110,20 +99,13 @@ namespace mongo {
         const IndexDescriptor* _descriptor;
         const IndexAccessMethod* _iam;
 
-        // Our start cursor is _btreeCursor.
-        boost::scoped_ptr<BtreeIndexCursor> _btreeCursor;
-
-        // Our end marker.
-        boost::scoped_ptr<BtreeIndexCursor> _endCursor;
+        std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
         // Could our index have duplicates?  If so, we use _returned to dedup.
-        unordered_set<DiskLoc, DiskLoc::Hasher> _returned;
+        bool _shouldDedup;
+        unordered_set<RecordId, RecordId::Hasher> _returned;
 
         CountScanParams _params;
-
-        bool _hitEnd;
-
-        bool _shouldDedup;
 
         CommonStats _commonStats;
         CountScanStats _specificStats;

@@ -26,12 +26,15 @@
  * it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/value.h"
 
+#include <cmath>
 #include <boost/functional/hash.hpp>
+#include <boost/scoped_array.hpp>
 
+#include "mongo/base/compare_numbers.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/util/hex.h"
@@ -39,6 +42,13 @@
 
 namespace mongo {
     using namespace mongoutils;
+    using boost::intrusive_ptr;
+    using std::min;
+    using std::numeric_limits;
+    using std::ostream;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     void ValueStorage::verifyRefCountingIfShould() const {
         switch (type) {
@@ -46,7 +56,7 @@ namespace mongo {
         case MaxKey:
         case jstOID:
         case Date:
-        case Timestamp:
+        case bsonTimestamp:
         case EOO:
         case jstNULL:
         case Undefined:
@@ -82,7 +92,7 @@ namespace mongo {
         }
     }
 
-    void ValueStorage::putString(const StringData& s) {
+    void ValueStorage::putString(StringData s) {
         // Note: this also stores data portion of BinData
         const size_t sizeNoNUL = s.size();
         if (sizeNoNUL <= sizeof(shortStrStorage)) {
@@ -189,9 +199,8 @@ namespace mongo {
             _storage.intValue = elem.numberInt();
             break;
 
-        case Timestamp:
-            // asDate is a poorly named function that returns a ReplTime
-            _storage.timestampValue = elem._opTime().asDate();
+        case bsonTimestamp:
+            _storage.timestampValue = elem.timestamp().asULL();
             break;
 
         case NumberLong:
@@ -280,7 +289,7 @@ namespace mongo {
         case String:       return builder << val.getStringData();
         case Bool:         return builder << val.getBool();
         case Date:         return builder << Date_t(val.getDate());
-        case Timestamp:    return builder << val.getTimestamp();
+        case bsonTimestamp:    return builder << val.getTimestamp();
         case Object:       return builder << val.getDocument();
         case Symbol:       return builder << BSONSymbol(val.getStringData());
         case Code:         return builder << BSONCode(val.getStringData());
@@ -338,7 +347,7 @@ namespace mongo {
         case Date:
         case RegEx:
         case Symbol:
-        case Timestamp:
+        case bsonTimestamp:
             return true;
 
         case EOO:
@@ -416,7 +425,7 @@ namespace mongo {
         case Date:
             return getDate();
 
-        case Timestamp:
+        case bsonTimestamp:
             return getTimestamp().getSecs() * 1000LL;
 
         default:
@@ -493,7 +502,7 @@ namespace mongo {
         case String:
             return getStringData().toString();
 
-        case Timestamp:
+        case bsonTimestamp:
             return getTimestamp().toStringPretty();
 
         case Date:
@@ -512,9 +521,9 @@ namespace mongo {
         } // switch(getType())
     }
 
-    OpTime Value::coerceToTimestamp() const {
+    Timestamp Value::coerceToTimestamp() const {
         switch(getType()) {
-        case Timestamp:
+        case bsonTimestamp:
             return getTimestamp();
 
         default:
@@ -539,19 +548,6 @@ namespace mongo {
             dassert(left > right);
             return 1;
         }
-    }
-
-    // Special case for double since it needs special NaN handling
-    inline static int cmp(double left, double right) {
-        // The following is lifted directly from compareElementValues
-        // to ensure identical handling of NaN
-        if (left < right) 
-            return -1;
-        if (left == right)
-            return 0;
-        if (isNaN(left))
-            return isNaN(right) ? 0 : -1;
-        return 1;
     }
 
     int Value::compare(const Value& rL, const Value& rR) {
@@ -582,23 +578,45 @@ namespace mongo {
         case Bool:
             return rL.getBool() - rR.getBool();
 
-        // WARNING: Timestamp and Date have same canonical type, but compare differently.
-        // Maintaining behavior from normal BSON.
-        case Timestamp: // unsigned
+        case bsonTimestamp: // unsigned
             return cmp(rL._storage.timestampValue, rR._storage.timestampValue);
+
         case Date: // signed
             return cmp(rL._storage.dateValue, rR._storage.dateValue);
 
         // Numbers should compare by equivalence even if different types
-        case NumberLong:
-        case NumberInt:
-        case NumberDouble:
-            switch (getWidestNumeric(lType, rType)) {
-            case NumberDouble: return cmp(rL.getDouble(), rR.getDouble());
-            case NumberLong:   return cmp(rL.getLong(),   rR.getLong());
-            case NumberInt:    return cmp(rL.getInt(),    rR.getInt());
-            default: verify(false);
+        case NumberInt: {
+            // All types can precisely represent all NumberInts, so it is safe to simply convert to
+            // whatever rhs's type is.
+            switch (rType) {
+            case NumberInt: return compareInts(rL._storage.intValue, rR._storage.intValue);
+            case NumberLong: return compareLongs(rL._storage.intValue, rR._storage.longValue);
+            case NumberDouble: return compareDoubles(rL._storage.intValue, rR._storage.doubleValue);
+            default: invariant(false);
             }
+        }
+
+        case NumberLong: {
+            switch (rType) {
+            case NumberLong: return compareLongs(rL._storage.longValue, rR._storage.longValue);
+            case NumberInt: return compareLongs(rL._storage.longValue, rR._storage.intValue);
+            case NumberDouble: return compareLongToDouble(rL._storage.longValue,
+                                                          rR._storage.doubleValue);
+            default: invariant(false);
+            }
+        }
+
+        case NumberDouble: {
+            switch (rType) {
+            case NumberDouble: return compareDoubles(rL._storage.doubleValue,
+                                                     rR._storage.doubleValue);
+            case NumberInt: return compareDoubles(rL._storage.doubleValue,
+                                                  rR._storage.intValue);
+            case NumberLong: return compareDoubleToLong(rL._storage.doubleValue,
+                                                        rR._storage.longValue);
+            default: invariant(false);
+            }
+        }
 
         case jstOID:
             return memcmp(rL._storage.oid, rR._storage.oid, OID::kOIDSize);
@@ -615,7 +633,7 @@ namespace mongo {
             const vector<Value>& lArr = rL.getArray();
             const vector<Value>& rArr = rR.getArray();
 
-            const size_t elems = min(lArr.size(), rArr.size());
+            const size_t elems = std::min(lArr.size(), rArr.size());
             for (size_t i = 0; i < elems; i++ ) {
                 // compare the two corresponding elements
                 ret = Value::compare(lArr[i], rArr[i]);
@@ -654,23 +672,14 @@ namespace mongo {
             return rL.getStringData().compare(rR.getStringData());
 
         case CodeWScope: {
-            // This case crazy, but identical to how they are compared in BSON (SERVER-7804)
-
             intrusive_ptr<const RCCodeWScope> l = rL._storage.getCodeWScope();
             intrusive_ptr<const RCCodeWScope> r = rR._storage.getCodeWScope();
-
-            // This triggers two bugs in codeWScope.
-            // Since this is a very rare case I'm not handling it here.
-            uassert(16557, "can't compare CodeWScope values containing a NUL byte in the code.",
-                    strlen(l->code.c_str()) == l->code.size()
-                 && strlen(r->code.c_str()) == r->code.size());
 
             ret = l->code.compare(r->code);
             if (ret)
                 return ret;
 
-            // SERVER-7804
-            return strcmp(l->scope.objdata(), r->scope.objdata());
+            return l->scope.woCompare(r->scope);
         }
         }
         verify(false);
@@ -696,27 +705,21 @@ namespace mongo {
             boost::hash_combine(seed, getBool());
             break;
 
-        case Timestamp:
+        case bsonTimestamp:
         case Date:
             BOOST_STATIC_ASSERT(sizeof(_storage.dateValue) == sizeof(_storage.timestampValue));
             boost::hash_combine(seed, _storage.dateValue);
             break;
 
-            /*
-              Numbers whose values are equal need to hash to the same thing
-              as well.  Note that Value::compare() promotes numeric values to
-              their largest common form in order for comparisons to work.
-              We must hash all numeric values as if they are doubles so that
-              things like grouping work.  We don't know what values will come
-              down the pipe later, but if we start out with int representations
-              of a value, and later see double representations of it, they need
-              to end up in the same buckets.
-             */
+        // This converts all numbers to doubles, which ignores the low-order bits of
+        // NumberLongs > 2**53, but that is ok since the hash will still be the same for
+        // equal numbers and is still likely to be different for different numbers.
+        // SERVER-16851
         case NumberDouble:
         case NumberLong:
         case NumberInt: {
             const double dbl = getDouble();
-            if (isNaN(dbl)) {
+            if (std::isnan(dbl)) {
                 boost::hash_combine(seed, numeric_limits<double>::quiet_NaN());
             }
             else {
@@ -768,11 +771,9 @@ namespace mongo {
         }
 
         case CodeWScope: {
-            // SERVER-7804
-            const char * code = _storage.getCodeWScope()->code.c_str();
-            boost::hash_range(seed, code, (code + strlen(code)));
-            // Not going to bother hashing scope. Too many edge cases. Will fall back to
-            // Value::compare when code is same, so this is ok.
+            intrusive_ptr<const RCCodeWScope> cws = _storage.getCodeWScope();
+            boost::hash_combine(seed, StringData::Hasher()(cws->code));
+            boost::hash_combine(seed, BSONObj::Hasher()(cws->scope));
             break;
         }
         }
@@ -863,7 +864,7 @@ namespace mongo {
         case Bool:
         case Date:
         case NumberInt:
-        case Timestamp:
+        case bsonTimestamp:
         case NumberLong:
         case jstNULL:
         case Undefined:
@@ -896,7 +897,7 @@ namespace mongo {
         case jstNULL: return out << "null";
         case Undefined: return out << "undefined";
         case Date: return out << tmToISODateString(val.coerceToTm());
-        case Timestamp: return out << val.getTimestamp().toString();
+        case bsonTimestamp: return out << val.getTimestamp().toString();
         case Object: return out << val.getDocument().toString();
         case Array: {
             out << "[";
@@ -947,7 +948,7 @@ namespace mongo {
         case NumberDouble: buf.appendNum(_storage.doubleValue); break;
         case Bool:         buf.appendChar(_storage.boolValue); break;
         case Date:         buf.appendNum(_storage.dateValue); break;
-        case Timestamp:    buf.appendStruct(getTimestamp()); break;
+        case bsonTimestamp:    buf.appendStruct(getTimestamp()); break;
 
         // types that are like strings
         case String:
@@ -1018,7 +1019,7 @@ namespace mongo {
         case NumberDouble: return Value(buf.read<double>());
         case Bool:         return Value(bool(buf.read<char>()));
         case Date:         return Value(Date_t(buf.read<long long>()));
-        case Timestamp:    return Value(buf.read<OpTime>());
+        case bsonTimestamp:  return Value(buf.read<Timestamp>());
 
         // types that are like strings
         case String:

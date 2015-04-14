@@ -27,9 +27,9 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetworking
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclientcursor.h"
 
@@ -38,9 +38,16 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
+#include "mongo/util/debug_util.h"
+#include "mongo/util/exit.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    using std::auto_ptr;
+    using std::endl;
+    using std::string;
+    using std::vector;
 
     void assembleRequest( const string &ns, BSONObj query, int nToReturn, int nToSkip, const BSONObj *fieldsToReturn, int queryOptions, Message &toSend );
 
@@ -205,10 +212,15 @@ namespace mongo {
 
         if ( qr.getResultFlags() & ResultFlag_CursorNotFound ) {
             // cursor id no longer valid at the server.
-            verify( qr.getCursorId() == 0 );
-            cursorId = 0; // 0 indicates no longer valid (dead)
-            if ( ! ( opts & QueryOption_CursorTailable ) )
-                throw UserException( 13127 , "getMore: cursor didn't exist on server, possible restart or timeout?" );
+            invariant(qr.getCursorId() == 0);
+
+            if (!(opts & QueryOption_CursorTailable)) {
+                uasserted(13127,
+                          str::stream() << "cursor id " << cursorId << " didn't exist on server.");
+            }
+
+            // 0 indicates no longer valid (dead)
+            cursorId = 0;
         }
 
         if ( cursorId == 0 || ! ( opts & QueryOption_CursorTailable ) ) {

@@ -25,7 +25,7 @@
  *    then also delete it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -60,7 +60,7 @@ namespace {
      *
      * E.g., for "/foo/bar/my.txt", returns "my.txt".
      */
-    StringData getBaseName(const StringData& path) {
+    StringData getBaseName(StringData path) {
         size_t lastSlash = path.rfind('/');
         if (lastSlash == std::string::npos)
             return path;

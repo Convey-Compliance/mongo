@@ -35,6 +35,7 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/scoped_ptr.hpp>
 
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
@@ -42,8 +43,11 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
+#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/log.h"
@@ -51,6 +55,13 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using boost::scoped_ptr;
+    using std::endl;
+    using std::map;
+    using std::string;
+    using std::stringstream;
+    using std::vector;
 
     typedef boost::filesystem::path Path;
 
@@ -240,7 +251,8 @@ namespace mongo {
                   << "db: " << _dbName << " path: " << _pathString;
 
             try {
-                _txn->recoveryUnit()->syncDataAndTruncateJournal();
+                getDur().syncDataAndTruncateJournal(_txn);
+
                 // need both in case journaling is disabled
                 MongoFile::flushAll(true);
 
@@ -269,17 +281,10 @@ namespace mongo {
                                          const std::string& dbName,
                                          bool preserveClonedFilesOnFailure,
                                          bool backupOriginalFiles ) {
-        // We must hold some form of lock here
-        invariant(txn->lockState()->isLocked());
-        invariant( dbName.find( '.' ) == string::npos );
-
         scoped_ptr<RepairFileDeleter> repairFileDeleter;
 
-        log() << "repairDatabase " << dbName << endl;
-
-        BackgroundOperation::assertNoBgOpInProgForDb(dbName);
-
-        txn->recoveryUnit()->syncDataAndTruncateJournal(); // Must be done before and after repair
+        // Must be done before and after repair
+        getDur().syncDataAndTruncateJournal(txn);
 
         intmax_t totalSize = dbSize( dbName );
         intmax_t freeSize = File::freeSpace(storageGlobalParams.repairpath);
@@ -296,7 +301,9 @@ namespace mongo {
         Path reservedPath =
             uniqueReservedPath( ( preserveClonedFilesOnFailure || backupOriginalFiles ) ?
                                 "backup" : "_tmp" );
-        MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::create_directory( reservedPath ) );
+        bool created = false;
+        MONGO_ASSERT_ON_EXCEPTION( created = boost::filesystem::create_directory( reservedPath ) );
+        invariant( created );
         string reservedPathString = reservedPath.string();
 
         if ( !preserveClonedFilesOnFailure )
@@ -314,9 +321,8 @@ namespace mongo {
             scoped_ptr<MMAPV1DatabaseCatalogEntry> dbEntry;
             scoped_ptr<Database> tempDatabase;
 
-            // Must syncDataAndTruncateJournal before closing files as done by
-            // MMAPV1DatabaseCatalogEntry's destructor.
-            ON_BLOCK_EXIT(&RecoveryUnit::syncDataAndTruncateJournal, txn->recoveryUnit());
+            // Must call this before MMAPV1DatabaseCatalogEntry's destructor closes the DB files
+            ON_BLOCK_EXIT(&dur::DurableInterface::syncDataAndTruncateJournal, &getDur(), txn);
 
             {
                 dbEntry.reset(new MMAPV1DatabaseCatalogEntry(txn,
@@ -324,22 +330,19 @@ namespace mongo {
                                                              reservedPathString,
                                                              storageGlobalParams.directoryperdb,
                                                              true));
-                invariant(!dbEntry->exists());
-                tempDatabase.reset( new Database(dbName, dbEntry.get()));
+                tempDatabase.reset( new Database(txn, dbName, dbEntry.get()));
             }
 
             map<string,CollectionOptions> namespacesToCopy;
             {
                 string ns = dbName + ".system.namespaces";
-                Client::Context ctx(txn,  ns );
-                Collection* coll = originalDatabase->getCollection( txn, ns );
+                OldClientContext ctx(txn,  ns );
+                Collection* coll = originalDatabase->getCollection( ns );
                 if ( coll ) {
-                    scoped_ptr<RecordIterator> it( coll->getIterator( txn,
-                                                                      DiskLoc(),
-                                                                      CollectionScanParams::FORWARD ) );
+                    scoped_ptr<RecordIterator> it( coll->getIterator(txn) );
                     while ( !it->isEOF() ) {
-                        DiskLoc loc = it->getNext();
-                        BSONObj obj = coll->docFor( txn, loc );
+                        RecordId loc = it->getNext();
+                        BSONObj obj = coll->docFor(txn, loc).value();
 
                         string ns = obj["name"].String();
 
@@ -374,12 +377,12 @@ namespace mongo {
                 Collection* tempCollection = NULL;
                 {
                     WriteUnitOfWork wunit(txn);
-                    tempCollection = tempDatabase->createCollection(txn, ns, options, true, false);
+                    tempCollection = tempDatabase->createCollection(txn, ns, options, false);
                     wunit.commit();
                 }
 
-                Client::Context readContext(txn, ns, originalDatabase);
-                Collection* originalCollection = originalDatabase->getCollection( txn, ns );
+                OldClientContext readContext(txn, ns, originalDatabase);
+                Collection* originalCollection = originalDatabase->getCollection( ns );
                 invariant( originalCollection );
 
                 // data
@@ -396,27 +399,28 @@ namespace mongo {
                     }
 
                     Status status = indexer.init( indexes );
-                    if ( !status.isOK() )
+                    if (!status.isOK()) {
                         return status;
+                    }
                 }
 
                 scoped_ptr<RecordIterator> iterator(originalCollection->getIterator(txn));
                 while ( !iterator->isEOF() ) {
-                    DiskLoc loc = iterator->getNext();
+                    RecordId loc = iterator->getNext();
                     invariant( !loc.isNull() );
 
-                    BSONObj doc = originalCollection->docFor( txn, loc );
+                    BSONObj doc = originalCollection->docFor(txn, loc).value();
 
                     WriteUnitOfWork wunit(txn);
-                    StatusWith<DiskLoc> result = tempCollection->insertDocument(txn,
-                                                                                doc,
-                                                                                &indexer,
-                                                                                false);
+                    StatusWith<RecordId> result = tempCollection->insertDocument(txn,
+                                                                                 doc,
+                                                                                 &indexer,
+                                                                                 false);
                     if ( !result.isOK() )
                         return result.getStatus();
 
                     wunit.commit();
-                    txn->checkForInterrupt(false);
+                    txn->checkForInterrupt();
                 }
                 
                 Status status = indexer.doneInserting();
@@ -431,11 +435,12 @@ namespace mongo {
 
             }
 
-            txn->recoveryUnit()->syncDataAndTruncateJournal();
+            getDur().syncDataAndTruncateJournal(txn);
+
             // need both in case journaling is disabled
             MongoFile::flushAll(true);
 
-            txn->checkForInterrupt(false);
+            txn->checkForInterrupt();
         }
 
         // at this point if we abort, we don't want to delete new files

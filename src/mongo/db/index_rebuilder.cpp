@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndexing
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,8 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -50,6 +51,10 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    using std::endl;
+    using std::string;
+    using std::vector;
 
 namespace {
     void checkNS(OperationContext* txn, const std::list<std::string>& nsToCheck) {
@@ -64,10 +69,11 @@ namespace {
 
             // This write lock is held throughout the index building process
             // for this namespace.
+            ScopedTransaction transaction(txn, MODE_IX);
             Lock::DBLock lk(txn->lockState(), nsToDatabaseSubstring(ns), MODE_X);
-            Client::Context ctx(txn, ns);
+            OldClientContext ctx(txn, ns);
 
-            Collection* collection = ctx.db()->getCollection(txn, ns);
+            Collection* collection = ctx.db()->getCollection(ns);
             if ( collection == NULL )
                 continue;
 
@@ -109,6 +115,7 @@ namespace {
 
                 if (!serverGlobalParams.indexBuildRetry) {
                     log() << "  not rebuilding interrupted indexes";
+                    wunit.commit();
                     continue;
                 }
 
@@ -123,6 +130,14 @@ namespace {
                 WriteUnitOfWork wunit(txn);
                 indexer.commit();
                 wunit.commit();
+            }
+            catch (const DBException& e) {
+                error() << "Index rebuilding did not complete: " << e.toString();
+                log() << "note: restart the server with --noIndexBuildRetry to skip index rebuilds";
+                // If anything went wrong, leave the indexes partially built so that we pick them up
+                // again on restart.
+                indexer.abortWithoutCleanup();
+                fassertFailedNoTrace(26100);
             }
             catch (...) {
                 // If anything went wrong, leave the indexes partially built so that we pick them up
@@ -139,7 +154,7 @@ namespace {
 
         std::vector<std::string> dbNames;
 
-        StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
+        StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
         storageEngine->listDatabases( &dbNames );
 
         try {
@@ -147,6 +162,8 @@ namespace {
             for (std::vector<std::string>::const_iterator dbName = dbNames.begin();
                  dbName < dbNames.end();
                  ++dbName) {
+
+                ScopedTransaction scopedXact(txn, MODE_IS);
                 AutoGetDb autoDb(txn, *dbName, MODE_S);
 
                 Database* db = autoDb.getDb();
@@ -155,8 +172,7 @@ namespace {
             checkNS(txn, collNames);
         }
         catch (const DBException& e) {
-            error() << "Index rebuilding did not complete: " << e.toString();
-            log() << "note: restart the server with --noIndexBuildRetry to skip index rebuilds";
+            error() << "Index verification did not complete: " << e.toString();
             fassertFailedNoTrace(18643);
         }
         LOG(1) << "checking complete" << endl;

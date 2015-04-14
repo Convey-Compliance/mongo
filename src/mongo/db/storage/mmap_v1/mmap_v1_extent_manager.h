@@ -34,12 +34,13 @@
 
 #include <boost/filesystem/path.hpp>
 
-#include "mongo/platform/atomic_word.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/concurrency/lock_mgr_defs.h"
-#include "mongo/db/diskloc.h"
+#include "mongo/db/concurrency/lock_manager_defs.h"
+#include "mongo/db/storage/mmap_v1/diskloc.h"
 #include "mongo/db/storage/mmap_v1/extent_manager.h"
+#include "mongo/db/storage/mmap_v1/record_access_tracker.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
@@ -79,7 +80,7 @@ namespace mongo {
          *        while a bit odd, this is not a layer violation as extents
          *        are a peer to the .ns file, without any layering
          */
-        MmapV1ExtentManager(const StringData& dbname, const StringData& path,
+        MmapV1ExtentManager(StringData dbname, StringData path,
                             bool directoryPerDB);
 
         /**
@@ -123,6 +124,8 @@ namespace mongo {
          */
         Record* recordForV1( const DiskLoc& loc ) const;
 
+        RecordFetcher* recordNeedsFetch( const DiskLoc& loc ) const;
+
         /**
          * @param loc - has to be for a specific Record (not an Extent)
          * Note(erh) see comment on recordFor
@@ -164,6 +167,13 @@ namespace mongo {
 
         DataFile* _addAFile( OperationContext* txn, int sizeNeeded, bool preallocateNextFile );
 
+
+        /**
+         * Shared record retrieval logic used by the public recordForV1() and likelyInPhysicalMem()
+         * above.
+         */
+        Record* _recordForV1( const DiskLoc& loc ) const;
+
         DiskLoc _getFreeListStart() const;
         DiskLoc _getFreeListEnd() const;
         void _setFreeListStart( OperationContext* txn, DiskLoc loc );
@@ -178,7 +188,7 @@ namespace mongo {
                                      int size,
                                      bool enforceQuota );
 
-        boost::filesystem::path fileName( int n ) const;
+        boost::filesystem::path _fileName(int n) const;
 
 // -----
 
@@ -187,6 +197,10 @@ namespace mongo {
         const bool _directoryPerDB;
         const ResourceId _rid;
 
+        // This reference points into the MMAPv1 engine and is only valid as long as the
+        // engine is valid. Not owned here.
+        RecordAccessTracker* _recordAccessTracker;
+
         /**
          * Simple wrapper around an array object to allow append-only modification of the array,
          * as well as concurrent read-accesses. This class has a minimal interface to keep
@@ -194,7 +208,7 @@ namespace mongo {
          */
         class FilesArray {
         public:
-            FilesArray() : _writersMutex("MmapV1ExtentManager"), _size(0) { }
+            FilesArray() : _size(0) { }
             ~FilesArray();
 
             /**

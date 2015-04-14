@@ -26,9 +26,13 @@
  *    then also delete it in the license file.
  */
 
-#include "mongo/db/clientcursor.h"
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
+
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
@@ -46,6 +50,11 @@
 
 namespace QueryPlanExecutor {
 
+    using boost::scoped_ptr;
+    using boost::shared_ptr;
+    using std::auto_ptr;
+    using std::string;
+
     class PlanExecutorBase {
     public:
         PlanExecutorBase() : _client(&_txn) {
@@ -57,7 +66,7 @@ namespace QueryPlanExecutor {
         }
 
         void addIndex(const BSONObj& obj) {
-            _client.ensureIndex(ns(), obj);
+            ASSERT_OK(dbtests::createIndex(&_txn, ns(), obj));
         }
 
         void insert(const BSONObj& obj) {
@@ -118,18 +127,17 @@ namespace QueryPlanExecutor {
          *
          * The caller takes ownership of the returned PlanExecutor*.
          */
-        PlanExecutor* makeIndexScanExec(Client::Context& context,
-                                                BSONObj& indexSpec, int start, int end) {
+        PlanExecutor* makeIndexScanExec(Database* db, BSONObj& indexSpec, int start, int end) {
             // Build the index scan stage.
             IndexScanParams ixparams;
-            ixparams.descriptor = getIndex(context.db(), indexSpec);
+            ixparams.descriptor = getIndex(db, indexSpec);
             ixparams.bounds.isSimpleRange = true;
             ixparams.bounds.startKey = BSON("" << start);
             ixparams.bounds.endKey = BSON("" << end);
             ixparams.bounds.endKeyInclusive = true;
             ixparams.direction = 1;
 
-            const Collection* coll = context.db()->getCollection(&_txn, ns());
+            const Collection* coll = db->getCollection(ns());
 
             auto_ptr<WorkingSet> ws(new WorkingSet());
             IndexScan* ix = new IndexScan(&_txn, ixparams, ws.get(), NULL);
@@ -154,7 +162,7 @@ namespace QueryPlanExecutor {
             Collection* collection = ctx.getCollection();
             if ( !collection )
                 return 0;
-            return collection->cursorCache()->numCursors();
+            return collection->getCursorManager()->numCursors();
         }
 
         void registerExec( PlanExecutor* exec ) {
@@ -162,7 +170,7 @@ namespace QueryPlanExecutor {
             AutoGetCollectionForRead ctx(&_txn, ns());
             WriteUnitOfWork wunit(&_txn);
             Collection* collection = ctx.getDb()->getOrCreateCollection(&_txn, ns());
-            collection->cursorCache()->registerExecutor( exec );
+            collection->getCursorManager()->registerExecutor( exec );
             wunit.commit();
         }
 
@@ -171,7 +179,7 @@ namespace QueryPlanExecutor {
             AutoGetCollectionForRead ctx(&_txn, ns());
             WriteUnitOfWork wunit(&_txn);
             Collection* collection = ctx.getDb()->getOrCreateCollection(&_txn, ns());
-            collection->cursorCache()->deregisterExecutor( exec );
+            collection->getCursorManager()->deregisterExecutor( exec );
             wunit.commit();
         }
 
@@ -180,7 +188,7 @@ namespace QueryPlanExecutor {
 
     private:
         IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
-            Collection* collection = db->getCollection( &_txn, ns() );
+            Collection* collection = db->getCollection( ns() );
             return collection->getIndexCatalog()->findIndexByKeyPattern(&_txn, obj);
         }
 
@@ -194,7 +202,7 @@ namespace QueryPlanExecutor {
     class DropCollScan : public PlanExecutorBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             insert(BSON("_id" << 1));
             insert(BSON("_id" << 2));
 
@@ -223,14 +231,14 @@ namespace QueryPlanExecutor {
     class DropIndexScan : public PlanExecutorBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             insert(BSON("_id" << 1 << "a" << 6));
             insert(BSON("_id" << 2 << "a" << 7));
             insert(BSON("_id" << 3 << "a" << 8));
             BSONObj indexSpec = BSON("a" << 1);
             addIndex(indexSpec);
 
-            scoped_ptr<PlanExecutor> exec(makeIndexScanExec(ctx.ctx(), indexSpec, 7, 10));
+            scoped_ptr<PlanExecutor> exec(makeIndexScanExec(ctx.db(), indexSpec, 7, 10));
             registerExec(exec.get());
 
             BSONObj objOut;
@@ -252,7 +260,7 @@ namespace QueryPlanExecutor {
     class DropIndexScanAgg : public PlanExecutorBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
 
             insert(BSON("_id" << 1 << "a" << 6));
             insert(BSON("_id" << 2 << "a" << 7));
@@ -262,7 +270,7 @@ namespace QueryPlanExecutor {
 
             // Create the PlanExecutor which feeds the aggregation pipeline.
             boost::shared_ptr<PlanExecutor> innerExec(
-                makeIndexScanExec(ctx.ctx(), indexSpec, 7, 10));
+                makeIndexScanExec(ctx.db(), indexSpec, 7, 10));
 
             // Create the aggregation pipeline.
             boost::intrusive_ptr<ExpressionContext> expCtx =
@@ -348,7 +356,7 @@ namespace QueryPlanExecutor {
     class SnapshotControl : public SnapshotBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             setupCollection();
 
             BSONObj filterObj = fromjson("{a: {$gte: 2}}");
@@ -375,13 +383,13 @@ namespace QueryPlanExecutor {
     class SnapshotTest : public SnapshotBase {
     public:
         void run() {
-            Client::WriteContext ctx(&_txn, ns());
+            OldClientWriteContext ctx(&_txn, ns());
             setupCollection();
             BSONObj indexSpec = BSON("_id" << 1);
             addIndex(indexSpec);
 
             BSONObj filterObj = fromjson("{a: {$gte: 2}}");
-            scoped_ptr<PlanExecutor> exec(makeIndexScanExec(ctx.ctx(), indexSpec, 2, 5));
+            scoped_ptr<PlanExecutor> exec(makeIndexScanExec(ctx.db(), indexSpec, 2, 5));
 
             BSONObj objOut;
             ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&objOut, NULL));
@@ -406,7 +414,7 @@ namespace QueryPlanExecutor {
         class Invalidate : public PlanExecutorBase {
         public:
             void run() {
-                Client::WriteContext ctx(&_txn, ns());
+                OldClientWriteContext ctx(&_txn, ns());
                 insert(BSON("a" << 1 << "b" << 1));
 
                 BSONObj filterObj = fromjson("{_id: {$gt: 0}, b: {$gt: 0}}");
@@ -415,12 +423,12 @@ namespace QueryPlanExecutor {
                 PlanExecutor* exec = makeCollScanExec(coll,filterObj);
 
                 // Make a client cursor from the runner.
-                new ClientCursor(coll, exec, 0, BSONObj());
+                new ClientCursor(coll->getCursorManager(), exec, ns(), 0, BSONObj());
 
                 // There should be one cursor before invalidation,
                 // and zero cursors after invalidation.
                 ASSERT_EQUALS(1U, numCursors());
-                coll->cursorCache()->invalidateAll(false);
+                coll->getCursorManager()->invalidateAll(false);
                 ASSERT_EQUALS(0U, numCursors());
             }
         };
@@ -432,7 +440,7 @@ namespace QueryPlanExecutor {
         class InvalidatePinned : public PlanExecutorBase {
         public:
             void run() {
-                Client::WriteContext ctx(&_txn, ns());
+                OldClientWriteContext ctx(&_txn, ns());
                 insert(BSON("a" << 1 << "b" << 1));
 
                 Collection* collection = ctx.getCollection();
@@ -441,13 +449,17 @@ namespace QueryPlanExecutor {
                 PlanExecutor* exec = makeCollScanExec(collection, filterObj);
 
                 // Make a client cursor from the runner.
-                ClientCursor* cc = new ClientCursor(collection, exec, 0, BSONObj());
-                ClientCursorPin ccPin(collection, cc->cursorid());
+                ClientCursor* cc = new ClientCursor(collection->getCursorManager(),
+                                                    exec,
+                                                    ns(),
+                                                    0,
+                                                    BSONObj());
+                ClientCursorPin ccPin(collection->getCursorManager(), cc->cursorid());
 
                 // If the cursor is pinned, it sticks around,
                 // even after invalidation.
                 ASSERT_EQUALS(1U, numCursors());
-                collection->cursorCache()->invalidateAll(false);
+                collection->getCursorManager()->invalidateAll(false);
                 ASSERT_EQUALS(1U, numCursors());
 
                 // The invalidation should have killed the runner.
@@ -469,7 +481,7 @@ namespace QueryPlanExecutor {
         public:
             void run() {
                 {
-                    Client::WriteContext ctx(&_txn, ns());
+                    OldClientWriteContext ctx(&_txn, ns());
                     insert(BSON("a" << 1 << "b" << 1));
                 }
 
@@ -481,13 +493,13 @@ namespace QueryPlanExecutor {
                     PlanExecutor* exec = makeCollScanExec(collection, filterObj);
 
                     // Make a client cursor from the runner.
-                    new ClientCursor(collection, exec, 0, BSONObj());
+                    new ClientCursor(collection->getCursorManager(), exec, ns(), 0, BSONObj());
                 }
 
                 // There should be one cursor before timeout,
                 // and zero cursors after timeout.
                 ASSERT_EQUALS(1U, numCursors());
-                CollectionCursorCache::timeoutCursorsGlobal(&_txn, 600001);
+                CursorManager::timeoutCursorsGlobal(&_txn, 600001);
                 ASSERT_EQUALS(0U, numCursors());
             }
         };
@@ -508,6 +520,8 @@ namespace QueryPlanExecutor {
             add<ClientCursor::InvalidatePinned>();
             add<ClientCursor::Timeout>();
         }
-    }  queryPlanExecutorAll;
+    };
+
+    SuiteInstance<All> queryPlanExecutorAll;
 
 }  // namespace QueryPlanExecutor

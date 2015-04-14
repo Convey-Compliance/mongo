@@ -26,6 +26,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+
 #include "mongo/db/exec/sort.h"
 
 #include <algorithm>
@@ -37,14 +39,15 @@
 #include "mongo/db/exec/working_set_computed_data.h"
 #include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/lite_parsed_query.h"
-#include "mongo/db/query/qlog.h"
+#include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::endl;
     using std::vector;
-
-    const size_t kMaxBytes = 32 * 1024 * 1024;
 
     // static
     const char* SortStage::kStageType = "SORT";
@@ -125,7 +128,7 @@ namespace mongo {
                                              BSONObj* objOut) const {
         BSONObj btreeKeyToUse;
 
-        Status btreeStatus = getBtreeKey(member.obj, &btreeKeyToUse);
+        Status btreeStatus = getBtreeKey(member.obj.value(), &btreeKeyToUse);
         if (!btreeStatus.isOK()) {
             return btreeStatus;
         }
@@ -228,7 +231,8 @@ namespace mongo {
         params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
         // We're creating a "virtual index" with key pattern equal to the sort order.
-        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, "doesnt_matter", BSONObj());
+        IndexEntry sortOrder(sortObj, IndexNames::BTREE, true, false, false, "doesnt_matter",
+                             BSONObj());
         params.indices.push_back(sortOrder);
 
         CanonicalQuery* rawQueryForSort;
@@ -237,7 +241,7 @@ namespace mongo {
         auto_ptr<CanonicalQuery> queryForSort(rawQueryForSort);
 
         vector<QuerySolution*> solns;
-        QLOG() << "Sort stage: Planning to obtain bounds for sort." << endl;
+        LOG(5) << "Sort stage: Planning to obtain bounds for sort." << endl;
         QueryPlanner::plan(*queryForSort, params, &solns);
 
         // TODO: are there ever > 1 solns?  If so, do we look for a specific soln?
@@ -277,16 +281,14 @@ namespace mongo {
         if (0 != result) {
             return result < 0;
         }
-        // Indices use DiskLoc as an additional sort key so we must as well.
+        // Indices use RecordId as an additional sort key so we must as well.
         return lhs.loc < rhs.loc;
     }
 
-    SortStage::SortStage(OperationContext* txn,
-                         const SortStageParams& params,
+    SortStage::SortStage(const SortStageParams& params,
                          WorkingSet* ws,
                          PlanStage* child)
-        : _txn(txn),
-          _collection(params.collection),
+        : _collection(params.collection),
           _ws(ws),
           _child(child),
           _pattern(params.pattern),
@@ -325,10 +327,11 @@ namespace mongo {
             return PlanStage::NEED_TIME;
         }
 
-        if (_memUsage > kMaxBytes) {
+        const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+        if (_memUsage > maxBytes) {
             mongoutils::str::stream ss;
             ss << "sort stage buffered data usage of " << _memUsage
-               << " bytes exceeds internal limit of " << kMaxBytes << " bytes";
+               << " bytes exceeds internal limit of " << maxBytes << " bytes";
             Status status(ErrorCodes::Overflow, ss);
             *out = WorkingSetCommon::allocateStatusMember( _ws, status);
             return PlanStage::FAILURE;
@@ -342,8 +345,8 @@ namespace mongo {
             StageState code = _child->work(&id);
 
             if (PlanStage::ADVANCED == code) {
-                // Add it into the map for quick invalidation if it has a valid DiskLoc.
-                // A DiskLoc may be invalidated at any time (during a yield).  We need to get into
+                // Add it into the map for quick invalidation if it has a valid RecordId.
+                // A RecordId may be invalidated at any time (during a yield).  We need to get into
                 // the WorkingSet as quickly as possible to handle it.
                 WorkingSetMember* member = _ws->get(id);
 
@@ -364,7 +367,7 @@ namespace mongo {
                 }
                 item.wsid = id;
                 if (member->hasLoc()) {
-                    // The DiskLoc breaks ties when sorting two WSMs with the same sort key.
+                    // The RecordId breaks ties when sorting two WSMs with the same sort key.
                     item.loc = member->loc;
                 }
 
@@ -395,12 +398,15 @@ namespace mongo {
                 }
                 return code;
             }
-            else {
-                if (PlanStage::NEED_TIME == code) {
-                    ++_commonStats.needTime;
-                }
-                return code;
+            else if (PlanStage::NEED_TIME == code) {
+                ++_commonStats.needTime;
             }
+            else if (PlanStage::NEED_YIELD == code) {
+                ++_commonStats.needYield;
+                *out = id;
+            }
+
+            return code;
         }
 
         // Returning results.
@@ -426,33 +432,32 @@ namespace mongo {
     }
 
     void SortStage::restoreState(OperationContext* opCtx) {
-        _txn = opCtx;
         ++_commonStats.unyields;
         _child->restoreState(opCtx);
     }
 
-    void SortStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void SortStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
-        _child->invalidate(dl, type);
+        _child->invalidate(txn, dl, type);
 
         // If we have a deletion, we can fetch and carry on.
         // If we have a mutation, it's easier to fetch and use the previous document.
         // So, no matter what, fetch and keep the doc in play.
 
         // _data contains indices into the WorkingSet, not actual data.  If a WorkingSetMember in
-        // the WorkingSet needs to change state as a result of a DiskLoc invalidation, it will still
+        // the WorkingSet needs to change state as a result of a RecordId invalidation, it will still
         // be at the same spot in the WorkingSet.  As such, we don't need to modify _data.
         DataMap::iterator it = _wsidByDiskLoc.find(dl);
 
-        // If we're holding on to data that's got the DiskLoc we're invalidating...
+        // If we're holding on to data that's got the RecordId we're invalidating...
         if (_wsidByDiskLoc.end() != it) {
             // Grab the WSM that we're nuking.
             WorkingSetMember* member = _ws->get(it->second);
             verify(member->loc == dl);
 
-            WorkingSetCommon::fetchAndInvalidateLoc(_txn, member, _collection);
+            WorkingSetCommon::fetchAndInvalidateLoc(txn, member, _collection);
 
-            // Remove the DiskLoc from our set of active DLs.
+            // Remove the RecordId from our set of active DLs.
             _wsidByDiskLoc.erase(it);
             ++_specificStats.forcedFetches;
         }
@@ -466,7 +471,8 @@ namespace mongo {
 
     PlanStageStats* SortStage::getStats() {
         _commonStats.isEOF = isEOF();
-        _specificStats.memLimit = kMaxBytes;
+        const size_t maxBytes = static_cast<size_t>(internalQueryExecMaxBlockingSortBytes);
+        _specificStats.memLimit = maxBytes;
         _specificStats.memUsage = _memUsage;
         _specificStats.limit = _limit;
         _specificStats.sortPattern = _pattern.getOwned();
@@ -558,7 +564,7 @@ namespace mongo {
         }
 
         // If the working set ID is valid, remove from
-        // DiskLoc invalidation map and free from working set.
+        // RecordId invalidation map and free from working set.
         if (wsidToFree != WorkingSet::INVALID_ID) {
             WorkingSetMember* member = _ws->get(wsidToFree);
             if (member->hasLoc()) {

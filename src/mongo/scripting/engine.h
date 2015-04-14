@@ -29,8 +29,9 @@
 
 #pragma once
 
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
     typedef unsigned long long ScriptingFunction;
@@ -54,6 +55,8 @@ namespace mongo {
 
         virtual void reset() = 0;
         virtual void init(const BSONObj* data) = 0;
+        virtual void registerOperation(OperationContext* txn) = 0;
+        virtual void unregisterOperation() = 0;
 
         void init(const char* data) {
             BSONObj o(data);
@@ -75,7 +78,7 @@ namespace mongo {
 
         virtual void setElement(const char* field, const BSONElement& e) = 0;
         virtual void setNumber(const char* field, double val) = 0;
-        virtual void setString(const char* field, const StringData& val) = 0;
+        virtual void setString(const char* field, StringData val) = 0;
         virtual void setObject(const char* field, const BSONObj& obj, bool readOnly=true) = 0;
         virtual void setBoolean(const char* field, bool val) = 0;
         virtual void setFunction(const char* field, const char* code) = 0;
@@ -124,10 +127,10 @@ namespace mongo {
 
         virtual void injectNative(const char* field, NativeFunction func, void* data = 0) = 0;
 
-        virtual bool exec(const StringData& code, const std::string& name, bool printResult,
+        virtual bool exec(StringData code, const std::string& name, bool printResult,
                           bool reportError, bool assertOnError, int timeoutMs = 0) = 0;
 
-        virtual void execSetup(const StringData& code, const std::string& name = "setup") {
+        virtual void execSetup(StringData code, const std::string& name = "setup") {
             exec(code, name, false, true, true, 0);
         }
 
@@ -146,7 +149,7 @@ namespace mongo {
          * if any changes are made to .system.js, call this
          * right now its just global - slightly inefficient, but a lot simpler
          */
-        static void storedFuncMod();
+        static void storedFuncMod(OperationContext *txn);
 
         static void validateObjectIdString(const std::string& str);
 
@@ -175,14 +178,21 @@ namespace mongo {
 
     protected:
         friend class PooledScope;
+
+        /**
+         * RecoveryUnit::Change subclass used to commit work for
+         * Scope::storedFuncMod logOp listener.
+         */
+        class StoredFuncModLogOpHandler;
+
         virtual FunctionCacheMap& getFunctionCache() { return _cachedFunctions; }
         virtual ScriptingFunction _createFunction(const char* code,
                                                   ScriptingFunction functionNumber = 0) = 0;
 
         std::string _localDBName;
-        long long _loadedVersion;
+        int64_t _loadedVersion;
         std::set<std::string> _storedNames;
-        static long long _lastVersion;
+        static AtomicInt64 _lastVersion;
         FunctionCacheMap _cachedFunctions;
         int _numTimesUsed;
         bool _lastRetIsNativeCode; // v8 only: set to true if eval'd script returns a native func
@@ -227,25 +237,6 @@ namespace mongo {
         // poll for interrupts.  the interrupt functions must not wait indefinitely on a lock.
         virtual void interrupt(unsigned opId) {}
         virtual void interruptAll() {}
-        static void setGetCurrentOpIdCallback(unsigned (*func)()) {
-            _getCurrentOpIdCallback = func;
-        }
-        static bool haveGetCurrentOpIdCallback() { return _getCurrentOpIdCallback; }
-        static unsigned getCurrentOpId() {
-            massert(13474, "no _getCurrentOpIdCallback", _getCurrentOpIdCallback);
-            return _getCurrentOpIdCallback();
-        }
-        static void setCheckInterruptCallback(const char* (*func)()) {
-            _checkInterruptCallback = func;
-        }
-        static bool haveCheckInterruptCallback() { return _checkInterruptCallback; }
-        static const char* checkInterrupt() {
-            return _checkInterruptCallback ? _checkInterruptCallback() : "";
-        }
-        static bool interrupted() {
-            const char* r = checkInterrupt();
-            return r && r[0];
-        }
 
         static std::string getInterpreterVersionString();
 
@@ -255,8 +246,6 @@ namespace mongo {
 
     private:
         static void (*_connectCallback)(DBClientWithCommands&);
-        static const char* (*_checkInterruptCallback)();
-        static unsigned (*_getCurrentOpIdCallback)();
     };
 
     void installGlobalUtils(Scope& scope);

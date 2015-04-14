@@ -77,11 +77,13 @@ namespace repl {
 
         // stop syncing (when this node becomes a primary, e.g.)
         void stop();
-        bool isAssumingPrimary_inlock();
 
 
         void shutdown();
-        void notify();
+        void notify(OperationContext* txn);
+
+        // Blocks until _pause becomes true from a call to stop() or shutdown()
+        void waitUntilPaused();
 
         virtual ~BackgroundSync() {}
 
@@ -101,10 +103,6 @@ namespace repl {
 
         // For monitoring
         BSONObj getCounters();
-
-        // Wait for replication to finish and buffer to be applied so that the member can become
-        // primary.
-        void stopReplicationAndFlushBuffer();
 
         long long getLastAppliedHash() const;
         void setLastAppliedHash(long long oldH);
@@ -133,7 +131,7 @@ namespace repl {
         // _mutex protects all of the class variables except _syncSourceReader and _buffer
         mutable boost::mutex _mutex;
 
-        OpTime _lastOpTimeFetched;
+        Timestamp _lastOpTimeFetched;
 
         // lastAppliedHash is used to generate a new hash for the following op, when primary.
         long long _lastAppliedHash;
@@ -143,9 +141,9 @@ namespace repl {
 
         // if produce thread should be running
         bool _pause;
+        boost::condition _pausedCondition;
         bool _appliedBuffer;
-        bool _assumingPrimary;
-        boost::condition _condvar;
+        boost::condition _appliedBufferCondition;
 
         HostAndPort _syncSourceHost;
 
@@ -162,8 +160,7 @@ namespace repl {
 
         // Evaluate if the current sync target is still good
         bool shouldChangeSyncSource();
-        // check lastOpTimeWritten against the remote's earliest op, filling in remoteOldestOp.
-        bool isStale(OpTime lastOpTimeFetched, OplogReader& r, BSONObj& remoteOldestOp);
+
         // restart syncing
         void start(OperationContext* txn);
 

@@ -39,6 +39,7 @@
 
 namespace {
 
+    using boost::shared_ptr;
     using std::auto_ptr;
     using std::string;
     using namespace mongo;
@@ -54,7 +55,7 @@ namespace {
      * Encode user-provided string. Cache key delimiters seen in the
      * user string are escaped with a backslash.
      */
-    void encodeUserString(const StringData& s, mongoutils::str::stream* os) {
+    void encodeUserString(StringData s, mongoutils::str::stream* os) {
         for (size_t i = 0; i < s.size(); ++i) {
             char c = s[i];
             switch (c) {
@@ -122,7 +123,6 @@ namespace {
         case MatchExpression::OR: return "or"; break;
         case MatchExpression::NOR: return "nr"; break;
         case MatchExpression::NOT: return "nt"; break;
-        case MatchExpression::ALL: return "al"; break;
         case MatchExpression::ELEM_MATCH_OBJECT: return "eo"; break;
         case MatchExpression::ELEM_MATCH_VALUE: return "ev"; break;
         case MatchExpression::SIZE: return "sz"; break;
@@ -275,6 +275,11 @@ namespace {
                 *os << "d";
             }
             encodeUserString(elt.fieldName(), os);
+
+            // Sort argument separator
+            if (it.more()) {
+                *os << ",";
+            }
         }
     }
 

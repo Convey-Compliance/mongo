@@ -26,13 +26,17 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/s/write_ops/batch_upconvert.h"
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/bson/bsonobj.h"
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/s/multi_command_dispatch.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/batched_delete_document.h"
@@ -40,7 +44,10 @@
 
 namespace mongo {
 
+    using boost::scoped_ptr;
     using mongoutils::str::stream;
+    using std::auto_ptr;
+    using std::string;
     using std::vector;
 
     void msgToBatchRequests( const Message& msg, vector<BatchedCommandRequest*>* requests ) {
@@ -97,7 +104,7 @@ namespace mongo {
             // No exceptions from here on
             BatchedCommandRequest* request =
                 new BatchedCommandRequest( BatchedCommandRequest::BatchType_Insert );
-            request->setNS( nss.ns() );
+            request->setNSS( nss );
             for ( vector<BSONObj>::const_iterator it = docs.begin(); it != docs.end(); ++it ) {
                 request->getInsertRequest()->addToDocuments( *it );
             }
@@ -128,7 +135,7 @@ namespace mongo {
 
         BatchedCommandRequest* request =
             new BatchedCommandRequest( BatchedCommandRequest::BatchType_Update );
-        request->setNS( nss.ns() );
+        request->setNSS( nss );
         request->getUpdateRequest()->addToUpdates( updateDoc );
         request->setWriteConcern( WriteConcernOptions::Acknowledged );
 
@@ -151,7 +158,7 @@ namespace mongo {
 
         BatchedCommandRequest* request =
             new BatchedCommandRequest( BatchedCommandRequest::BatchType_Delete );
-        request->setNS( nss.ns() );
+        request->setNSS( nss );
         request->getDeleteRequest()->addToDeletes( deleteDoc );
         request->setWriteConcern( WriteConcernOptions::Acknowledged );
 

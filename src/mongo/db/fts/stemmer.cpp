@@ -38,10 +38,12 @@ namespace mongo {
 
     namespace fts {
 
-        Stemmer::Stemmer( const FTSLanguage& language ) {
+        using std::string;
+
+        Stemmer::Stemmer( const FTSLanguage* language ) {
             _stemmer = NULL;
-            if ( language.str() != "none" )
-                _stemmer = sb_stemmer_new(language.str().c_str(), "UTF_8");
+            if ( language->str() != "none" )
+                _stemmer = sb_stemmer_new(language->str().c_str(), "UTF_8");
         }
 
         Stemmer::~Stemmer() {
@@ -51,7 +53,7 @@ namespace mongo {
             }
         }
 
-        string Stemmer::stem( const StringData& word ) const {
+        string Stemmer::stem( StringData word ) const {
             if ( !_stemmer )
                 return word.toString();
 
@@ -61,7 +63,7 @@ namespace mongo {
 
             if ( sb_sym == NULL ) {
                 // out of memory
-                abort();
+                invariant( false );
             }
 
             return string( (const char*)(sb_sym), sb_stemmer_length( _stemmer ) );

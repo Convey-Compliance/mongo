@@ -44,17 +44,12 @@
 #include "mongo/db/json.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
-#include "mongo/db/storage/mmap_v1/catalog/hashtab.h"
 #include "mongo/db/storage/mmap_v1/catalog/namespace_index.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/startup_test.h"
 
-
 namespace mongo {
-
-
-    BSONObj idKeyPattern = fromjson("{\"_id\":1}");
 
     NamespaceDetails::NamespaceDetails( const DiskLoc &loc, bool capped ) {
         BOOST_STATIC_ASSERT( sizeof(NamespaceDetails::Extra) <= sizeof(NamespaceDetails) );
@@ -88,10 +83,13 @@ namespace mongo {
     }
 
     NamespaceDetails::Extra* NamespaceDetails::allocExtra( OperationContext* txn,
-                                                           const StringData& ns,
+                                                           StringData ns,
                                                            NamespaceIndex& ni,
                                                            int nindexessofar) {
-        txn->lockState()->assertWriteLocked(ns);
+
+        // Namespace details must always be changed under an exclusive DB lock
+        const NamespaceString nss(ns);
+        invariant(txn->lockState()->isDbLockedForMode(nss.db(), MODE_X));
 
         int i = (nindexessofar - NIndexesBase) / NIndexesExtra;
         verify( i >= 0 && i <= 1 );
@@ -182,7 +180,7 @@ namespace mongo {
 
     // must be called when renaming a NS to fix up extra
     void NamespaceDetails::copyingFrom( OperationContext* txn,
-                                        const StringData& thisns,
+                                        StringData thisns,
                                         NamespaceIndex& ni,
                                         NamespaceDetails* src) {
         _extraOffset = 0; // we are a copy -- the old value is wrong.  fixing it up below.
@@ -228,11 +226,11 @@ namespace mongo {
 
     int NamespaceDetails::_catalogFindIndexByName(OperationContext* txn,
                                                   const Collection* coll,
-                                                  const StringData& name,
+                                                  StringData name,
                                                   bool includeBackgroundInProgress) const {
         IndexIterator i = ii(includeBackgroundInProgress);
         while( i.more() ) {
-            const BSONObj obj = coll->docFor(txn, i.next().info);
+            const BSONObj obj = coll->docFor(txn, i.next().info.toRecordId()).value();
             if ( name == obj.getStringField("name") )
                 return i.pos()-1;
         }

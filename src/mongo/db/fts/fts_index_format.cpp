@@ -28,18 +28,22 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/base/init.h"
 #include "mongo/db/fts/fts_index_format.h"
+#include "mongo/db/fts/fts_spec.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
     namespace fts {
+
+        using std::string;
+        using std::vector;
 
         namespace {
             BSONObj nullObj;

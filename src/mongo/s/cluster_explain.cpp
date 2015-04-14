@@ -34,6 +34,8 @@
 
 namespace mongo {
 
+    using std::vector;
+
     const char* ClusterExplain::kSingleShard = "SINGLE_SHARD";
     const char* ClusterExplain::kMergeFromShards = "SHARD_MERGE";
     const char* ClusterExplain::kMergeSortFromShards = "SHARD_MERGE_SORT";
@@ -49,7 +51,7 @@ namespace mongo {
 
         bool appendIfRoom(BSONObjBuilder* bob,
                           const BSONObj& toAppend,
-                          const StringData& fieldName) {
+                          StringData fieldName) {
             if ((bob->len() + toAppend.objsize()) < BSONObjMaxUserSize) {
                 bob->append(fieldName, toAppend);
                 return true;
@@ -130,11 +132,22 @@ namespace mongo {
         // Check that the result from each shard has a true value for "ok" and has
         // the expected "queryPlanner" field.
         for (size_t i = 0; i < shardResults.size(); i++) {
-            if (!shardResults[i].result["ok"].trueValue() ||
-                Object != shardResults[i].result["queryPlanner"].type()) {
-                return Status(ErrorCodes::OperationFailed,
-                              str::stream() << "Shard " << shardResults[i].target.toString()
-                                            << " failed: " << shardResults[i].result);
+            if (!shardResults[i].result["ok"].trueValue()) {
+                // Try to pass up the error code from the shard.
+                ErrorCodes::Error error = ErrorCodes::OperationFailed;
+                if (shardResults[i].result["code"].isNumber()) {
+                    error = ErrorCodes::fromInt(shardResults[i].result["code"].numberInt());
+                }
+
+                return Status(error, str::stream()
+                    << "Explain command on shard " << shardResults[i].target.toString()
+                    << " failed, caused by: " << shardResults[i].result);
+            }
+
+            if (Object != shardResults[i].result["queryPlanner"].type()) {
+                return Status(ErrorCodes::OperationFailed, str::stream()
+                    << "Explain command on shard " << shardResults[i].target.toString()
+                    << " failed, caused by: " << shardResults[i].result);
             }
 
             if (shardResults[i].result.hasField("executionStats")) {
@@ -270,6 +283,18 @@ namespace mongo {
             BSONObj execStages = execStats["executionStages"].Obj();
 
             singleShardBob.append("shardName", shardResults[i].shardTarget.getName());
+
+            // Append error-related fields, if present.
+            if (!execStats["executionSuccess"].eoo()) {
+                singleShardBob.append(execStats["executionSuccess"]);
+            }
+            if (!execStats["errorMessage"].eoo()) {
+                singleShardBob.append(execStats["errorMessage"]);
+            }
+            if (!execStats["errorCode"].eoo()) {
+                singleShardBob.append(execStats["errorCode"]);
+            }
+
             appendIfRoom(&singleShardBob, execStages, "executionStages");
 
             singleShardBob.doneFast();

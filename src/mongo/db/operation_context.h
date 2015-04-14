@@ -28,27 +28,29 @@
 
 #pragma once
 
-#include <stdlib.h>
-
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
-#include "mongo/base/string_data.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/concurrency/locker.h"
-
+#include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
     class Client;
     class CurOp;
     class ProgressMeter;
-
+    class StringData;
     /**
      * This class encompasses the state required by an operation.
      *
      * TODO(HK): clarify what this means.  There's one OperationContext for one user operation...
      *           but is this true for getmore?  Also what about things like fsyncunlock / internal
      *           users / etc.?
+     *
+     * On construction, an OperationContext associates itself with the current client, and only on
+     * destruction it deassociates itself. At any time a client can be associated with at most one
+     * OperationContext.
      */
     class OperationContext  {
         MONGO_DISALLOW_COPYING(OperationContext);
@@ -84,17 +86,11 @@ namespace mongo {
         // --- operation level info? ---
 
         /**
-         * TODO: Get rid of this and just have one interrupt func?
-         * throws an exception if the operation is interrupted
-         * @param heedMutex if true and have a write lock, won't kill op since it might be unsafe
+         * If the thread is not interrupted, returns Status::OK(), otherwise returns the cause
+         * for the interruption. The throw variant returns a user assertion corresponding to the
+         * interruption status.
          */
-        virtual void checkForInterrupt(bool heedMutex = true) const = 0;
-
-        /**
-         * TODO: Where do I go
-         * @return Status::OK() if not interrupted
-         *         otherwise returns reasons
-         */
+        virtual void checkForInterrupt() const = 0;
         virtual Status checkForInterruptNoAssert() const = 0;
 
         /**
@@ -111,13 +107,7 @@ namespace mongo {
          *
          * TODO: We return a string because of hopefully transient CurOp thread-unsafe insanity.
          */
-        virtual string getNS() const = 0;
-
-        /**
-         * Returns true if this operation is under a GodScope.  Only used by DBDirectClient.
-         * TODO(spencer): SERVER-10228 Remove this
-         */
-        virtual bool isGod() const = 0;
+        virtual std::string getNS() const = 0;
 
         /**
          * Returns the client under which this context runs.
@@ -139,40 +129,98 @@ namespace mongo {
         /**
          * @return true if this instance is primary for this namespace
          */
-        virtual bool isPrimaryFor( const StringData& ns ) = 0;
+        virtual bool isPrimaryFor( StringData ns ) = 0;
+
+        /**
+         * Returns WriteConcernOptions of the current operation
+         */
+        const WriteConcernOptions& getWriteConcern() const {
+            return _writeConcern;
+        }
+
+        void setWriteConcern(const WriteConcernOptions& writeConcern) {
+            _writeConcern = writeConcern;
+        }
+
+        /**
+         * Set whether or not operations should generate oplog entries.
+         */
+        virtual void setReplicatedWrites(bool writesAreReplicated = true) = 0;
+
+        /**
+         * Returns true if operations should generate oplog entries.
+         */
+        virtual bool writesAreReplicated() const = 0;
 
     protected:
         OperationContext() { }
+
+    private:
+        WriteConcernOptions _writeConcern;
     };
 
     class WriteUnitOfWork {
         MONGO_DISALLOW_COPYING(WriteUnitOfWork);
     public:
         WriteUnitOfWork(OperationContext* txn)
-                 : _txn(txn) {
-            if ( _txn->lockState() ) {
-                _txn->lockState()->beginWriteUnitOfWork();
-            }
-            _txn->recoveryUnit()->beginUnitOfWork();
+                 : _txn(txn),
+                   _ended(false) {
+
+            _txn->lockState()->beginWriteUnitOfWork();
+            _txn->recoveryUnit()->beginUnitOfWork(_txn);
         }
 
         ~WriteUnitOfWork() {
             _txn->recoveryUnit()->endUnitOfWork();
-            if ( _txn->lockState() ) {
+
+            if (!_ended) {
                 _txn->lockState()->endWriteUnitOfWork();
             }
         }
 
         void commit() {
+            invariant(!_ended);
+
             _txn->recoveryUnit()->commitUnitOfWork();
-            if ( _txn->lockState() ) {
-                _txn->lockState()->endWriteUnitOfWork();
-                _txn->lockState()->beginWriteUnitOfWork();
-            }
+            _txn->lockState()->endWriteUnitOfWork();
+
+            _ended = true;
         }
 
     private:
         OperationContext* const _txn;
+
+        bool _ended;
+    };
+
+
+    /**
+     * RAII-style class to mark the scope of a transaction. ScopedTransactions may be nested.
+     * An outermost ScopedTransaction calls commitAndRestart() on destruction, so that the storage
+     * engine can release resources, such as snapshots or locks, that it may have acquired during
+     * the transaction. Note that any writes are committed in nested WriteUnitOfWork scopes,
+     * so write conflicts cannot happen on completing a ScopedTransaction.
+     *
+     * TODO: The ScopedTransaction should hold the global lock
+     */
+    class ScopedTransaction {
+        MONGO_DISALLOW_COPYING(ScopedTransaction);
+    public:
+        /**
+         * The mode for the transaction indicates whether the transaction will write (MODE_IX) or
+         * only read (MODE_IS), or needs to run without other writers (MODE_S) or any other
+         * operations (MODE_X) on the server.
+         */
+        ScopedTransaction(OperationContext* txn, LockMode mode) : _txn(txn) { }
+
+        ~ScopedTransaction() {
+            if (!_txn->lockState()->isLocked()) {
+                _txn->recoveryUnit()->commitAndRestart();
+            }
+        }
+
+    private:
+        OperationContext* _txn;
     };
 
 }  // namespace mongo

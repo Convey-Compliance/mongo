@@ -36,6 +36,9 @@
 
 namespace mongo {
 
+    using std::auto_ptr;
+    using std::vector;
+
     // static
     const char* CountStage::kStageType = "COUNT";
 
@@ -153,12 +156,18 @@ namespace mongo {
                 _ws->free(id);
             }
         }
+        else if (PlanStage::NEED_YIELD == state) {
+            *out = id;
+            _commonStats.needYield++;
+            return PlanStage::NEED_YIELD;
+        }
 
         _commonStats.needTime++;
         return PlanStage::NEED_TIME;
     }
 
     void CountStage::saveState() {
+        _txn = NULL;
         ++_commonStats.yields;
         if (_child.get()) {
             _child->saveState();
@@ -166,6 +175,7 @@ namespace mongo {
     }
 
     void CountStage::restoreState(OperationContext* opCtx) {
+        invariant(_txn == NULL);
         _txn = opCtx;
         ++_commonStats.unyields;
         if (_child.get()) {
@@ -173,10 +183,10 @@ namespace mongo {
         }
     }
 
-    void CountStage::invalidate(const DiskLoc& dl, InvalidationType type) {
+    void CountStage::invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type) {
         ++_commonStats.invalidates;
         if (_child.get()) {
-            _child->invalidate(dl, type);
+            _child->invalidate(txn, dl, type);
         }
     }
 

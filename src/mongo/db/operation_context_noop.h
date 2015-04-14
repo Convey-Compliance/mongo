@@ -27,22 +27,28 @@
  */
 #pragma once
 
+#include <boost/scoped_ptr.hpp>
+
 #include "mongo/db/operation_context.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
-
 
 namespace mongo {
 
     class OperationContextNoop : public OperationContext {
     public:
-        OperationContextNoop(RecoveryUnit* ru) {
-            _recoveryUnit.reset(ru);
+        OperationContextNoop(RecoveryUnit* ru)
+            : _recoveryUnit(ru),
+              _locker(new LockerNoop()) {
+
         }
 
-        OperationContextNoop() {
-            _recoveryUnit.reset(new RecoveryUnitNoop());
+        OperationContextNoop()
+            : _recoveryUnit(new RecoveryUnitNoop()),
+              _locker(new LockerNoop()) {
+
         }
 
         virtual ~OperationContextNoop() { }
@@ -70,8 +76,7 @@ namespace mongo {
         }
 
         virtual Locker* lockState() const {
-            // TODO: This should return an actual object if necessary for testing.
-            return NULL;
+            return _locker.get();
         }
 
         virtual ProgressMeter* setMessage(const char * msg,
@@ -81,30 +86,32 @@ namespace mongo {
             return &_pm;
         }
 
-        virtual void checkForInterrupt(bool heedMutex = true) const { }
-
+        virtual void checkForInterrupt() const { }
         virtual Status checkForInterruptNoAssert() const {
             return Status::OK();
         }
 
-        virtual bool isPrimaryFor( const StringData& ns ) {
+        virtual bool isPrimaryFor( StringData ns ) {
             return true;
         }
 
-        virtual bool isGod() const {
-            return false;
-        }
-
-        virtual string getNS() const {
-            return string();
+        virtual std::string getNS() const {
+            return std::string();
         };
 
         virtual unsigned int getOpID() const {
             return 0;
         }
 
+        void setReplicatedWrites(bool writesAreReplicated = true) {}
+
+        bool writesAreReplicated() const {
+            return false;
+        }
+
     private:
         std::auto_ptr<RecoveryUnit> _recoveryUnit;
+        boost::scoped_ptr<Locker> _locker;
         ProgressMeter _pm;
     };
 

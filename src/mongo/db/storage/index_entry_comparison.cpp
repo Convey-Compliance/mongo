@@ -27,9 +27,16 @@
  */
 #include "mongo/platform/basic.h"
 
+#include <ostream>
+
+#include "mongo/db/jsobj.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 
 namespace mongo {
+
+    std::ostream& operator<<(std::ostream& stream, const IndexKeyEntry& entry) {
+        return stream << entry.key << '@' << entry.loc;
+    }
 
     // Due to the limitations of various APIs, we need to use the same type (IndexKeyEntry)
     // for both the stored data and the "query". We cheat and encode extra information in the
@@ -104,11 +111,11 @@ namespace mongo {
     // reading the comment in the .h file is highly recommended if you need to understand what this
     // function is doing
     BSONObj IndexEntryComparison::makeQueryObject(const BSONObj& keyPrefix,
-                                                        int prefixLen,
-                                                        bool prefixExclusive,
-                                                        const vector<const BSONElement*>& keySuffix,
-                                                        const vector<bool>& suffixInclusive,
-                                                        const int cursorDirection) {
+                                                  int prefixLen,
+                                                  bool prefixExclusive,
+                                                  const std::vector<const BSONElement*>& keySuffix,
+                                                  const std::vector<bool>& suffixInclusive,
+                                                  const int cursorDirection) {
 
         // Please read the comments in the header file to see why this is done.
         // The basic idea is that we use the field name to store a byte which indicates whether

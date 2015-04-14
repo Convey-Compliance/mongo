@@ -28,14 +28,19 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 #include "mongo/db/matcher/expression_text.h"
 
 namespace mongo {
 
-    Status TextMatchExpression::init( const string& query, const string& language ) {
+    using std::string;
+
+    Status TextMatchExpression::init( const string& query,
+                                      const string& language,
+                                      bool caseSensitive ) {
         _query = query;
         _language = language;
+        _caseSensitive = caseSensitive;
         return initPath( "_fts" );
     }
 
@@ -48,7 +53,9 @@ namespace mongo {
 
     void TextMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace(debug, level);
-        debug << "TEXT : query=" << _query << ", language=" << _language << ", tag=";
+        debug << "TEXT : query=" << _query << ", language="
+                                 << _language << ", caseSensitive="
+                                 << _caseSensitive << ", tag=";
         MatchExpression::TagData* td = getTag();
         if ( NULL != td ) {
             td->debugString( &debug );
@@ -60,7 +67,9 @@ namespace mongo {
     }
 
     void TextMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$text", BSON("$search" << _query << "$language" << _language));
+        out->append("$text", BSON("$search" << _query <<
+                                  "$language" << _language <<
+                                  "$caseSensitive" << _caseSensitive));
     }
 
     bool TextMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -77,12 +86,15 @@ namespace mongo {
         if ( realOther->getLanguage() != _language ) {
             return false;
         }
+        if ( realOther->getCaseSensitive() != _caseSensitive ) {
+            return false;
+        }
         return true;
     }
 
     LeafMatchExpression* TextMatchExpression::shallowClone() const {
         TextMatchExpression* next = new TextMatchExpression();
-        next->init( _query, _language );
+        next->init( _query, _language, _caseSensitive );
         if ( getTag() ) {
             next->setTag( getTag()->clone() );
         }
